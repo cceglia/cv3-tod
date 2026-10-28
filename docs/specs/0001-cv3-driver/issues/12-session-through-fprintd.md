@@ -1,9 +1,9 @@
-# 11: Session through fprintd
+# 12: Session through fprintd
 
 **What to build:** opening and closing the sensor through `fprintd` performs the handshake and the
 session teardown, so the plugin is wired end to end before any biometric behaviour exists.
 
-**Blocked by:** 10 (plugin loads)
+**Blocked by:** 11 (plugin loads)
 
 **Status:** ready-for-agent
 
@@ -11,4 +11,4 @@ session teardown, so the plugin is wired end to end before any biometric behavio
       session cleanly
 - [ ] A second open after a failed open succeeds instead of reporting "already open"
 - [ ] No session handle is left on the sensor after a failed open
-- [ ] `fprintd` does not hang when the sensor is unplugged or absent during open
+- [ ] `fprintd` does not hang when the sensor is absent during open

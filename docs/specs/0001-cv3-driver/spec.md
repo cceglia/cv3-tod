@@ -4,16 +4,15 @@ Status: ready-for-agent
 
 ## Problem Statement
 
-The Dell Latitude's fingerprint sensor (Broadcom ControlVault 3, `0a5c:5843`) has no working
-open-source Linux driver. The only implementation that drives it is a proprietary blob distributed
+The Dell Latitude's fingerprint sensor (Broadcom ControlVault 3, `0a5c:5843`) has no driver in the
+kernel or in `libfprint`. The only implementation that drives it is a proprietary blob distributed
 by Canonical, which does not work on this machine; `fprintd` therefore reports no device, and
 fingerprint login, unlock and `sudo` are unavailable.
 
-The one open-source implementation that does work is a small C plugin written in a day by a single
-author, with no review and one commit. An audit cleared it of malice but found a root-reachable
-stack overflow, a verdict that a tampered reply can forge, and a design that stops short of
-decoding the sensor's template inventory — so it can only answer "some enrolled finger", never
-"this user's finger".
+An independent open-source driver exists, written in a day by one author and never reviewed. An
+audit cleared it of malice but found a root-reachable stack overflow, a verdict that a single altered
+reply can forge, and a design that stops short of decoding the sensor's template inventory — so it
+can only answer "some enrolled finger", never "this user's finger".
 
 I do not want to run unaudited third-party C as root, and I do not want a reader whose verdict can
 be changed by flipping one bit of a reply.
@@ -31,20 +30,21 @@ protocol facts can be established on hardware without installing anything.
 
 The result behaves like a normal `fprintd` reader: enrol, verify, and — once the sensor's inventory
 is decoded — list and delete, with the sensor's own store as the source of truth. Verification is
-bound to the print that was enrolled rather than to the presence of any enrolled finger, so a
-tampered reply cannot authenticate someone who was never enrolled; where that binding is unavailable
-the driver says so instead of pretending.
+bound to the print that was enrolled rather than to the presence of any enrolled finger, so an
+altered match flag does not authenticate someone who was never enrolled. The binding cannot detect a
+replayed reply; the driver states that limit rather than implying otherwise. A print is only ever
+stored bound: if the binding cannot be established, enrolment fails and can be retried.
 
 ## User Stories
 
-1. As a laptop owner, I want `fprintd-list` to show my fingerprint reader, so that I know the driver
-   is installed and the sensor is recognised.
+1. As a laptop owner, I want `fprintd` to report my fingerprint reader, so that I know the driver is
+   installed and the sensor is recognised.
 2. As a laptop owner, I want to enrol a finger through the desktop settings, so that I never have to
    use a command line to set up biometric login.
 3. As a laptop owner, I want to enrol a finger with `fprintd-enroll`, so that the same flow works on
    a headless machine.
-4. As a laptop owner, I want each enrolment stage to report progress, including the final
-   confirmation touch, so that I know what the sensor expects next.
+4. As a laptop owner, I want each enrolment stage to report progress, so that I can see the enrolment
+   advancing.
 5. As a laptop owner, I want a sample the sensor rejects to be re-requested rather than aborting the
    enrolment, so that a poorly placed finger does not cost me the whole attempt.
 6. As a laptop owner, I want enrolment to stop when the sensor says it has enough samples, so that
@@ -61,9 +61,9 @@ the driver says so instead of pretending.
 11. As a laptop owner, I want an unenrolled finger presented during verification to fail even when
     another user on the machine has enrolled their own finger, so that sharing a laptop does not
     mean sharing accounts.
-12. As a laptop owner, I want a reply that was altered in transit to be rejected when the print is
-    bound to its match id, so that the fingerprint is not a decorative check; and when a print is
-    bound to no id, I want that limitation stated rather than hidden.
+12. As a laptop owner, I want a reply whose match flag was altered to be rejected, because the print
+    is bound to its match id, so that a single-bit forgery does not authenticate; and I want the
+    limits of that guarantee stated, including that it does not detect replay.
 13. As a laptop owner, I want cancelling a verification to stop immediately and leave the sensor
     usable, so that an abandoned prompt does not wedge the reader or block the next attempt.
 14. As a laptop owner, I want to cancel a verification by pressing Escape in the `sudo` prompt, so
@@ -80,10 +80,10 @@ the driver says so instead of pretending.
     revoked finger genuinely stops working.
 20. As a laptop owner, I want deletion to be reported as unsupported rather than faked if the sensor
     has no delete command, so that I am not told a finger is gone when it still matches.
-21. As a laptop owner, I want a "clear all fingerprints" operation, so that I can reset the reader
-    before selling or lending the machine.
-22. As a laptop owner, I want identification (one-to-many) to work once the sensor's inventory is
-    decoded, so that the login screen can match without being told which finger to expect.
+21. As a laptop owner, I want to be able to wipe the sensor's stored templates through the driver, so
+    that I can reset the reader before selling or lending the machine.
+22. As a laptop owner, I want identification (one-to-many) to work for a bound print, so that the
+    login screen can match without being told which finger to expect.
 23. As a laptop owner, I want the driver to report a clear error when the sensor is absent or held by
     another process, so that I can tell "no reader" from "reader busy".
 24. As a laptop owner, I want the driver to leave a sensor stuck by an interrupted session in a
@@ -103,8 +103,8 @@ the driver says so instead of pretending.
     with tests pinning the wire offsets, so that I can check the implementation against the wire
     format without reading a decompiler's output.
 31. As a security reviewer, I want the driver to state honestly what a match proves and what it does
-    not, including that the channel authenticates neither side, so that nobody mistakes it for a
-    stronger guarantee than it is.
+    not, including that the channel authenticates neither side and that the match id binding does
+    not defeat replay, so that nobody mistakes it for a stronger guarantee than it is.
 32. As the developer reverse-engineering the protocol, I want a probe that sends one command at a
     time and dumps both directions as hex, so that I can establish facts the documentation gets
     wrong.
@@ -132,34 +132,36 @@ the driver says so instead of pretending.
 
 ## Implementation Decisions
 
-**Shape.** A Rust workspace with three crates: the protocol core, the probe, and the TOD plugin. The
-core has no I/O in its dependency list, which makes "the core performs no I/O" a compile-time fact
-rather than a convention (ADR-0001). The plugin crate is a `cdylib` containing the C shim, built
-only when the `libfprint` TOD headers are present.
+**Shape.** A Rust workspace: the protocol core and the probe are crates from the start, and the TOD
+plugin becomes a third crate when the shim is first built, since it cannot compile without the
+`libfprint` TOD headers. The core has no I/O in its dependency list, which makes "the core performs
+no I/O" a compile-time fact rather than a convention (ADR-0001). The plugin crate is a `cdylib`
+containing the C shim.
 
-**Core interface.** One engine object owns all session state and exposes a single step function: it
+**Core interface.** One **core** object owns all session state and exposes a single step function: it
 takes an event and returns the action to perform next. Events are: a reply arrived with a status and
 body, a reply arrived with no body, a finger event arrived, the transport failed, and the operation
-was cancelled. Actions are: send bytes on the command channel, wait for a finger event, and finish
-with a result. The core names channels, never USB endpoint addresses; mapping a channel to an
-endpoint is the transport's job. There is no callback, no thread and no timer inside the core: the
-transport owns time.
+was cancelled. Actions are: send bytes on a protocol channel, wait for a finger event, and finish with
+a result. The core may carry the protocol's endpoint numbers as constants — they are part of the
+protocol — but it never chooses a USB transfer; mapping a channel to a transfer is the transport's
+job. There is no callback, no thread and no timer inside the core: the transport owns time.
 
 **Transport contract.** A transport sends bytes and returns one of: a reply (status and body), an
 empty reply, a transport error, or cancellation. It performs the out/interrupt/in exchange the
-protocol requires and hides it from the core, including the rule that an announced body must always
-be drained even when its length is zero. Two real implementations exist — the probe's, over a
-pure-Rust USB stack, and the shim's, over `libfprint`'s asynchronous transfers — plus a replay
-implementation used by tests and by the probe's replay mode.
+protocol requires and hides it from the core. An announced body is always read before the next
+command; an announced length of zero means there is nothing to read. Two real implementations exist —
+the probe's, over a pure-Rust USB stack, and the shim's, over `libfprint`'s asynchronous transfers —
+plus a scripted and a replay implementation used by tests and by the probe.
 
-**Cryptography.** Pure-Rust primitives with no OpenSSL: AES-128-CBC with PKCS#7, HMAC-SHA-256,
-SHA-1, and P-256 ECDH. The host keypair is generated per session; the sensor does not authenticate
-the host, so no key material is stored. The key schedule follows the observed protocol: the shared
-secret, hashed, then combined with both nonces to produce the session key. The per-command MAC
-covers the header, the parameter block and the wrap sequence. **The MAC key is a fixed constant
-published in the protocol, so the MAC proves the frame was built by something that knows the
-protocol — it is not authentication.** Replies carry no MAC at all. The session key is zeroed when
-the session closes. Every primitive is pinned by known-answer vectors in addition to the
+**Cryptography.** Pure-Rust primitives with no OpenSSL: AES-128-CBC with PKCS#7, HMAC-SHA-256, SHA-1,
+and P-256 ECDH. The host keypair is generated per session; the sensor does not authenticate the host,
+so no key material is stored. The key schedule follows the observed protocol: the shared secret,
+hashed, then combined with the device nonce and the host nonce that the challenge response carries.
+The client nonce from the first challenge is not part of the key schedule. The per-command MAC covers
+the header, the parameter block and the wrap sequence. **The MAC key is a fixed constant published in
+the protocol, so the MAC proves the frame was built by something that knows the protocol — it is not
+authentication.** Replies carry no MAC, so a genuine reply can be replayed. The session key is zeroed
+when the session closes. Every primitive is pinned by known-answer vectors in addition to the
 protocol-level tests.
 
 **The wrap-sequence rule lives in exactly one predicate.** The two reference implementations disagree
@@ -170,39 +172,50 @@ cover both readings so the decision is a one-line change rather than a rewrite.
 **Enrolment.** Discard any pending enrolment, start, then loop: arm a capture, wait for the finger
 event, submit the sample. Accepted samples advance progress; unusable samples are re-requested; the
 sensor's "no more samples" reply stops the loop. Completion is recognised when the reply carries an
-**enrolment id** distinct from the **sample hash** that was submitted. The commit uses that
-enrolment id. The threshold for committing without an explicit completion signal is twelve accepted
-stages, which is the number of stages `libfprint` is told to expect for the sample-collection part.
+**enrolment id** distinct from the **sample hash** that was submitted. The driver tells `libfprint` to
+expect **thirteen** stages: twelve samples plus one confirmation touch after the commit. Committing
+without an explicit completion signal uses the last submitted sample hash as the template id; the
+stored record says which of the two it is.
 
-**Verification and id binding.** Verification arms a capture, waits for the finger event, and asks
-the sensor to match. A match is only accepted when the returned **match id** equals the one recorded
-for the print being verified; the sensor's match flag alone is not enough.
+**Verification and id binding.** Verification arms a capture, waits for the finger event, and asks the
+sensor to match. A match is only accepted when the returned **match id** equals the one recorded for
+the print being verified; the sensor's match flag alone is not enough.
 
-The match id is not something enrolment can obtain: it is only returned alongside a match. The
-driver therefore declares **thirteen** enrolment stages — twelve samples plus one confirmation touch
-after the commit — and uses that confirmation to record the print's match id. If the confirmation
-does not happen, or the match id proves unstable across sessions, the print is stored **unbound**,
-verification degrades to trusting the match flag, and every verification of that print reports the
-degradation. The degradation is a documented property of the stored print, not a build feature.
+The match id is never returned by enrolment, only alongside a match. After committing, the driver
+therefore asks for one more touch and records the match id from that confirmation. **This mechanism is
+unproven**: neither reference implementation performs a match immediately after a commit, and nobody
+has established whether the value at that position is per-finger or per-template, or that it is stable
+across sessions. Establishing that is a prerequisite, not an implementation detail.
 
-**Print payload.** The data stored per print is a fixed, versioned binary record: a magic and
-version, the **enrolment id**, the optional **match id**, and flags recording which of them are
-meaningful. No serialisation dependency, no JSON, no schema. Unknown versions are rejected rather
-than guessed.
+Two limits are properties of the design, not bugs to fix later. The driver cannot prove that the
+confirmation touch is the same finger as the twelve samples; it trusts the person at the device. And
+the comparison detects an altered match flag, not a replayed reply. Both are stated in the project's
+documentation and in the driver's claims.
 
-**Storage model.** The sensor's store is the source of truth where the inventory query can be
-decoded: the driver maps templates to prints with a **store diff** taken around each enrolment, and
-declares the storage, list, identify and delete features to `libfprint`. Where it cannot be decoded,
-the driver stores prints host-side with the recorded match id and declares none of those features.
-Which model is active is not a configuration switch: it is decided at open time by whether the
-inventory query was successfully decoded on this sensor, and it is visible in the features the
-driver reports.
+**No unbound prints.** If the confirmation does not happen, fails, or the match id proves unstable, the
+enrolment fails and the user retries. There is no degraded mode that silently trusts the match flag:
+that would reintroduce the cross-user hole this project exists to close. A template committed before a
+failed confirmation is left on the sensor; the driver reports it as orphaned, because the protocol has
+no way to remove it until deletion exists.
+
+**Print payload.** The data stored per print is a fixed, versioned binary record: a magic and version,
+the **enrolment id** (or the sample hash used in its place), the **match id**, and flags recording
+which id is which and that the print is bound. No serialisation dependency, no JSON, no schema.
+Unknown versions are rejected rather than guessed. Every stored print is bound, by the decision above.
+
+**Storage model.** The sensor's store is the source of truth where the inventory query can be decoded:
+the driver maps templates to prints with a **store diff** taken around each enrolment, and declares
+the storage, list, delete and clear features to `libfprint`. Identification does not depend on the
+inventory: it needs match ids, which every stored print already carries, so it is declared whenever
+prints are bound. Where the inventory cannot be decoded, the driver stores prints host-side and
+declares neither list, delete nor clear. Which model is active is decided at open time by whether the
+inventory query was decoded on this sensor, and is visible in the features the driver reports.
 
 **Deletion.** Deletion is a sensor operation when an opcode for it is known. If none is found, the
 driver reports deletion as unsupported and keeps the print visible; it never emulates deletion by
 overwriting, because a finger that "was deleted" but still matches is worse than one that cannot be
-deleted. In the host-stored fallback the driver does not claim a storage feature at all, so
-`fprintd` does not offer deletion it cannot honour.
+deleted. In the host-stored fallback the driver declares no storage feature, so `fprintd` does not
+offer deletion it cannot honour.
 
 **The shim.** C, and deliberately trivial: a GObject subclass of the `libfprint` device type whose
 virtual functions forward to the core, and a transfer binding that performs what the core asks. It
@@ -215,41 +228,39 @@ shorter one, all as constants with one explaining comment. Command transfers are
 only the finger wait is. This is a safety property of the hardware, not a preference.
 
 **Failure and recovery.** On any failure the driver cancels a pending capture and closes the session
-handle before reporting the error, because a dangling handle survives reboots. It never resets the
-USB device and never touches the port's `disable` knob. Recovery from a sensor wedged by an external
-kill is an operator action, documented in the project: the USB `authorized` toggle, and nothing
-stronger.
+handle before reporting the error, because a dangling handle survives reboots. It never resets the USB
+device and never touches the port's `disable` knob. Recovery from a sensor wedged by an external kill
+is an operator action, documented in the project: the USB `authorized` toggle, and nothing stronger.
 
-**Probe.** `cvctl` runs one operation at a time and prints both directions as hex with decoded
+**Probe.** `cvctl` runs one **session** per invocation and prints both directions as hex with decoded
 fields. Subcommands cover discovery, the handshake, opening and closing a session, capture,
 verification, enrolment, the inventory query, recording and replaying. It refuses to run while
 `fprintd` is active, requires root, and never resets the device.
 
-**Errors.** Protocol failures map onto `libfprint`'s device errors so that `fprintd` reports
-"retry", "no match" or "device error" rather than a generic failure.
+**Errors.** Protocol failures map onto `libfprint`'s device errors so that `fprintd` reports "retry",
+"no match" or "device error" rather than a generic failure.
 
 **Dependencies.** A small, pinned set of pure-Rust crypto crates, audited in CI for advisories and
-licences. No transport crate in the core, no OpenSSL, no build scripts where avoidable. The absence
-of `unsafe` and of transport dependencies in the core is checked mechanically in CI, not assumed.
+licences. No transport crate in the core, no OpenSSL, no build scripts where avoidable. The absence of
+`unsafe` and of transport dependencies in the core is checked mechanically in CI, not assumed.
 
-**Licence and provenance.** MIT, with a notice crediting the reverse-engineering that made the
-protocol known and stating that no vendor code or firmware is redistributed.
+**Licence and provenance.** MIT, with a notice crediting the reverse-engineering that made the protocol
+known and stating that no vendor code or firmware is redistributed.
 
 ## Testing Decisions
 
 A good test here asserts **wire behaviour and observable outcomes**, never internal structure: given
 this conversation, the driver must want to send these bytes, or must report this result. Tests do not
-reach into engine fields, do not assert on private state machines, and do not mock the crypto.
+reach into core fields, do not assert on private state machines, and do not mock the crypto.
 
-**The engine seam is where nearly everything is tested.** A test scripts a sensor: replies to feed, a
+**The core seam is where nearly everything is tested.** A test scripts a sensor: replies to feed, a
 finger event, a cancellation, a transport error. It asserts the sequence of actions requested and the
 final outcome. Scenarios cover: handshake success and rejection, wrong sequence, capture pending,
 capture cancelled, sample rejected and retried, enrolment completing early, enrolment running out of
-samples, match, no match, id mismatch, unbound print, unstable id, empty inventory, inventory diff,
-delete unsupported, and transport failure at each state. Fixtures are synthetic, built from the same
-codec the tests pin independently, so a fixture cannot drift silently from the frame definition.
-Building that scripted-sensor harness is its own piece of work, scheduled before the protocol
-behaviour that depends on it.
+samples, match, no match, id mismatch, unstable id, empty inventory, inventory diff, delete
+unsupported, and transport failure at each state. Fixtures are synthetic, built from the same codec the
+tests pin independently, so a fixture cannot drift silently from the frame definition. Building that
+scripted harness is its own piece of work, scheduled before the biometric behaviour that depends on it.
 
 **The codec keeps its own tests**, because it is the one place where byte offsets matter: field
 positions, both length fields, wrapped-versus-plain, and rejection of short, mis-magicked and
@@ -257,9 +268,9 @@ inconsistently-sized buffers. Random and structured buffers must never panic; a 
 accompanies it. These five existing tests are the prior art for the style.
 
 **The transport contract is tested once and run against every implementation.** The contract tests —
-reply, empty reply, drain-when-empty, error, cancellation, timeout — run against the replay transport
-and against a fake that injects failures. The probe's real transport and the shim's are not
-unit-tested; they are exercised on hardware.
+reply, empty reply, error, cancellation, timeout — run against the scripted and replay transports and
+against a fake that injects failures. The probe's real transport and the shim's are not unit-tested;
+they are exercised on hardware.
 
 **Crypto is pinned twice**: known-answer vectors for each primitive, and one full handshake vector
 whose session key and MAC are asserted, so a refactor in the key schedule fails loudly instead of
@@ -272,12 +283,14 @@ that acceptable.
 
 ## Out of Scope
 
-- Listing, deletion and identification until the inventory query is decoded; they are scheduled, but
+- Listing, deletion and identification through the sensor's store until the inventory query is decoded;
   the first release may ship without them and must then declare the corresponding features absent.
+- A "clear all" control in desktop clients: `fprintd` exposes deletion per print and per user, not a
+  global wipe. The driver implements the storage-clear operation; whether a client can reach it is a
+  client question.
 - Suspend and resume handling.
 - Firmware update, firmware version checks, and the chip's smartcard and RFID functions.
-- Sensors other than `0a5c:5843`; other ControlVault models may be close but are untested and
-  unclaimed.
+- Sensors other than `0a5c:5843`; other ControlVault models may be close but are untested and unclaimed.
 - Reading fingerprint images: the sensor matches on-chip and never sends an image.
 - Our own PAM module; `pam_fprintd` is the consumer.
 - Upstreaming into `libfprint` as a native C driver.
@@ -286,32 +299,35 @@ that acceptable.
 
 ## Further Notes
 
-**Facts the first probe session must settle** (none of these can be decided from the documentation,
-and at least one of them the documentation contradicts):
+**Facts that must be established before the binding exists** (all unproven, and load-bearing):
 
-1. Whether a "capture pending" reply advances the wrap sequence.
-2. Whether a **match id** is stable across sessions and reboots. If it is not, prints are stored
-   unbound and the binding guarantee narrows to what the driver can honestly claim.
-3. The inventory query's reply format, which is what unlocks list, delete and true revocation.
-4. Whether a delete command exists at all.
-5. Whether the sensor tolerates the chosen timeouts, given that an aborted command transfer is what
+1. Whether the sensor accepts a capture and a match immediately after a commit.
+2. What the 20-byte value at the match reply's `+32` actually is: per-finger or per-template, and
+   whether it is stable across sessions and reboots. The reference implementation calls it a
+   "biometric-derived hash" in a comment; that is not a finding.
+3. Whether a "capture pending" reply advances the wrap sequence.
+4. The inventory query's reply format, which is what unlocks list, delete and true revocation.
+5. Whether a delete command exists at all.
+6. Whether the sensor tolerates the chosen timeouts, given that an aborted command transfer is what
    wedges it.
 
-**Risks.** A bug in the probe runs as root and can wedge the sensor's command interface; the
-documented recovery is the USB `authorized` toggle, and the documented way to make it unrecoverable
-is a port reset, which the driver never performs. A bad session may cost a power cycle.
+**Risks.** A bug in the probe runs as root and can wedge the sensor's command interface; the documented
+recovery is the USB `authorized` toggle, and the documented way to make it unrecoverable is a port
+reset, which the driver never performs. A bad session may cost a power cycle. If the binding facts do
+not hold, the enrolling flow cannot be shipped as designed and the project must decide between a
+documented weaker guarantee and no driver.
 
 **Acceptance for the first release** is: the probe proves handshake, capture, verification, enrolment
-and id binding on hardware; `fprintd-enroll`, `fprintd-verify` and the cancel-then-verify case work;
+and binding on hardware; `fprintd-enroll`, `fprintd-verify` and the cancel-then-verify case work;
 `sudo` authenticates through `pam_fprintd`; and a verification cancelled mid-capture is followed by a
-successful one.
+successful one. Binding is part of that list, so a release with an unbound print path is not a release.
 
 Listing, deletion and identification are acceptance criteria for the **inventory milestone**, not for
-the first release. If that work succeeds they become part of the same driver; if it stalls, the
-driver ships with the host-stored fallback and says so.
+the first release. If that work succeeds they become part of the same driver; if it stalls, the driver
+ships with the host-stored fallback and says so.
 
 **Provenance.** The protocol was reverse-engineered by a third party under the MIT licence; their
 write-up and implementation are the source of the constants, and an audit of that implementation —
-including the defects this design must not inherit — is kept with the project's reference material.
-The two load-bearing decisions are recorded as ADR-0001 (I/O-free core with a C shim) and ADR-0002
+including the defects this design must not inherit — is kept with the project's reference material. The
+two load-bearing decisions are recorded as ADR-0001 (I/O-free core with a C shim) and ADR-0002
 (device-stored prints with host-side fallback).

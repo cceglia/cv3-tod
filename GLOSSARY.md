@@ -39,9 +39,15 @@ just stored.
 _Avoid_: template id, print id
 
 **Match id**:
-The 20-byte identifier the sensor returns alongside a positive match, derived from the biometric
-rather than from the enrolment. It is not comparable with an enrolment id.
+The 20-byte value the sensor returns alongside a positive match. It is not the enrolment id and the two
+are not comparable; what it is derived from, and whether it is stable across sessions, is not
+established.
 _Avoid_: template id, matched id
+
+**Bound print**:
+A print whose verification requires the sensor to report the same match id that was recorded for it.
+The driver stores no other kind.
+_Avoid_: bound template, linked print
 
 **Device-stored print**:
 A fingerprint whose template lives on the sensor, the host keeping only its identifier and
@@ -49,8 +55,9 @@ metadata. Deleting one is a sensor operation.
 _Avoid_: chip print, stored print, on-chip print
 
 **Host-stored print**:
-A fingerprint whose record lives in fprintd's storage while the sensor holds the template and
-answers only yes or no. Deleting one leaves the template in place.
+A fingerprint whose record lives in fprintd's storage while the sensor holds the template. It can
+still be bound, by recording the match id in the record; without one, verification would trust the
+sensor's match flag alone.
 _Avoid_: local print, fprintd print
 
 **Store diff**:

@@ -11,7 +11,10 @@ attempt, start, collect samples until the sensor is satisfied, and commit the te
 - [ ] A sample the sensor rejects for quality is re-requested, and the attempt continues
 - [ ] Collection stops when the sensor reports it has enough samples, recognised by the enrolment id
       arriving distinct from the sample hash, or by the sensor's "no more samples" reply
-- [ ] Committing with fewer than twelve accepted stages fails with a clear message and stores no
+- [ ] Committing without a completion signal uses the last sample hash and records that fact; the
+      threshold is twelve accepted samples
+- [ ] Committing with fewer than twelve accepted samples fails with a clear message and stores no
       template
 - [ ] A failed commit is reported as such, and a following enrolment starts from a discarded state
-- [ ] A finger that never arrives fails cleanly without leaving a half-built enrolment behind
+- [ ] A finger that never arrives fails cleanly, and the driver reports that a pending enrolment may
+      remain on the sensor until the next discard

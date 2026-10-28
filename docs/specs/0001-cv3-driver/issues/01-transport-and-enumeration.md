@@ -13,7 +13,7 @@ any protocol work exists.
       (such as `fprintd`) holds the sensor
 - [ ] It reports a clear "not found" and exits non-zero when the sensor is absent
 - [ ] It claims the interface, reads the endpoint layout, and releases both on the success path, on
-      error, and when killed with a signal
-- [ ] The transport always drains an announced body, including when the announced length is zero, and
-      a test covers that case
+      error, and on a catchable signal
+- [ ] An announced non-zero reply body is always read before the next command, and a zero-length
+      announcement performs no read — both covered by tests
 - [ ] No code path resets the USB device or writes the port's `disable` knob
