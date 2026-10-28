@@ -1,0 +1,42 @@
+# `cargo-deny`: RustSec advisories and the licence set of the pinned dependencies.
+#
+# The SPEC's "Dependencies" section promises that the pinned set is audited in CI for advisories
+# and licences. The workflow runs this file through `EmbarkStudios/cargo-deny-action`; the
+# per-crate rule that no transport crate may reach the core stays in `./scripts/check-core.sh`,
+# because `[bans]` applies to the whole graph and `cv3-probe` legitimately depends on `nusb`.
+
+[graph]
+all-features = true
+
+[advisories]
+# Accepted for compatibility; cargo-deny denies every advisory by default since 0.16.
+version = 2
+db-urls = ["https://github.com/RustSec/advisory-db"]
+# Add `{ crate = "...", reason = "..." }` entries only when an affected dependency cannot be
+# updated yet; an empty list means nothing is suppressed.
+ignore = []
+
+[licenses]
+# The exact expressions `cargo metadata` reports for this workspace's dependency graph. Every one
+# is permissive; an expression with any other term is denied.
+#
+# `unlicensed` and `copyleft` are not fields any more (removed in cargo-deny 0.16): a crate whose
+# licence cannot be determined is an error, and a licence outside `allow` is denied. That is the
+# same policy the SPEC asks for, expressed the way the current tool accepts it.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+]
+
+[bans]
+# The SPEC also forbids OpenSSL, which a graph-wide ban can express. Transport crates cannot be
+# banned here because the probe needs `nusb`; keeping them out of `cv3-core` is checked by
+# `scripts/check-core.sh`.
+deny = [
+    { crate = "openssl", use-instead = "the pinned pure-Rust crypto set" },
+    { crate = "openssl-sys", use-instead = "the pinned pure-Rust crypto set" },
+]

@@ -10,7 +10,7 @@ license.workspace = true
 aes = "=0.8.4"
 cbc = { version = "=0.1.2", features = ["alloc"] }
 hmac = "=0.12.1"
-p256 = { version = "=0.13.2", default-features = false, features = ["arithmetic", "ecdh"] }
+p256 = { version = "=0.14.0", default-features = false, features = ["arithmetic", "ecdh"] }
 sha1 = "=0.10.6"
 sha2 = "=0.10.9"
 zeroize = "=1.8.1"

@@ -174,9 +174,9 @@ impl HostKey {
 
     /// The uncompressed public key as `X || Y`, the 64 bytes the sensor's `0x24` frame carries.
     pub fn public_key(&self) -> [u8; 64] {
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::elliptic_curve::sec1::ToSec1Point;
 
-        let point = self.0.public_key().to_encoded_point(false);
+        let point = self.0.public_key().to_sec1_point(false);
         let encoded = point.as_bytes();
         debug_assert_eq!(encoded.len(), 65, "uncompressed P-256 point");
         let mut out = [0u8; 64];

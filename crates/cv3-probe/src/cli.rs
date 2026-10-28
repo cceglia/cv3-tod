@@ -469,7 +469,7 @@ fn handshake(
         }
         Err(error) => {
             let _ = writeln!(err, "cvctl: handshake failed: {error}");
-            EXIT_OTHER
+            handshake_error_code(&error)
         }
     };
     let code = signalled_exit(shutdown, err, code);
@@ -524,15 +524,11 @@ fn open(
         }
         Err(OpenFailure::Handshake(error)) => {
             let _ = writeln!(err, "cvctl: handshake failed: {error}");
-            EXIT_OTHER
+            handshake_error_code(&error)
         }
         Err(OpenFailure::Open(error)) => {
             let _ = writeln!(err, "cvctl: {error}");
-            if matches!(error, OpenError::WrongSequence) {
-                EXIT_SEQUENCE
-            } else {
-                EXIT_OTHER
-            }
+            open_error_code(&error)
         }
     };
     let code = signalled_exit(shutdown, err, code);
@@ -575,11 +571,11 @@ fn close(
         }
         Err(CloseFailure::Handshake(error)) => {
             let _ = writeln!(err, "cvctl: handshake failed: {error}");
-            EXIT_OTHER
+            handshake_error_code(&error)
         }
         Err(CloseFailure::Close(error)) => {
             let _ = writeln!(err, "cvctl: {error}");
-            EXIT_OTHER
+            close_error_code(&error)
         }
     };
     let code = signalled_exit(shutdown, err, code);
@@ -637,24 +633,15 @@ fn capture(
         }
         Err(CaptureFailure::Handshake(error)) => {
             let _ = writeln!(err, "cvctl: handshake failed: {error}");
-            EXIT_OTHER
+            handshake_error_code(&error)
         }
         Err(CaptureFailure::Open(error)) => {
             let _ = writeln!(err, "cvctl: {error}");
-            if matches!(error, OpenError::WrongSequence) {
-                EXIT_SEQUENCE
-            } else {
-                EXIT_OTHER
-            }
+            open_error_code(&error)
         }
         Err(CaptureFailure::Capture(error)) => {
-            let code = match error {
-                CaptureError::AlreadyPending => EXIT_CAPTURE_PENDING,
-                CaptureError::FingerTimeout => EXIT_FINGER_TIMEOUT,
-                _ => EXIT_OTHER,
-            };
             let _ = writeln!(err, "cvctl: capture failed: {error}");
-            code
+            capture_error_code(&error)
         }
     };
     signalled_exit(shutdown, err, code)
@@ -793,24 +780,15 @@ fn enroll(
         }
         Err(EnrolFailure::Handshake(error)) => {
             let _ = writeln!(err, "cvctl: handshake failed: {error}");
-            EXIT_OTHER
+            handshake_error_code(&error)
         }
         Err(EnrolFailure::Open(error)) => {
             let _ = writeln!(err, "cvctl: {error}");
-            if matches!(error, OpenError::WrongSequence) {
-                EXIT_SEQUENCE
-            } else {
-                EXIT_OTHER
-            }
+            open_error_code(&error)
         }
         Err(EnrolFailure::Enrol(error)) => {
-            let code = match &error {
-                EnrolError::Capture(CaptureError::FingerTimeout) => EXIT_FINGER_TIMEOUT,
-                EnrolError::Capture(CaptureError::AlreadyPending) => EXIT_CAPTURE_PENDING,
-                _ => EXIT_OTHER,
-            };
             let _ = writeln!(err, "cvctl: enrolment failed: {error}");
-            code
+            enrol_error_code(&error)
         }
     };
     signalled_exit(shutdown, err, code)
@@ -870,6 +848,37 @@ fn print_verdict(verdict: &Verdict, out: &mut dyn Write) {
     let _ = writeln!(out, "plaintext length {}", verdict.plaintext_len);
 }
 
+/// Maps the `0x23` / `0x24` handshake failure onto the probe's documented exit codes.
+///
+/// The handshake runs before every session command, so a transport failure there is still a
+/// transport failure during a command operation rather than a generic error.
+fn handshake_error_code(error: &HandshakeError) -> u8 {
+    match error {
+        HandshakeError::Transport(_) => EXIT_TRANSPORT,
+        _ => EXIT_OTHER,
+    }
+}
+
+/// Maps the wrapped `0x02` open failure onto the probe's documented exit codes.
+///
+/// Every session command starts here, so a wrong sequence and a transport failure get the same
+/// codes whether they happen during the open or later in the operation.
+fn open_error_code(error: &OpenError) -> u8 {
+    match error {
+        OpenError::WrongSequence => EXIT_SEQUENCE,
+        OpenError::Transport(_) => EXIT_TRANSPORT,
+        _ => EXIT_OTHER,
+    }
+}
+
+/// Maps a plain `0x04` close failure onto the probe's documented exit codes.
+fn close_error_code(error: &CloseError) -> u8 {
+    match error {
+        CloseError::Transport(_) => EXIT_TRANSPORT,
+        _ => EXIT_OTHER,
+    }
+}
+
 /// Maps a capture failure onto the probe's documented exit codes.
 fn capture_error_code(error: &CaptureError) -> u8 {
     use cv3_core::proto::status;
@@ -899,6 +908,38 @@ fn verify_error_code(error: &VerifyError) -> u8 {
         }
         VerifyError::Match(MatchError::SensorStatus(code)) if *code == status::CAPTURE_PENDING => {
             EXIT_CAPTURE_PENDING
+        }
+        _ => EXIT_OTHER,
+    }
+}
+
+/// Maps a mid-session cancel failure onto the probe's documented exit codes.
+fn cancel_error_code(error: &CancelError) -> u8 {
+    use cv3_core::proto::status;
+
+    match error {
+        CancelError::Transport(_) => EXIT_TRANSPORT,
+        CancelError::SensorStatus(code) if *code == status::BAD_SEQUENCE => EXIT_SEQUENCE,
+        _ => EXIT_OTHER,
+    }
+}
+
+/// Maps an enrolment failure onto the probe's documented exit codes.
+///
+/// The capture it composes keeps its own codes, and the update and commit stages report a rejected
+/// sequence as [`EnrolError::UpdateRejected`] or [`EnrolError::CommitRejected`], so both are read
+/// through this helper rather than falling through to [`EXIT_OTHER`].
+fn enrol_error_code(error: &EnrolError) -> u8 {
+    use cv3_core::proto::status;
+
+    match error {
+        EnrolError::Capture(error) => capture_error_code(error),
+        EnrolError::Transport { .. } => EXIT_TRANSPORT,
+        EnrolError::UpdateRejected { status: code, .. }
+        | EnrolError::CommitRejected { status: code }
+            if *code == status::BAD_SEQUENCE =>
+        {
+            EXIT_SEQUENCE
         }
         _ => EXIT_OTHER,
     }
@@ -965,15 +1006,11 @@ fn verify(
         }
         Err(VerifyFailure::Handshake(error)) => {
             let _ = writeln!(err, "cvctl: handshake failed: {error}");
-            EXIT_OTHER
+            handshake_error_code(&error)
         }
         Err(VerifyFailure::Open(error)) => {
             let _ = writeln!(err, "cvctl: {error}");
-            if matches!(error, OpenError::WrongSequence) {
-                EXIT_SEQUENCE
-            } else {
-                EXIT_OTHER
-            }
+            open_error_code(&error)
         }
         Err(VerifyFailure::Verify(error)) => {
             let _ = writeln!(err, "cvctl: verification failed: {error}");
@@ -1098,15 +1135,11 @@ fn cancel_then_verify(
         }
         Err(CancelThenVerifyFailure::Handshake(error)) => {
             let _ = writeln!(err, "cvctl: handshake failed: {error}");
-            EXIT_OTHER
+            handshake_error_code(&error)
         }
         Err(CancelThenVerifyFailure::Open(error)) => {
             let _ = writeln!(err, "cvctl: {error}");
-            if matches!(error, OpenError::WrongSequence) {
-                EXIT_SEQUENCE
-            } else {
-                EXIT_OTHER
-            }
+            open_error_code(&error)
         }
         Err(CancelThenVerifyFailure::Capture(error)) => {
             let _ = writeln!(err, "cvctl: the first capture failed: {error}");
@@ -1114,15 +1147,7 @@ fn cancel_then_verify(
         }
         Err(CancelThenVerifyFailure::Cancel(error)) => {
             let _ = writeln!(err, "cvctl: the mid-session cancel failed: {error}");
-            match &error {
-                CancelError::Transport(_) => EXIT_TRANSPORT,
-                CancelError::SensorStatus(code)
-                    if *code == cv3_core::proto::status::BAD_SEQUENCE =>
-                {
-                    EXIT_SEQUENCE
-                }
-                _ => EXIT_OTHER,
-            }
+            cancel_error_code(&error)
         }
         Err(CancelThenVerifyFailure::Verify(error)) => {
             let _ = writeln!(err, "cvctl: verification failed: {error}");
@@ -1230,7 +1255,7 @@ fn report_replay(outcome: ReplayOutcome, out: &mut dyn Write, err: &mut dyn Writ
         }
         ReplayOutcome::Handshake(Err(error)) => {
             let _ = writeln!(err, "cvctl: handshake failed: {error}");
-            EXIT_OTHER
+            handshake_error_code(&error)
         }
         ReplayOutcome::Open(Ok((handle, closed))) => {
             let _ = writeln!(out, "handle {handle:#010x}");
@@ -1242,15 +1267,11 @@ fn report_replay(outcome: ReplayOutcome, out: &mut dyn Write, err: &mut dyn Writ
         }
         ReplayOutcome::Open(Err(OpenFailure::Handshake(error))) => {
             let _ = writeln!(err, "cvctl: handshake failed: {error}");
-            EXIT_OTHER
+            handshake_error_code(&error)
         }
         ReplayOutcome::Open(Err(OpenFailure::Open(error))) => {
             let _ = writeln!(err, "cvctl: {error}");
-            if matches!(error, OpenError::WrongSequence) {
-                EXIT_SEQUENCE
-            } else {
-                EXIT_OTHER
-            }
+            open_error_code(&error)
         }
         ReplayOutcome::Close(Ok(())) => {
             let _ = writeln!(out, "secure session closed");
@@ -1258,11 +1279,11 @@ fn report_replay(outcome: ReplayOutcome, out: &mut dyn Write, err: &mut dyn Writ
         }
         ReplayOutcome::Close(Err(CloseFailure::Handshake(error))) => {
             let _ = writeln!(err, "cvctl: handshake failed: {error}");
-            EXIT_OTHER
+            handshake_error_code(&error)
         }
         ReplayOutcome::Close(Err(CloseFailure::Close(error))) => {
             let _ = writeln!(err, "cvctl: {error}");
-            EXIT_OTHER
+            close_error_code(&error)
         }
     }
 }
@@ -1877,7 +1898,7 @@ mod tests {
 
         let (code, out, err) = run_with(&["open"], &mut usb, &shutdown);
 
-        assert_eq!(code, 1);
+        assert_eq!(code, EXIT_TRANSPORT);
         assert_eq!(out, "");
         assert!(err.contains("timed out"), "{err}");
         assert!(
@@ -1913,10 +1934,29 @@ mod tests {
 
         let (code, out, err) = run_with(&["close"], &mut usb, &shutdown);
 
-        assert_eq!(code, 1);
+        assert_eq!(code, EXIT_TRANSPORT);
         assert_eq!(out, "");
         assert!(err.contains("disconnected"), "{err}");
         assert!(err.contains("closed locally"), "{err}");
+    }
+
+    #[test]
+    fn a_handshake_transport_failure_exits_with_the_transport_code() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.challenge_command_error = Some(UsbError::Timeout);
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["handshake"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_TRANSPORT);
+        assert_ne!(code, EXIT_OTHER);
+        assert_eq!(out, "");
+        assert!(err.contains("handshake failed"), "{err}");
+        assert!(err.contains("timed out"), "{err}");
+        assert!(
+            sent_command(&usb, cmd::CLOSE_SESSION).is_none(),
+            "no handle was learned, so there is nothing to close"
+        );
     }
 
     #[test]
@@ -2357,12 +2397,98 @@ mod tests {
 
         let (code, out, err) = run_with(&["capture"], &mut usb, &shutdown);
 
-        assert_eq!(code, EXIT_OTHER);
+        assert_eq!(code, EXIT_TRANSPORT);
+        assert_ne!(code, EXIT_FINGER_TIMEOUT);
         assert_eq!(out, "");
         assert!(err.contains("capture failed"), "{err}");
         assert!(err.contains("timed out"), "{err}");
         assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
         assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some());
+    }
+
+    #[test]
+    fn capture_reports_a_sequence_rejection_with_the_sequence_code() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.arm_status = 0x0f;
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["capture"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_SEQUENCE);
+        assert_ne!(code, EXIT_OTHER);
+        assert_eq!(out, "");
+        assert!(err.contains("0x0f"), "{err}");
+        assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
+        assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some());
+    }
+
+    #[test]
+    fn enroll_transport_failures_at_every_stage_exit_with_the_transport_code() {
+        type Configure = fn(&mut FakeUsb);
+
+        let stages: [(&str, Configure); 5] = [
+            ("0x6d discard", |usb| {
+                usb.discard_command_error = Some(UsbError::Timeout);
+            }),
+            ("0x8a start", |usb| {
+                usb.start_command_error = Some(UsbError::Disconnected);
+            }),
+            ("0x66 capture", |usb| {
+                usb.arm_command_error = Some(UsbError::Disconnected);
+            }),
+            ("0x6c update", |usb| {
+                usb.update_command_error = Some(UsbError::Timeout);
+            }),
+            ("0x6e commit", |usb| {
+                usb.completion_after = Some(1);
+                usb.commit_command_error = Some(UsbError::Stall);
+            }),
+        ];
+        let shutdown = SignalFlag::new();
+
+        for (stage, configure) in stages {
+            let mut usb = FakeUsb::with_sensor();
+            configure(&mut usb);
+
+            let (code, out, err) = run_with(&["enroll"], &mut usb, &shutdown);
+
+            assert_eq!(code, EXIT_TRANSPORT, "{stage}: {err}");
+            assert!(
+                !out.contains("template id"),
+                "{stage}: no template id is printed: {out}"
+            );
+            assert!(
+                err.contains("transport failed"),
+                "{stage} names the transport: {err}"
+            );
+            assert!(
+                sent_command(&usb, cmd::CLOSE_SESSION).is_some(),
+                "{stage} still tears the session down"
+            );
+        }
+    }
+
+    #[test]
+    fn enroll_reports_a_sequence_rejection_at_update_or_commit_with_the_sequence_code() {
+        let shutdown = SignalFlag::new();
+
+        let mut update = FakeUsb::with_sensor();
+        update.update_statuses = vec![0x0f];
+        let (code, out, err) = run_with(&["enroll"], &mut update, &shutdown);
+        assert_eq!(code, EXIT_SEQUENCE, "the 0x6c update: {err}");
+        assert_ne!(code, EXIT_OTHER);
+        assert_eq!(out, "", "no template id is printed");
+        assert!(err.contains("0x0f"), "{err}");
+        assert!(sent_command(&update, cmd::CLOSE_SESSION).is_some());
+
+        let mut commit = FakeUsb::with_sensor();
+        commit.completion_after = Some(1);
+        commit.commit_status = 0x0f;
+        let (code, out, err) = run_with(&["enroll"], &mut commit, &shutdown);
+        assert_eq!(code, EXIT_SEQUENCE, "the 0x6e commit: {err}");
+        assert_eq!(out, "sample 1 accepted (1/12)\n");
+        assert!(err.contains("0x0f"), "{err}");
+        assert!(sent_command(&commit, cmd::CLOSE_SESSION).is_some());
     }
 
     fn match_plaintext(word: u32, value: Option<&[u8; 20]>) -> Vec<u8> {

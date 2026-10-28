@@ -29,7 +29,7 @@ this is a probe, not a login driver.
 |---|---|
 | `crates/cv3-core` | Protocol core. Performs no I/O: events in, actions out. |
 | `crates/cv3-probe` | `cvctl`, the probe used to establish protocol facts on hardware. |
-| `crates/cv3-tod` | The libfprint TOD plugin: C shim plus Rust core wrapper. Not built yet. |
+| `crates/cv3-tod` | The libfprint TOD plugin: the C shim plus the Rust core it drives. Not built yet. |
 | `docs/adr/` | Why the shape is what it is. |
 | `docs/agents/` | Issue tracker, triage and domain-doc conventions for agents. |
 | `GLOSSARY.md` | The project's vocabulary. Read it before naming anything. |
@@ -61,7 +61,8 @@ The probe drives the sensor through the kernel's USB device nodes and therefore 
 
 `./scripts/check-core.sh` mechanically checks that the core's direct dependencies are only the
 pinned crypto set and that its source contains no `unsafe`; the GitHub workflow runs it alongside
-formatting, clippy and the workspace tests.
+formatting, clippy, the workspace tests, and `cargo-deny` for RustSec advisories and licences
+(`deny.toml`).
 
 ## `cvctl` exit codes
 
@@ -74,8 +75,8 @@ formatting, clippy and the workspace tests.
 | 4 | permission denied opening the sensor |
 | 5 | the sensor rejected the wrap sequence (`0x0F`) |
 | 6 | a replay diverged from its transcript |
-| 7 | `capture` found a capture already armed (`0x85`); the session was torn down |
-| 8 | `capture` (or `verify`) timed out waiting for the finger; the session was torn down |
+| 7 | a capture arm answered `0x85`: a capture was already armed; the session was torn down |
+| 8 | a finger wait timed out; the session was torn down |
 | 9 | `verify` completed with a genuine no-match; this is a result, not an error |
 | 10 | a transport failure during a command operation; distinct from a finger timeout |
 | 128 + signal | interrupted by a catchable signal (for example 130 for `SIGINT`) |
@@ -97,8 +98,9 @@ its short fingerprint is printed, because the key is freshly generated for the r
 
 `--hex` on `handshake`, `open`, `close`, `capture`, `enroll`, `verify` and `cancel-then-verify`
 writes every host frame and every device reply body to **stderr** as lowercase hex, prefixed `> `
-and `< ` (`< empty` for a reply with no body). The decoded output on stdout is unchanged. The flag
-is a transport wrapper over the core's `Transport` seam, so no operation changes.
+and `< ` (`< empty` for a reply with no body, `< finger` for the finger event). The decoded output
+on stdout is unchanged. The flag is a transport wrapper over the core's `Transport` seam, so no
+operation changes.
 
 A catchable signal (`SIGINT`, `SIGTERM`, `SIGHUP`) during the finger wait cancels that transfer,
 tears the session down (`0x68`, then `0x04`) and exits `128 + signal`; command transfers are never

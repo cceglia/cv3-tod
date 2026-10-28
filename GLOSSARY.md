@@ -36,13 +36,19 @@ _Avoid_: capture hash, image hash
 **Enrolment id**:
 The 20-byte identifier the sensor returns when an enrolment completes, naming the template it
 just stored.
-_Avoid_: template id, print id
+_Avoid_: print id
+
+**Template id**:
+The 20-byte value the `0x6E` commit submits to name the template the sensor stores. It is either the
+sensor's **enrolment id**, when the sensor named one, or the fallback **sample hash** of the last
+accepted sample; the enrolment records which of the two it used.
+_Avoid_: template name, print id
 
 **Match id**:
 The 20-byte value the sensor returns alongside a positive match. It is not the enrolment id and the two
 are not comparable; what it is derived from, and whether it is stable across sessions, is not
 established.
-_Avoid_: template id, matched id
+_Avoid_: matched id
 
 **Bound print**:
 A print whose verification requires the sensor to report the same match id that was recorded for it.

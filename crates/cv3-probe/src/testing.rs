@@ -57,6 +57,8 @@ pub struct FakeUsb {
     pub signal_after_enumerate: Option<SignalFlag>,
     pub signal_after_descriptor: Option<SignalFlag>,
     pub challenge_status: u32,
+    /// If set, the scripted sensor fails the plain `0x23` challenge in the transport.
+    pub challenge_command_error: Option<UsbError>,
     pub response_status: u32,
     pub challenge_body: Option<Vec<u8>>,
     /// Status the scripted sensor answers the wrapped `0x02` open with.
@@ -83,6 +85,8 @@ pub struct FakeUsb {
     pub discard_command_error: Option<UsbError>,
     /// Status the scripted sensor answers the plain `0x8a` start with.
     pub start_status: u32,
+    /// If set, the scripted sensor fails the plain `0x8a` start in the transport.
+    pub start_command_error: Option<UsbError>,
     /// Status the scripted sensor answers a `0x6c` update with when `update_statuses` is empty.
     pub update_status: u32,
     /// Per-update statuses consumed in order before falling back to `update_status`.
@@ -127,6 +131,7 @@ impl Default for FakeUsb {
             signal_after_enumerate: None,
             signal_after_descriptor: None,
             challenge_status: 0,
+            challenge_command_error: None,
             response_status: 0,
             challenge_body: None,
             open_status: 0,
@@ -141,6 +146,7 @@ impl Default for FakeUsb {
             discard_status: 0,
             discard_command_error: None,
             start_status: 0,
+            start_command_error: None,
             update_status: 0x8f,
             update_statuses: Vec::new(),
             update_command_error: None,
@@ -217,6 +223,7 @@ impl UsbBackend for FakeUsb {
             sent: Rc::clone(&self.sent),
             challenge: self.challenge_body.clone(),
             challenge_status: self.challenge_status,
+            challenge_command_error: self.challenge_command_error.clone(),
             response_status: self.response_status,
             open_status: self.open_status,
             open_command_error: self.open_command_error.clone(),
@@ -230,6 +237,7 @@ impl UsbBackend for FakeUsb {
             discard_status: self.discard_status,
             discard_command_error: self.discard_command_error.clone(),
             start_status: self.start_status,
+            start_command_error: self.start_command_error.clone(),
             update_status: self.update_status,
             update_statuses: self.update_statuses.clone(),
             update_command_error: self.update_command_error.clone(),
@@ -346,6 +354,7 @@ pub struct HandshakeSensor {
     pub sent: Rc<RefCell<Vec<Vec<u8>>>>,
     pub challenge: Option<Vec<u8>>,
     pub challenge_status: u32,
+    pub challenge_command_error: Option<UsbError>,
     pub response_status: u32,
     pub open_status: u32,
     pub open_command_error: Option<UsbError>,
@@ -359,6 +368,7 @@ pub struct HandshakeSensor {
     pub discard_status: u32,
     pub discard_command_error: Option<UsbError>,
     pub start_status: u32,
+    pub start_command_error: Option<UsbError>,
     pub update_status: u32,
     pub update_statuses: Vec<u32>,
     pub update_command_error: Option<UsbError>,
@@ -574,6 +584,11 @@ impl UsbIo for HandshakeSensor {
             frame.get(9).copied().unwrap_or(0),
         ]);
         match command {
+            cmd::CHALLENGE => {
+                if let Some(error) = &self.challenge_command_error {
+                    return Err(error.clone());
+                }
+            }
             cmd::CHALLENGE_RESPONSE => {
                 self.derive_session_key(frame);
                 if let Some(flag) = &self.signal_during_command {
@@ -587,6 +602,11 @@ impl UsbIo for HandshakeSensor {
             }
             cmd::DISCARD_ENROLMENT => {
                 if let Some(error) = &self.discard_command_error {
+                    return Err(error.clone());
+                }
+            }
+            cmd::START_ENROLMENT => {
+                if let Some(error) = &self.start_command_error {
                     return Err(error.clone());
                 }
             }

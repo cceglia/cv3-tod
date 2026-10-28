@@ -1,9 +1,10 @@
 //! `--hex`: dumps both transport directions for protocol work.
 //!
-//! [`HexTransport`] wraps any core [`Transport`] and writes each host frame and each device reply
-//! body to a sink as lowercase hex. The operation and the core do not know it is there; this is
-//! the same layering the recording wrapper in [`cv3_core::transcript`] uses. The probe points the
-//! sink at stderr, so stdout keeps exactly the decoded fields it prints without the flag.
+//! [`HexTransport`] wraps any core [`Transport`] and writes each host frame, each device reply
+//! body and each finger event to a sink as lowercase hex or a marker line. The operation and the
+//! core do not know it is there; this is the same layering the recording wrapper in
+//! [`cv3_core::transcript`] uses. The probe points the sink at stderr, so stdout keeps exactly the
+//! decoded fields it prints without the flag.
 
 use std::io::Write;
 
@@ -49,7 +50,13 @@ impl<T: Transport> Transport for HexTransport<'_, T> {
     }
 
     fn wait_finger(&mut self) -> Event {
-        self.inner.wait_finger()
+        let event = self.inner.wait_finger();
+        // The finger event is the one device-to-host event with no reply body. Without a marker
+        // the dump would show the host frame that armed the capture and then nothing.
+        if matches!(event, Event::Finger) {
+            let _ = writeln!(self.out, "< finger");
+        }
+        event
     }
 }
 
@@ -67,7 +74,7 @@ mod tests {
     use cv3_core::{ScriptedOutcome, ScriptedTransport};
 
     #[test]
-    fn dumps_each_host_frame_and_reply_body_in_lowercase_hex() {
+    fn dumps_each_host_frame_reply_body_and_finger_event() {
         let mut out = Vec::new();
         let mut transport = HexTransport::new(
             ScriptedTransport::new([
@@ -93,6 +100,6 @@ mod tests {
         drop(transport);
 
         let text = String::from_utf8(out).expect("the dump is UTF-8");
-        assert_eq!(text, "> 01fe\n< abcd\n> 04\n< empty\n");
+        assert_eq!(text, "> 01fe\n< abcd\n< finger\n> 04\n< empty\n");
     }
 }
