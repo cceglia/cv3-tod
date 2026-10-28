@@ -19,6 +19,7 @@ this is a probe, not a login driver.
 | `open` / `close` | Opens the wrapped `0x02` session and releases it with plain `0x04`. |
 | `capture` | Arms `0x66`, waits for the finger, reads the sample hash and tears the session down. |
 | `enroll` | Discards, starts, captures, submits, commits and prints the template id it now holds. |
+| `enroll-then-verify` | Enrols and commits, then takes one confirmation touch and matches it in the **same session**. It is the ticket-09 measurement tool: it reports whether a match immediately after a commit works and what value comes back, and it is **not** a binding check. |
 | `verify` | Captures and matches `0x73`, printing the raw verdict word, the 20-byte value and the reply lengths. |
 | `cancel-then-verify` | Cancels a capture mid-session and verifies in the same session; it is the run that can settle the wrap-sequence question when the first arm answers `0x85`, and the current reading is unmeasured. |
 | `handshake`/`open`/`close --record` | Writes a wire-only transcript; `cvctl replay <file>` reproduces it without hardware. |
@@ -88,6 +89,13 @@ exiting. `verify` prints the raw verdict word with its meaning (`verdict 1 (matc
 length and the decrypted plaintext length, then runs the same teardown. The value's meaning is not
 established, and `verify` does not yet compare it with anything: ticket 10 owns id binding.
 
+`cvctl enroll-then-verify` is the ticket-09 measurement tool: it enrols and commits, prints the
+template id and its source, then takes one more touch and runs `0x73` in the **same secure
+session**, printing the verdict the way `verify` does. It answers whether a capture and match
+immediately after a commit are accepted and what value that reply carries. It deliberately does
+not compare the value with the enrolment id — ticket 10 owns binding — so a match here proves only
+that the sensor matched some enrolled template.
+
 `cvctl cancel-then-verify` owns one session and runs the sequence that can settle the wrap-sequence
 question: it arms a capture, cancels it with the mid-session `0x68` before any finger, then runs a
 full verification in the same session and prints its verdict the way `verify` does. An arm that
@@ -98,7 +106,8 @@ disagree about; the current reading is still unmeasured, and the run settles it 
 `handshake --show-key` adds the derived session key to the ordinary report. Without the flag only
 its short fingerprint is printed, because the key is freshly generated for the run and sensitive.
 
-`--hex` on `handshake`, `open`, `close`, `capture`, `enroll`, `verify` and `cancel-then-verify`
+`--hex` on `handshake`, `open`, `close`, `capture`, `enroll`, `enroll-then-verify`, `verify` and
+`cancel-then-verify`
 writes every host frame and every device reply body to **stderr** as lowercase hex, prefixed `> `
 and `< ` (`< empty` for a reply with no body, `< finger` for the finger event). The decoded output
 on stdout is unchanged. The flag is a transport wrapper over the core's `Transport` seam, so no

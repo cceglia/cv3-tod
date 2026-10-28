@@ -110,6 +110,9 @@ pub struct FakeUsb {
     pub match_command_error: Option<UsbError>,
     /// What the finger wait delivers. `None` is a genuine `0x03` finger event.
     pub finger_event: Option<Result<Vec<u8>, UsbError>>,
+    /// Per-wait finger results consumed in order before falling back to `finger_event`, so a test
+    /// can let an enrolment's touches succeed and fail only the confirmation one.
+    pub finger_events: Vec<Result<Vec<u8>, UsbError>>,
     /// Raised when the scripted sensor sends the `0x24` response, as a signal mid-command would be.
     pub signal_during_command: Option<SignalFlag>,
     /// Raised when the finger wait starts, as a signal mid-wait would be.
@@ -158,6 +161,7 @@ impl Default for FakeUsb {
             match_plaintext: None,
             match_command_error: None,
             finger_event: None,
+            finger_events: Vec::new(),
             signal_during_command: None,
             signal_during_finger: None,
             sent: Rc::new(RefCell::new(Vec::new())),
@@ -250,6 +254,7 @@ impl UsbBackend for FakeUsb {
             match_command_error: self.match_command_error.clone(),
             accepted_updates: 0,
             finger_event: self.finger_event.clone(),
+            finger_events: self.finger_events.clone(),
             signal_during_command: self.signal_during_command.clone(),
             signal_during_finger: self.signal_during_finger.clone(),
             cancellation,
@@ -381,6 +386,7 @@ pub struct HandshakeSensor {
     pub match_command_error: Option<UsbError>,
     pub accepted_updates: usize,
     pub finger_event: Option<Result<Vec<u8>, UsbError>>,
+    pub finger_events: Vec<Result<Vec<u8>, UsbError>>,
     pub signal_during_command: Option<SignalFlag>,
     pub signal_during_finger: Option<SignalFlag>,
     /// The handle the CLI threaded in; a raised flag makes the finger wait report cancellation.
@@ -671,7 +677,12 @@ impl UsbIo for HandshakeSensor {
             // The real transport polls the same handle in slices and returns Cancelled.
             return Err(UsbError::Cancelled);
         }
-        match self.finger_event.clone() {
+        let scheduled = if self.finger_events.is_empty() {
+            None
+        } else {
+            Some(self.finger_events.remove(0))
+        };
+        match scheduled.or_else(|| self.finger_event.clone()) {
             Some(result) => result,
             None => Ok(interrupt::FINGER.to_le_bytes().to_vec()),
         }

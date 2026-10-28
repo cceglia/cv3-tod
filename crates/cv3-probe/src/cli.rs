@@ -57,6 +57,7 @@ const USAGE: &str = "usage: cvctl devices
        cvctl close [--hex] [--record <file>]
        cvctl capture [--hex]
        cvctl enroll [--hex]
+       cvctl enroll-then-verify [--hex]
        cvctl verify [--hex]
        cvctl cancel-then-verify [--hex]
        cvctl replay <file>";
@@ -82,6 +83,9 @@ enum Command<'a> {
         hex: bool,
     },
     Enroll {
+        hex: bool,
+    },
+    EnrollThenVerify {
         hex: bool,
     },
     Verify {
@@ -139,6 +143,10 @@ fn parse(args: &[String]) -> Option<Command<'_>> {
         "enroll" => {
             let flags = parse_flags(rest, false, false, false)?;
             Some(Command::Enroll { hex: flags.hex })
+        }
+        "enroll-then-verify" => {
+            let flags = parse_flags(rest, false, false, false)?;
+            Some(Command::EnrollThenVerify { hex: flags.hex })
         }
         "verify" => {
             let flags = parse_flags(rest, false, false, false)?;
@@ -212,6 +220,9 @@ pub fn run(
         Some(Command::Close { hex, record }) => close(backend, shutdown, hex, record, out, err),
         Some(Command::Capture { hex }) => capture(backend, shutdown, hex, out, err),
         Some(Command::Enroll { hex }) => enroll(backend, shutdown, hex, out, err),
+        Some(Command::EnrollThenVerify { hex }) => {
+            enroll_then_verify(backend, shutdown, hex, out, err)
+        }
         Some(Command::Verify { hex }) => verify(backend, shutdown, hex, out, err),
         Some(Command::CancelThenVerify { hex }) => {
             cancel_then_verify(backend, shutdown, hex, out, err)
@@ -660,33 +671,28 @@ struct EnrolReport {
     source: TemplateSource,
 }
 
-/// Opens the secure session, runs a whole enrolment, prints progress as samples are accepted and
-/// tears the session down afterwards.
+/// Drives a whole enrolment over an open session and returns the committed template **with the
+/// session still open**, printing progress as samples are accepted or rejected.
 ///
 /// The operation is driven one event at a time rather than through [`drive`] so its
 /// [`Enrol::progress`] can be read between steps and printed. The core stays callback-free.
-/// A failed enrolment has already torn the session down; a successful one is torn down here,
-/// because the probe does not perform the binding confirmation.
-fn enrol_over(
+/// The caller owns the teardown: `cvctl enroll` tears down straight away, while
+/// `cvctl enroll-then-verify` keeps the session for the confirmation touch.
+fn enrol_session(
     transport: &mut dyn Transport,
-    secrets: RunSecrets,
-    open_iv: [u8; cv3_core::crypto::BLOCK_LEN],
-    base_iv: [u8; cv3_core::crypto::BLOCK_LEN],
+    session: Session,
+    base_iv: [u8; BLOCK_LEN],
     progress_out: &mut dyn Write,
-) -> Result<(EnrolReport, Result<(), TeardownError>), EnrolFailure> {
-    let run = handshake_over(transport, secrets, true).map_err(EnrolFailure::Handshake)?;
-    let mut open = OpenSession::new(run.session, open_iv);
-    let session = drive(&mut open, transport).map_err(EnrolFailure::Open)?;
-
+) -> Result<EnrolledTemplate, EnrolError> {
     let mut enrol = Enrol::new(session, base_iv);
     let mut action = enrol.start();
     let mut shown_accepted = 0usize;
     let mut shown_rejected = 0usize;
-    let outcome = loop {
+    loop {
         match action {
             Action::Send(frame) => action = enrol.step(transport.command(&frame)),
             Action::WaitFinger => action = enrol.step(transport.wait_finger()),
-            Action::Finish(result) => break result,
+            Action::Finish(result) => return result,
         }
 
         let progress = enrol.progress();
@@ -701,9 +707,26 @@ fn enrol_over(
             shown_rejected += 1;
             let _ = writeln!(progress_out, "sample rejected; place the finger again");
         }
-    };
+    }
+}
 
-    match outcome {
+/// Opens the secure session, runs a whole enrolment, prints progress as samples are accepted and
+/// tears the session down afterwards.
+///
+/// A failed enrolment has already torn the session down; a successful one is torn down here,
+/// because `cvctl enroll` does not perform the binding confirmation.
+fn enrol_over(
+    transport: &mut dyn Transport,
+    secrets: RunSecrets,
+    open_iv: [u8; BLOCK_LEN],
+    base_iv: [u8; BLOCK_LEN],
+    progress_out: &mut dyn Write,
+) -> Result<(EnrolReport, Result<(), TeardownError>), EnrolFailure> {
+    let run = handshake_over(transport, secrets, true).map_err(EnrolFailure::Handshake)?;
+    let mut open = OpenSession::new(run.session, open_iv);
+    let session = drive(&mut open, transport).map_err(EnrolFailure::Open)?;
+
+    match enrol_session(transport, session, base_iv, progress_out) {
         Ok(EnrolledTemplate {
             template_id,
             source,
@@ -789,6 +812,137 @@ fn enroll(
         Err(EnrolFailure::Enrol(error)) => {
             let _ = writeln!(err, "cvctl: enrolment failed: {error}");
             enrol_error_code(&error)
+        }
+    };
+    signalled_exit(shutdown, err, code)
+}
+
+/// Where an enrol-then-verify run stopped.
+enum EnrollThenVerifyFailure {
+    Handshake(HandshakeError),
+    Open(OpenError),
+    /// The enrolment failed; its own teardown has run.
+    Enrol(EnrolError),
+    /// The confirmation capture or match failed; verification's own teardown has run.
+    Verify(VerifyError),
+}
+
+/// Opens **one** session, enrols and commits in it, then takes the confirmation touch and matches
+/// it in that same session.
+///
+/// The wire order is `0x02`, `0x6D`, `0x8A`, (`0x66`, `0x6C`) once per sample, `0x6E`, one more
+/// `0x66`, then `0x73`, followed by the cancel-then-close teardown. The template id is printed
+/// before the confirmation so a failed confirmation still reports what was committed. This is
+/// ticket 09's measurement tool: it reports the value the match returns but never compares it with
+/// the enrolment id, because ticket 10 owns binding.
+fn enroll_then_verify_over(
+    transport: &mut dyn Transport,
+    secrets: RunSecrets,
+    open_iv: [u8; BLOCK_LEN],
+    enrol_iv: [u8; BLOCK_LEN],
+    capture_iv: [u8; BLOCK_LEN],
+    match_iv: [u8; BLOCK_LEN],
+    out: &mut dyn Write,
+) -> Result<(Verdict, Result<(), TeardownError>), EnrollThenVerifyFailure> {
+    let run =
+        handshake_over(transport, secrets, true).map_err(EnrollThenVerifyFailure::Handshake)?;
+    let mut open = OpenSession::new(run.session, open_iv);
+    let session = drive(&mut open, transport).map_err(EnrollThenVerifyFailure::Open)?;
+
+    let EnrolledTemplate {
+        template_id,
+        source,
+        session,
+        ..
+    } = enrol_session(transport, session, enrol_iv, out).map_err(EnrollThenVerifyFailure::Enrol)?;
+    let _ = writeln!(out, "template id {} ({})", hex(&template_id), source);
+
+    let mut verify = Verify::new(session, capture_iv, match_iv);
+    match drive(&mut verify, transport) {
+        Ok(Verification { verdict, session }) => {
+            let mut teardown = Teardown::new(session.handle);
+            drop(session);
+            Ok((verdict, drive(&mut teardown, transport)))
+        }
+        Err(error) => Err(EnrollThenVerifyFailure::Verify(error)),
+    }
+}
+
+/// Runs the ticket-09 measurement: enrol, commit, confirmation touch and match in one session.
+fn enroll_then_verify(
+    backend: &mut dyn UsbBackend,
+    shutdown: &dyn Shutdown,
+    dump_hex: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let mut ivs = [[0u8; BLOCK_LEN]; 4];
+    for slot in &mut ivs {
+        *slot = match random_iv() {
+            Ok(iv) => iv,
+            Err(error) => {
+                let _ = writeln!(err, "cvctl: {error}");
+                return EXIT_OTHER;
+            }
+        };
+    }
+    let [open_iv, enrol_iv, capture_iv, match_iv] = ivs;
+
+    let mut channel = match open_for_command(backend, shutdown) {
+        Ok(channel) => channel,
+        Err(error) => {
+            report(&error, err);
+            return error.exit_code();
+        }
+    };
+    let secrets = match RunSecrets::generate() {
+        Ok(secrets) => secrets,
+        Err(error) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            return EXIT_OTHER;
+        }
+    };
+
+    let (outcome, _) = with_transport(
+        &mut channel,
+        "enroll-then-verify",
+        None,
+        dump_hex,
+        err,
+        |transport| {
+            enroll_then_verify_over(
+                transport, secrets, open_iv, enrol_iv, capture_iv, match_iv, out,
+            )
+        },
+    );
+
+    let code = match outcome {
+        Ok((verdict, teardown)) => {
+            print_verdict(&verdict, out);
+            if let Err(error) = teardown {
+                let _ = writeln!(err, "cvctl: {error}");
+            }
+            if verdict.matched {
+                EXIT_OK
+            } else {
+                EXIT_NO_MATCH
+            }
+        }
+        Err(EnrollThenVerifyFailure::Handshake(error)) => {
+            let _ = writeln!(err, "cvctl: handshake failed: {error}");
+            handshake_error_code(&error)
+        }
+        Err(EnrollThenVerifyFailure::Open(error)) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            open_error_code(&error)
+        }
+        Err(EnrollThenVerifyFailure::Enrol(error)) => {
+            let _ = writeln!(err, "cvctl: enrolment failed: {error}");
+            enrol_error_code(&error)
+        }
+        Err(EnrollThenVerifyFailure::Verify(error)) => {
+            let _ = writeln!(err, "cvctl: verification failed: {error}");
+            verify_error_code(&error)
         }
     };
     signalled_exit(shutdown, err, code)
@@ -1311,7 +1465,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use cv3_core::frame;
-    use cv3_core::proto::{attr, cmd};
+    use cv3_core::proto::{attr, cmd, interrupt};
     use cv3_core::transcript::TranscriptRecord;
 
     use crate::discovery::UsbError;
@@ -2489,6 +2643,258 @@ mod tests {
         assert_eq!(out, "sample 1 accepted (1/12)\n");
         assert!(err.contains("0x0f"), "{err}");
         assert!(sent_command(&commit, cmd::CLOSE_SESSION).is_some());
+    }
+
+    #[test]
+    fn enroll_then_verify_runs_the_whole_measurement_in_one_session() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.completion_after = Some(2);
+        let shutdown = SignalFlag::new();
+
+        let (code, _out, err) = run_with(&["enroll-then-verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(err, "");
+        assert_eq!(
+            sent_commands(&usb),
+            [
+                cmd::CHALLENGE,
+                cmd::CHALLENGE_RESPONSE,
+                cmd::OPEN_SESSION,
+                cmd::DISCARD_ENROLMENT,
+                cmd::START_ENROLMENT,
+                cmd::ARM_CAPTURE,
+                cmd::UPDATE_ENROLMENT,
+                cmd::ARM_CAPTURE,
+                cmd::UPDATE_ENROLMENT,
+                cmd::COMMIT_ENROLMENT,
+                cmd::ARM_CAPTURE,
+                cmd::MATCH,
+                cmd::CANCEL_CAPTURE,
+                cmd::CLOSE_SESSION,
+            ],
+            "one session: 0x02, the enrolment, then the confirmation capture and 0x73, then teardown"
+        );
+        assert_eq!(
+            sent_commands(&usb)
+                .iter()
+                .filter(|command| **command == cmd::OPEN_SESSION)
+                .count(),
+            1,
+            "the confirmation touch happens in the enrolment's session"
+        );
+        assert_eq!(
+            sent_commands(&usb)
+                .iter()
+                .filter(|command| **command == cmd::CLOSE_SESSION)
+                .count(),
+            1
+        );
+        assert_eq!(
+            sent_commands(&usb)
+                .iter()
+                .filter(|command| **command == cmd::ARM_CAPTURE)
+                .count(),
+            3,
+            "two enrolment samples and one confirmation capture"
+        );
+    }
+
+    #[test]
+    fn enroll_then_verify_prints_progress_template_id_then_the_verdict() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.completion_after = Some(2);
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["enroll-then-verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(err, "");
+        let expected = format!(
+            "sample 1 accepted (1/12)\n\
+             sample 2 accepted (2/12)\n\
+             template id {} (sensor enrolment id)\n\
+             {}",
+            hex(&ENROLMENT_ID),
+            verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
+        );
+        assert_eq!(
+            out, expected,
+            "progress, the template id, then the verdict detail"
+        );
+    }
+
+    #[test]
+    fn enroll_then_verify_reports_a_no_match_after_naming_the_template_and_tears_down() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.completion_after = Some(2);
+        usb.match_plaintext = Some(match_plaintext(VERDICT_NO_MATCH, Some(&MATCH_VALUE)));
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["enroll-then-verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_NO_MATCH);
+        assert_ne!(code, EXIT_OTHER);
+        assert_eq!(err, "");
+        assert!(
+            out.contains(&format!(
+                "template id {} (sensor enrolment id)",
+                hex(&ENROLMENT_ID)
+            )),
+            "the template id is printed before the confirmation: {out}"
+        );
+        assert!(out.ends_with(&verify_output(
+            VERDICT_NO_MATCH,
+            Some(&MATCH_VALUE),
+            108,
+            52
+        )));
+        assert_eq!(
+            sent_commands(&usb)
+                .iter()
+                .filter(|c| **c == cmd::CANCEL_CAPTURE)
+                .count(),
+            1,
+            "the successful no-match run tears the session down once"
+        );
+        assert_eq!(
+            sent_commands(&usb)
+                .iter()
+                .filter(|c| **c == cmd::CLOSE_SESSION)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn enroll_then_verify_tears_down_when_the_confirmation_finger_never_arrives() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.completion_after = Some(2);
+        let finger = Ok(interrupt::FINGER.to_le_bytes().to_vec());
+        usb.finger_events = vec![finger.clone(), finger, Err(UsbError::Timeout)];
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["enroll-then-verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_FINGER_TIMEOUT);
+        assert_ne!(code, EXIT_TRANSPORT);
+        assert!(
+            out.contains(&format!(
+                "template id {} (sensor enrolment id)",
+                hex(&ENROLMENT_ID)
+            )),
+            "the committed template is still reported: {out}"
+        );
+        assert!(err.contains("verification failed"), "{err}");
+        assert!(err.contains("finger timeout"), "{err}");
+        assert_eq!(
+            sent_commands(&usb)
+                .iter()
+                .filter(|c| **c == cmd::CANCEL_CAPTURE)
+                .count(),
+            1,
+            "the failed confirmation tears the session down once"
+        );
+        assert_eq!(
+            sent_commands(&usb)
+                .iter()
+                .filter(|c| **c == cmd::CLOSE_SESSION)
+                .count(),
+            1
+        );
+        assert!(
+            sent_command(&usb, cmd::MATCH).is_none(),
+            "the match is never attempted without the confirmation touch"
+        );
+    }
+
+    #[test]
+    fn enroll_then_verify_stops_at_a_rejected_commit_and_never_matches() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.completion_after = Some(1);
+        usb.commit_status = 0x0c;
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["enroll-then-verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OTHER);
+        assert_eq!(
+            out, "sample 1 accepted (1/12)\n",
+            "no template id is printed"
+        );
+        assert!(err.contains("enrolment failed"), "{err}");
+        assert!(err.contains("0x0c"), "{err}");
+        assert!(err.contains("may exist"), "{err}");
+        assert!(
+            sent_command(&usb, cmd::MATCH).is_none(),
+            "a failed enrolment does not attempt the confirmation match"
+        );
+        assert_eq!(
+            sent_commands(&usb)
+                .iter()
+                .filter(|c| **c == cmd::CANCEL_CAPTURE)
+                .count(),
+            1,
+            "the enrolment's own teardown is not repeated"
+        );
+        assert_eq!(
+            sent_commands(&usb)
+                .iter()
+                .filter(|c| **c == cmd::CLOSE_SESSION)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn enroll_then_verify_hex_dumps_the_enrolment_and_confirmation_frames_to_stderr() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.completion_after = Some(2);
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["enroll-then-verify", "--hex"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert!(
+            !out.contains("> ") && !out.contains("< "),
+            "the hex dump never reaches stdout: {out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "template id {} (sensor enrolment id)",
+                hex(&ENROLMENT_ID)
+            )),
+            "stdout keeps the decoded lines: {out}"
+        );
+        assert!(out.contains("verdict 1 (match)"), "{out}");
+
+        let sent = usb.sent.borrow();
+        let host: Vec<&str> = err.lines().filter(|line| line.starts_with("> ")).collect();
+        assert_eq!(host.len(), sent.len(), "one host line per frame: {err}");
+        for (line, frame) in host.iter().zip(sent.iter()) {
+            assert_eq!(*line, format!("> {}", hex(frame)));
+        }
+
+        for wanted in [cmd::DISCARD_ENROLMENT, cmd::COMMIT_ENROLMENT, cmd::MATCH] {
+            let frame = sent
+                .iter()
+                .find(|frame| command(frame) == wanted)
+                .unwrap_or_else(|| panic!("{wanted:#04x} was sent"));
+            assert!(
+                err.contains(&format!("> {}", hex(frame))),
+                "the {wanted:#04x} frame is in the dump: {err}"
+            );
+        }
+
+        let last_arm = sent
+            .iter()
+            .rev()
+            .find(|frame| command(frame) == cmd::ARM_CAPTURE)
+            .expect("the confirmation arm was sent");
+        assert!(
+            err.contains(&format!("> {}", hex(last_arm))),
+            "the confirmation capture is in the dump: {err}"
+        );
     }
 
     fn match_plaintext(word: u32, value: Option<&[u8; 20]>) -> Vec<u8> {

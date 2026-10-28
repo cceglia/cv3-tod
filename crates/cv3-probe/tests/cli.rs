@@ -15,7 +15,8 @@ fn a_bare_invocation_prints_usage_to_stderr_and_exits_one() {
         "usage: cvctl devices\n       cvctl handshake [--show-key] [--hex] [--record <file>]\n       \
          cvctl open [--bad-sequence] [--hex] [--record <file>]\n       \
          cvctl close [--hex] [--record <file>]\n       \
-         cvctl capture [--hex]\n       cvctl enroll [--hex]\n       cvctl verify [--hex]\n       \
+         cvctl capture [--hex]\n       cvctl enroll [--hex]\n       \
+         cvctl enroll-then-verify [--hex]\n       cvctl verify [--hex]\n       \
          cvctl cancel-then-verify [--hex]\n       cvctl replay <file>\n"
     );
 }
