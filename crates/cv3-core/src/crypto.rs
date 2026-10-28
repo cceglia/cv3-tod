@@ -147,6 +147,17 @@ pub fn sha1(data: &[u8]) -> [u8; SHA1_LEN] {
     out
 }
 
+/// SHA-256 over `data`.
+///
+/// The secure session's MAC key is `SHA-256` of a published seed, so this hash is protocol
+/// material rather than only a fingerprinting helper.
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let digest = Sha256::digest(data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
 /// A host P-256 keypair.
 ///
 /// The sensor does not authenticate the host, so the probe generates one per run and never stores
@@ -316,6 +327,25 @@ mod tests {
         assert_eq!(
             sha1(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
             array::<20>("84983e441c3bd26ebaae4aa1f95129e5e54670f1")
+        );
+    }
+
+    // FIPS 180-2, appendix B.1 ("abc") and the empty-message value from the same definition.
+    #[test]
+    fn sha256_matches_fips_180_2() {
+        assert_eq!(
+            sha256(b"abc"),
+            array::<32>(
+                "ba7816bf8f01cfea414140de5dae2223
+                 b00361a396177a9cb410ff61f20015ad"
+            )
+        );
+        assert_eq!(
+            sha256(b""),
+            array::<32>(
+                "e3b0c44298fc1c149afbf4c8996fb924
+                 27ae41e4649b934ca495991b7852b855"
+            )
         );
     }
 

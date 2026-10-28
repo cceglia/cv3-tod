@@ -6,20 +6,25 @@
 
 use std::io::Write;
 
-use cv3_core::handshake::Handshake;
+use cv3_core::handshake::{Handshake, HandshakeError};
+use cv3_core::session::{CloseSession, OpenError, OpenSession, Session};
 
-use crate::discovery::{ProbeError, UsbBackend, open_for_command, probe};
+use crate::discovery::{CommandSession, ProbeError, UsbBackend, open_for_command, probe};
 use crate::driver::{NoFingerWait, run as drive};
-use crate::random::RunSecrets;
+use crate::random::{RandomError, RunSecrets, random_iv};
 use crate::signals::Shutdown;
 
 /// The sensor was found, opened and released.
 pub const EXIT_OK: u8 = 0;
 /// Any error without its own code, including a bad usage line.
 pub const EXIT_OTHER: u8 = 1;
+/// The sensor refused the wrap sequence (`0x0F`); distinct so a probe run can tell it apart.
+pub const EXIT_SEQUENCE: u8 = 5;
 
 const USAGE: &str = "usage: cvctl devices
-       cvctl handshake [--show-key]";
+       cvctl handshake [--show-key]
+       cvctl open [--bad-sequence]
+       cvctl close";
 
 /// Runs one invocation and returns its exit status.
 ///
@@ -46,6 +51,11 @@ pub fn run(
         [command, flag] if command == "handshake" && flag == "--show-key" => {
             handshake(backend, shutdown, true, out, err)
         }
+        [command] if command == "open" => open(backend, shutdown, false, out, err),
+        [command, flag] if command == "open" && flag == "--bad-sequence" => {
+            open(backend, shutdown, true, out, err)
+        }
+        [command] if command == "close" => close(backend, shutdown, out, err),
         _ => {
             let _ = writeln!(err, "{USAGE}");
             EXIT_OTHER
@@ -53,7 +63,69 @@ pub fn run(
     }
 }
 
+/// A completed handshake and the claimed command channel that produced it.
+struct HandshakeRun {
+    channel: CommandSession,
+    session: Session,
+    host_public: [u8; 64],
+}
+
+/// Why the shared handshake step did not produce a session.
+enum HandshakeFailure {
+    Probe(ProbeError),
+    Random(RandomError),
+    Handshake(HandshakeError),
+}
+
+/// Runs the handshake, keeping the handle only when `keep_handle` asks for a secure session.
+fn establish(
+    backend: &mut dyn UsbBackend,
+    shutdown: &dyn Shutdown,
+    keep_handle: bool,
+) -> Result<HandshakeRun, HandshakeFailure> {
+    let mut channel = open_for_command(backend, shutdown).map_err(HandshakeFailure::Probe)?;
+
+    // The host keypair is fresh for every invocation and is never stored.
+    let secrets = RunSecrets::generate().map_err(HandshakeFailure::Random)?;
+    let host_public = secrets.host_key.public_key();
+    let mut operation = Handshake::new(secrets.client_nonce, secrets.host_key, secrets.host_nonce);
+    if keep_handle {
+        operation = operation.keeping_handle();
+    }
+
+    let outcome = {
+        let mut exchange = channel.exchange();
+        drive(&mut exchange, &mut operation, &mut NoFingerWait)
+    };
+    let session = outcome.map_err(HandshakeFailure::Handshake)?;
+    Ok(HandshakeRun {
+        channel,
+        session,
+        host_public,
+    })
+}
+
+/// Reports a failed shared handshake step and returns its exit status.
+fn report_handshake(failure: HandshakeFailure, err: &mut dyn Write) -> u8 {
+    match failure {
+        HandshakeFailure::Probe(error) => {
+            report(&error, err);
+            error.exit_code()
+        }
+        HandshakeFailure::Random(error) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            EXIT_OTHER
+        }
+        HandshakeFailure::Handshake(error) => {
+            let _ = writeln!(err, "cvctl: handshake failed: {error}");
+            EXIT_OTHER
+        }
+    }
+}
+
 /// Runs one `0x23` / `0x24` handshake and prints what it learned.
+///
+/// This is the ticket-02 behaviour: the handshake closes the handle before returning.
 fn handshake(
     backend: &mut dyn UsbBackend,
     shutdown: &dyn Shutdown,
@@ -61,25 +133,60 @@ fn handshake(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
-    let mut channel = match open_for_command(backend, shutdown) {
-        Ok(channel) => channel,
-        Err(error) => {
-            report(&error, err);
-            return error.exit_code();
-        }
+    let run = match establish(backend, shutdown, false) {
+        Ok(run) => run,
+        Err(failure) => return report_handshake(failure, err),
     };
+    let HandshakeRun {
+        session,
+        host_public,
+        ..
+    } = run;
 
-    // The host keypair is fresh for every invocation and is never stored.
-    let secrets = match RunSecrets::generate() {
-        Ok(secrets) => secrets,
+    let _ = writeln!(out, "handle {:#010x}", session.handle);
+    let _ = writeln!(out, "client nonce {} bytes", session.client_nonce_len);
+    let _ = writeln!(out, "device nonce {} bytes", session.device_nonce_len);
+    let _ = writeln!(out, "host nonce {} bytes", session.host_nonce_len);
+    let _ = writeln!(out, "host public key {}", hex(&host_public));
+    let _ = writeln!(out, "key fingerprint {}", hex(&session.key().fingerprint()));
+    if show_key {
+        let _ = writeln!(out, "key {}", hex(session.key().as_bytes()));
+    }
+    EXIT_OK
+}
+
+/// Opens the wrapped `0x02` session, prints the handle, then closes it before exiting.
+///
+/// `bad_sequence` is the probe-only diagnostic: it sends sequence 1 on a fresh session so the
+/// sensor answers `0x0F`, which surfaces as [`EXIT_SEQUENCE`].
+fn open(
+    backend: &mut dyn UsbBackend,
+    shutdown: &dyn Shutdown,
+    bad_sequence: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let iv = match random_iv() {
+        Ok(iv) => iv,
         Err(error) => {
             let _ = writeln!(err, "cvctl: {error}");
             return EXIT_OTHER;
         }
     };
+    let run = match establish(backend, shutdown, true) {
+        Ok(run) => run,
+        Err(failure) => return report_handshake(failure, err),
+    };
+    let HandshakeRun {
+        mut channel,
+        session,
+        ..
+    } = run;
 
-    let host_public = secrets.host_key.public_key();
-    let mut operation = Handshake::new(secrets.client_nonce, secrets.host_key, secrets.host_nonce);
+    let mut operation = OpenSession::new(session, iv);
+    if bad_sequence {
+        operation = operation.at_sequence(1);
+    }
     let outcome = {
         let mut exchange = channel.exchange();
         drive(&mut exchange, &mut operation, &mut NoFingerWait)
@@ -87,19 +194,64 @@ fn handshake(
 
     match outcome {
         Ok(session) => {
-            let _ = writeln!(out, "handle {:#010x}", session.handle);
-            let _ = writeln!(out, "client nonce {} bytes", session.client_nonce_len);
-            let _ = writeln!(out, "device nonce {} bytes", session.device_nonce_len);
-            let _ = writeln!(out, "host nonce {} bytes", session.host_nonce_len);
-            let _ = writeln!(out, "host public key {}", hex(&host_public));
-            let _ = writeln!(out, "key fingerprint {}", hex(&session.key().fingerprint()));
-            if show_key {
-                let _ = writeln!(out, "key {}", hex(session.key().as_bytes()));
+            let handle = session.handle;
+            let _ = writeln!(out, "handle {handle:#010x}");
+            let _ = writeln!(out, "secure session open");
+
+            // One invocation leaves no handle behind, so the next `cvctl open` cannot be told the
+            // session is already open.
+            drop(session);
+            let mut close = CloseSession::new(handle);
+            let closed = {
+                let mut exchange = channel.exchange();
+                drive(&mut exchange, &mut close, &mut NoFingerWait)
+            };
+            if let Err(error) = closed {
+                let _ = writeln!(err, "cvctl: {error}");
             }
             EXIT_OK
         }
         Err(error) => {
-            let _ = writeln!(err, "cvctl: handshake failed: {error}");
+            let _ = writeln!(err, "cvctl: {error}");
+            if matches!(error, OpenError::WrongSequence) {
+                EXIT_SEQUENCE
+            } else {
+                EXIT_OTHER
+            }
+        }
+    }
+}
+
+/// Closes the secure session the handshake kept open.
+fn close(
+    backend: &mut dyn UsbBackend,
+    shutdown: &dyn Shutdown,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let run = match establish(backend, shutdown, true) {
+        Ok(run) => run,
+        Err(failure) => return report_handshake(failure, err),
+    };
+    let HandshakeRun {
+        mut channel,
+        session,
+        ..
+    } = run;
+
+    let mut operation = CloseSession::new(session.handle);
+    drop(session);
+    let closed = {
+        let mut exchange = channel.exchange();
+        drive(&mut exchange, &mut operation, &mut NoFingerWait)
+    };
+    match closed {
+        Ok(()) => {
+            let _ = writeln!(out, "secure session closed");
+            EXIT_OK
+        }
+        Err(error) => {
+            let _ = writeln!(err, "cvctl: {error}");
             EXIT_OTHER
         }
     }
@@ -469,5 +621,151 @@ mod tests {
             sent_command(&usb, cmd::CLOSE_SESSION).is_some(),
             "the allocated handle is released before reporting the failure"
         );
+    }
+
+    #[test]
+    fn open_prints_the_handle_opens_the_session_and_closes_it() {
+        let mut usb = FakeUsb::with_sensor();
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["open"], &mut usb, &shutdown);
+
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(err, "");
+        assert_eq!(
+            out,
+            format!("handle {TEST_HANDLE:#010x}\nsecure session open\n")
+        );
+
+        let open = sent_command(&usb, cmd::OPEN_SESSION).expect("0x02 was sent");
+        assert_eq!(open[11], 0x02, "the open command is wrapped");
+        assert_eq!(open[10], attr::SESSION);
+        assert_eq!(
+            u32::from_le_bytes(open[16..20].try_into().expect("handle field")),
+            TEST_HANDLE
+        );
+        assert_eq!(
+            u32::from_le_bytes(open[40..44].try_into().expect("declared length")),
+            36,
+            "the wrapped open declares its 36-byte TLV block"
+        );
+
+        assert!(
+            sent_command(&usb, cmd::CLOSE_SESSION).is_some(),
+            "the probe closes the session before exiting"
+        );
+    }
+
+    #[test]
+    fn open_reports_a_non_zero_status_and_closes_the_handle() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.open_status = 0x0c;
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["open"], &mut usb, &shutdown);
+
+        assert_eq!(code, 1);
+        assert_eq!(out, "");
+        assert!(err.contains("0x0c"), "{err}");
+        assert!(
+            sent_command(&usb, cmd::CLOSE_SESSION).is_some(),
+            "the failed open releases the handle before reporting"
+        );
+
+        usb.open_status = 0;
+        let (code, out, err) = run_with(&["open"], &mut usb, &shutdown);
+        assert_eq!(
+            code, 0,
+            "the next open is not told the session is already open: {err}"
+        );
+        assert!(out.contains("secure session open"), "{out}");
+    }
+
+    #[test]
+    fn a_deliberately_wrong_wrap_sequence_is_its_own_failure() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.open_status = 0x0f;
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["open", "--bad-sequence"], &mut usb, &shutdown);
+
+        assert_eq!(code, 5, "the sequence failure has its own exit status");
+        assert_eq!(out, "");
+        assert!(err.contains("wrap sequence"), "{err}");
+        assert!(err.contains("0x0f"), "{err}");
+        assert!(
+            sent_command(&usb, cmd::CLOSE_SESSION).is_some(),
+            "even a rejected open leaves no handle behind"
+        );
+    }
+
+    #[test]
+    fn close_prints_and_a_following_open_succeeds() {
+        let mut usb = FakeUsb::with_sensor();
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["close"], &mut usb, &shutdown);
+
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(out, "secure session closed\n");
+        assert_eq!(err, "");
+        assert!(
+            sent_command(&usb, cmd::CLOSE_SESSION).is_some(),
+            "0x04 was sent"
+        );
+
+        let (code, out, err) = run_with(&["open"], &mut usb, &shutdown);
+        assert_eq!(code, 0, "a following open succeeds: {err}");
+        assert!(out.contains("secure session open"), "{out}");
+    }
+
+    #[test]
+    fn an_open_transport_failure_is_reported_and_the_handle_closed() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.open_command_error = Some(UsbError::Timeout);
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["open"], &mut usb, &shutdown);
+
+        assert_eq!(code, 1);
+        assert_eq!(out, "");
+        assert!(err.contains("timed out"), "{err}");
+        assert!(
+            sent_command(&usb, cmd::CLOSE_SESSION).is_some(),
+            "the core closes a handle learned by the handshake"
+        );
+    }
+
+    #[test]
+    fn close_accepts_a_reply_body_as_closed() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.close_body = Some(frame::build_plain_reply(
+            cmd::CLOSE_SESSION,
+            attr::CLOSE_SESSION,
+            TEST_HANDLE,
+            0,
+            &[],
+        ));
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["close"], &mut usb, &shutdown);
+
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(out, "secure session closed\n");
+        assert_eq!(err, "");
+    }
+
+    #[test]
+    fn a_close_transport_failure_is_reported_but_the_session_is_locally_closed() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.close_command_error = Some(UsbError::Disconnected);
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["close"], &mut usb, &shutdown);
+
+        assert_eq!(code, 1);
+        assert_eq!(out, "");
+        assert!(err.contains("disconnected"), "{err}");
+        assert!(err.contains("closed locally"), "{err}");
     }
 }

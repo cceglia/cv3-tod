@@ -18,10 +18,14 @@ pub mod frame;
 pub mod handshake;
 pub mod operation;
 pub mod proto;
+pub mod session;
 
 pub use event::{Action, Event, TransportError};
-pub use handshake::{Handshake, HandshakeError, Session, SessionKey};
+pub use handshake::{Handshake, HandshakeError};
 pub use operation::Operation;
+pub use session::{
+    CloseError, CloseSession, OpenError, OpenSession, Session, SessionKey, UnwrapError, WrapError,
+};
 
 /// Version of the core crate, reported by the probe.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -18,20 +18,23 @@
 //! so the probe generates a fresh host keypair per run and nothing is stored.
 //!
 //! The sensor allocates the session handle during `0x23`. A handshake that fails after the handle
-//! was learned, and a successful handshake, both send the close-session frame before finishing, so
-//! no handle is left dangling across reboots. Teardown is best effort: a failure to send or read
-//! the close reply never replaces the handshake's own result.
+//! was learned always sends the close-session frame before finishing, so no handle is left dangling
+//! across reboots. A successful handshake does the same unless it was built with
+//! [`Handshake::keeping_handle`], which leaves the handle for [`crate::session::OpenSession`].
+//! Teardown is best effort: a failure to send or read the close reply never replaces the
+//! handshake's own result.
 
 use std::fmt;
 
-use sha2::{Digest, Sha256};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::crypto::{self, HostKey};
 use crate::event::{Action, Event, TransportError};
 use crate::frame::{self, FrameError, HEADER_LEN};
 use crate::operation::Operation;
 use crate::proto::{attr, cmd};
+
+pub use crate::session::{Session, SessionKey};
 
 /// Length of every nonce in the handshake: client, device and host.
 pub const NONCE_LEN: usize = 20;
@@ -44,79 +47,6 @@ pub const SESSION_KEY_LEN: usize = crypto::SESSION_KEY_LEN;
 
 const DEVICE_PUBLIC_OFFSET: usize = HEADER_LEN;
 const DEVICE_NONCE_OFFSET: usize = HEADER_LEN + 128;
-
-/// The derived session key, zeroed when dropped.
-///
-/// It has no `Clone`, no `Copy`, and its `Debug` output is redacted; the bytes leave the core only
-/// through [`Self::as_bytes`], which the probe uses behind an explicit flag.
-pub struct SessionKey([u8; SESSION_KEY_LEN]);
-
-impl SessionKey {
-    /// The raw key bytes.
-    pub fn as_bytes(&self) -> &[u8; SESSION_KEY_LEN] {
-        &self.0
-    }
-
-    /// A short, non-secret identifier for the key: `SHA-256(key)[..8]`.
-    pub fn fingerprint(&self) -> [u8; 8] {
-        let digest = Sha256::digest(self.0);
-        let mut out = [0u8; 8];
-        out.copy_from_slice(&digest[..8]);
-        out
-    }
-}
-
-impl fmt::Debug for SessionKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("SessionKey(<redacted>)")
-    }
-}
-
-impl Drop for SessionKey {
-    fn drop(&mut self) {
-        self.0.zeroize();
-    }
-}
-
-/// What a completed handshake learned.
-#[derive(Debug)]
-pub struct Session {
-    /// The session handle the sensor allocated in its `0x23` reply. The handshake has already sent
-    /// the close-session frame before returning (teardown is best effort); the value remains useful
-    /// for the probe's output and for tests.
-    pub handle: u32,
-    /// Length of the client nonce sent in `0x23`.
-    pub client_nonce_len: usize,
-    /// Length of the device nonce read from the `0x23` reply.
-    pub device_nonce_len: usize,
-    /// Length of the host nonce sent in `0x24`.
-    pub host_nonce_len: usize,
-    key: SessionKey,
-}
-
-impl Session {
-    /// The derived session key.
-    pub fn key(&self) -> &SessionKey {
-        &self.key
-    }
-
-    /// Takes the session key, leaving the rest of the record.
-    pub fn into_key(self) -> SessionKey {
-        self.key
-    }
-}
-
-impl PartialEq for Session {
-    fn eq(&self, other: &Self) -> bool {
-        self.handle == other.handle
-            && self.client_nonce_len == other.client_nonce_len
-            && self.device_nonce_len == other.device_nonce_len
-            && self.host_nonce_len == other.host_nonce_len
-            && self.key.0 == other.key.0
-    }
-}
-
-impl Eq for Session {}
 
 /// Why a handshake did not produce a session key.
 ///
@@ -195,11 +125,15 @@ pub struct Handshake {
     handle: u32,
     device_public: [u8; DEVICE_PUBLIC_LEN],
     device_nonce: [u8; NONCE_LEN],
+    keep_handle: bool,
     state: State,
 }
 
 impl Handshake {
     /// Builds a handshake from the probe's randomness. `host_key` is the fresh ephemeral keypair.
+    ///
+    /// The successful handshake closes its handle before returning, which is the behaviour
+    /// `cvctl handshake` wants. [`Self::keeping_handle`] leaves it open for a secure session.
     pub fn new(
         client_nonce: [u8; NONCE_LEN],
         host_key: HostKey,
@@ -212,8 +146,17 @@ impl Handshake {
             handle: 0,
             device_public: [0u8; DEVICE_PUBLIC_LEN],
             device_nonce: [0u8; NONCE_LEN],
+            keep_handle: false,
             state: State::NotStarted,
         }
+    }
+
+    /// Leaves a successful handshake's handle open for the caller to close.
+    ///
+    /// Failure paths still release the handle: only a derived key makes the handle useful.
+    pub fn keeping_handle(mut self) -> Self {
+        self.keep_handle = true;
+        self
     }
 
     fn challenge_frame(&self) -> Vec<u8> {
@@ -240,9 +183,10 @@ impl Handshake {
         Action::Finish(outcome)
     }
 
-    /// Releases a learned handle before finishing. With no handle there is nothing to release.
+    /// Releases a learned handle before finishing. With no handle there is nothing to release, and
+    /// a successful handshake that keeps its handle finishes without one.
     fn release_then_finish(&mut self, outcome: Outcome) -> Action<Outcome> {
-        if self.handle == 0 {
+        if self.handle == 0 || (self.keep_handle && outcome.is_ok()) {
             return self.finish(outcome);
         }
         self.state = State::ReleasingHandle { outcome };
@@ -310,13 +254,14 @@ impl Handshake {
         let mut key = [0u8; SESSION_KEY_LEN];
         key.copy_from_slice(&digest[..SESSION_KEY_LEN]);
 
-        Ok(Session {
-            handle: self.handle,
-            client_nonce_len: NONCE_LEN,
-            device_nonce_len: self.device_nonce.len(),
-            host_nonce_len: self.host_nonce.len(),
-            key: SessionKey(key),
-        })
+        Ok(Session::new(
+            self.handle,
+            NONCE_LEN,
+            self.device_nonce.len(),
+            self.host_nonce.len(),
+            SessionKey::new(key),
+            0,
+        ))
     }
 }
 
@@ -804,6 +749,48 @@ mod tests {
         assert_eq!(
             expect_finish(operation.step(Event::Finger)),
             Err(HandshakeError::UnexpectedEvent)
+        );
+    }
+
+    #[test]
+    fn keeping_the_handle_leaves_the_session_open_for_the_caller() {
+        let mut operation = handshake(client_nonce()).keeping_handle();
+        let _ = operation.start();
+        let _ = operation.step(Event::Reply {
+            status: 0,
+            body: challenge_reply(0),
+        });
+
+        let session = expect_finish(operation.step(Event::Reply {
+            status: 0,
+            body: response_reply(0),
+        }))
+        .expect("success");
+        assert_eq!(session.handle, HANDLE, "the handle was not released");
+        assert_eq!(
+            session.next_sequence(),
+            0,
+            "a fresh session starts at wrap sequence zero"
+        );
+    }
+
+    #[test]
+    fn keeping_the_handle_still_releases_it_on_failure() {
+        let mut operation = handshake(client_nonce()).keeping_handle();
+        let _ = operation.start();
+        let _ = operation.step(Event::Reply {
+            status: 0,
+            body: challenge_reply(0),
+        });
+
+        let close = expect_send(operation.step(Event::Reply {
+            status: 0x09,
+            body: response_reply(0x09),
+        }));
+        assert_eq!(close, frame::build_close_handle(HANDLE));
+        assert_eq!(
+            expect_finish(operation.step(Event::ReplyWithoutBody)),
+            Err(HandshakeError::RejectedResponse(0x09))
         );
     }
 

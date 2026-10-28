@@ -58,6 +58,14 @@ pub struct FakeUsb {
     pub challenge_status: u32,
     pub response_status: u32,
     pub challenge_body: Option<Vec<u8>>,
+    /// Status the scripted sensor answers the wrapped `0x02` open with.
+    pub open_status: u32,
+    /// If set, the scripted sensor fails the wrapped `0x02` command in the transport.
+    pub open_command_error: Option<UsbError>,
+    /// If set, the scripted sensor fails the plain `0x04` close in the transport.
+    pub close_command_error: Option<UsbError>,
+    /// If set, the scripted sensor answers `0x04` with this body instead of no body.
+    pub close_body: Option<Vec<u8>>,
     pub sent: Rc<RefCell<Vec<Vec<u8>>>>,
     log: Rc<RefCell<Vec<&'static str>>>,
 }
@@ -77,6 +85,10 @@ impl Default for FakeUsb {
             challenge_status: 0,
             response_status: 0,
             challenge_body: None,
+            open_status: 0,
+            open_command_error: None,
+            close_command_error: None,
+            close_body: None,
             sent: Rc::new(RefCell::new(Vec::new())),
             log: Rc::new(RefCell::new(Vec::new())),
         }
@@ -137,6 +149,10 @@ impl UsbBackend for FakeUsb {
             challenge: self.challenge_body.clone(),
             challenge_status: self.challenge_status,
             response_status: self.response_status,
+            open_status: self.open_status,
+            open_command_error: self.open_command_error.clone(),
+            close_command_error: self.close_command_error.clone(),
+            close_body: self.close_body.clone(),
             pending: None,
         }))
     }
@@ -208,13 +224,17 @@ pub const DEVICE_PUBLIC: [u8; 64] = [
     0x2b, 0xce, 0x33, 0x57, 0x6b, 0x31, 0x5e, 0xce, 0xcb, 0xb6, 0x40, 0x68, 0x37, 0xbf, 0x51, 0xf5,
 ];
 
-/// A scripted sensor that answers the `0x23` / `0x24` / `0x04` frames, so the probe's whole
-/// handshake runs offline. It records every frame it was sent.
+/// A scripted sensor that answers the `0x23` / `0x24` / `0x02` / `0x04` frames, so the probe's
+/// whole handshake and secure-session lifecycle run offline. It records every frame it was sent.
 pub struct HandshakeSensor {
     pub sent: Rc<RefCell<Vec<Vec<u8>>>>,
     pub challenge: Option<Vec<u8>>,
     pub challenge_status: u32,
     pub response_status: u32,
+    pub open_status: u32,
+    pub open_command_error: Option<UsbError>,
+    pub close_command_error: Option<UsbError>,
+    pub close_body: Option<Vec<u8>>,
     pending: Option<Reply>,
 }
 
@@ -251,6 +271,20 @@ impl HandshakeSensor {
                     &[],
                 ),
             },
+            cmd::OPEN_SESSION => Reply {
+                status: 0,
+                body: frame::build_plain_reply(
+                    cmd::OPEN_SESSION,
+                    attr::SESSION,
+                    TEST_HANDLE,
+                    self.open_status,
+                    &[],
+                ),
+            },
+            cmd::CLOSE_SESSION => Reply {
+                status: 0,
+                body: self.close_body.clone().unwrap_or_default(),
+            },
             _ => Reply {
                 status: 0,
                 body: Vec::new(),
@@ -262,6 +296,23 @@ impl HandshakeSensor {
 impl UsbIo for HandshakeSensor {
     fn out(&mut self, frame: &[u8]) -> Result<(), UsbError> {
         self.sent.borrow_mut().push(frame.to_vec());
+        let command = u16::from_le_bytes([
+            frame.get(8).copied().unwrap_or(0),
+            frame.get(9).copied().unwrap_or(0),
+        ]);
+        match command {
+            cmd::OPEN_SESSION => {
+                if let Some(error) = &self.open_command_error {
+                    return Err(error.clone());
+                }
+            }
+            cmd::CLOSE_SESSION => {
+                if let Some(error) = &self.close_command_error {
+                    return Err(error.clone());
+                }
+            }
+            _ => {}
+        }
         self.pending = Some(self.reply_to(frame));
         Ok(())
     }

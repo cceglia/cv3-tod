@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use cv3_core::crypto::HostKey;
+use cv3_core::crypto::{BLOCK_LEN, HostKey};
 use cv3_core::handshake::NONCE_LEN;
 
 /// The fresh key material for one handshake.
@@ -34,6 +34,11 @@ impl RunSecrets {
             host_nonce: random_bytes()?,
         })
     }
+}
+
+/// Draws a fresh AES-CBC IV for a wrapped command from the operating system.
+pub fn random_iv() -> Result<[u8; BLOCK_LEN], RandomError> {
+    random_bytes()
 }
 
 /// The operating system refused to supply randomness.
@@ -66,5 +71,13 @@ mod tests {
         assert_ne!(first.host_key.public_key(), second.host_key.public_key());
         assert_ne!(first.client_nonce, second.client_nonce);
         assert_ne!(first.host_nonce, second.host_nonce);
+    }
+
+    #[test]
+    fn two_wrapped_commands_use_different_ivs() {
+        assert_ne!(
+            random_iv().expect("OS randomness"),
+            random_iv().expect("OS randomness")
+        );
     }
 }
