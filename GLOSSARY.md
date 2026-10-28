@@ -22,6 +22,11 @@ The counter that the driver and the sensor keep in step while a session is open.
 mismatched counter is rejected.
 _Avoid_: nonce, sequence number, counter
 
+**Host timestamp request**:
+The interrupt event whose first word is `5`, answered with a vendor device control request carrying
+the packed civil date and time. The vendor packs local time; the probe packs UTC.
+_Avoid_: clock sync event, time command
+
 **Light wedge** / **Deep wedge**:
 A wedged sensor still enumerates on USB but refuses commands. A light wedge clears with a USB
 `authorized` toggle; a deep wedge survives until the machine loses power.

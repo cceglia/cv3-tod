@@ -15,6 +15,8 @@ pub enum UsbError {
     ///
     /// Only the finger wait can produce this: a command transfer is never cancelled.
     Cancelled,
+    /// The sensor kept asking for the host timestamp past the demultiplexing retry bound.
+    TimestampRequests,
     Other(String),
 }
 
@@ -28,6 +30,9 @@ impl fmt::Display for UsbError {
             Self::Timeout => f.write_str("transfer timed out"),
             Self::Stall => f.write_str("endpoint stalled"),
             Self::Cancelled => f.write_str("finger wait cancelled by a shutdown signal"),
+            Self::TimestampRequests => {
+                f.write_str("sensor kept requesting the host timestamp without a reply")
+            }
             Self::Other(message) => f.write_str(message),
         }
     }

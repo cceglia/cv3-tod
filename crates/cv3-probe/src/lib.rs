@@ -9,6 +9,7 @@ pub mod layout;
 pub mod nusb_backend;
 pub mod random;
 pub mod signals;
+pub mod timestamp;
 pub mod usb;
 
 #[cfg(test)]

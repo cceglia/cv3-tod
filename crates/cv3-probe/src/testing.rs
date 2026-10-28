@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use cv3_core::crypto;
 use cv3_core::frame;
@@ -12,6 +12,7 @@ use crate::discovery::{FoundSensor, SensorDevice, UsbBackend, UsbError};
 use crate::exchange::{ANNOUNCEMENT_LEN, Reply, UsbIo};
 use crate::layout::{EndpointDescriptor, InterfaceDescriptor, TransferType};
 use crate::signals::{Shutdown, SignalFlag};
+use crate::timestamp::{self, TimestampInterrupt};
 
 /// The sensor the ticket's hardware reports: bus 3, port 8.
 pub fn sensor() -> FoundSensor {
@@ -115,6 +116,14 @@ pub struct FakeUsb {
     /// Per-wait finger results consumed in order before falling back to `finger_event`, so a test
     /// can let an enrolment's touches succeed and fail only the confirmation one.
     pub finger_events: Vec<Result<Vec<u8>, UsbError>>,
+    /// A type-5 host-timestamp request is delivered before the first reply announcement.
+    pub timestamp_before_announcement: bool,
+    /// A type-5 host-timestamp request is delivered before the first finger event.
+    pub timestamp_before_finger: bool,
+    /// If set, every timestamp sync fails with this error.
+    pub sync_error: Option<UsbError>,
+    /// Every packed timestamp the scripted sensor was sent, in order.
+    pub syncs: Rc<RefCell<Vec<u32>>>,
     /// Raised when the scripted sensor sends the `0x24` response, as a signal mid-command would be.
     pub signal_during_command: Option<SignalFlag>,
     /// Raised when the finger wait starts, as a signal mid-wait would be.
@@ -165,6 +174,10 @@ impl Default for FakeUsb {
             match_tlvs: Rc::new(RefCell::new(Vec::new())),
             finger_event: None,
             finger_events: Vec::new(),
+            timestamp_before_announcement: false,
+            timestamp_before_finger: false,
+            sync_error: None,
+            syncs: Rc::new(RefCell::new(Vec::new())),
             signal_during_command: None,
             signal_during_finger: None,
             sent: Rc::new(RefCell::new(Vec::new())),
@@ -259,6 +272,11 @@ impl UsbBackend for FakeUsb {
             accepted_updates: 0,
             finger_event: self.finger_event.clone(),
             finger_events: self.finger_events.clone(),
+            timestamp_before_announcement: self.timestamp_before_announcement,
+            timestamp_before_finger: self.timestamp_before_finger,
+            sync_error: self.sync_error.clone(),
+            syncs: Rc::clone(&self.syncs),
+            timestamps: Vec::new(),
             signal_during_command: self.signal_during_command.clone(),
             signal_during_finger: self.signal_during_finger.clone(),
             cancellation,
@@ -393,6 +411,15 @@ pub struct HandshakeSensor {
     pub accepted_updates: usize,
     pub finger_event: Option<Result<Vec<u8>, UsbError>>,
     pub finger_events: Vec<Result<Vec<u8>, UsbError>>,
+    /// Delivered once, before the first reply announcement, as the real endpoint can.
+    pub timestamp_before_announcement: bool,
+    /// Delivered once, before the first finger event, as the real endpoint can.
+    pub timestamp_before_finger: bool,
+    pub sync_error: Option<UsbError>,
+    /// Every packed timestamp this scripted sensor was sent, in order.
+    pub syncs: Rc<RefCell<Vec<u32>>>,
+    /// The same syncs, drained by `take_timestamps` for the `--hex` dump.
+    pub timestamps: Vec<u32>,
     pub signal_during_command: Option<SignalFlag>,
     pub signal_during_finger: Option<SignalFlag>,
     /// The handle the CLI threaded in; a raised flag makes the finger wait report cancellation.
@@ -694,11 +721,11 @@ impl UsbIo for HandshakeSensor {
     }
 
     fn read_interrupt(&mut self, _timeout: Duration) -> Result<Vec<u8>, UsbError> {
-        let reply = self.pending.as_ref().expect("out ran first");
-        let mut announcement = [0u8; ANNOUNCEMENT_LEN];
-        announcement[..4].copy_from_slice(&reply.status.to_le_bytes());
-        announcement[4..].copy_from_slice(&(reply.body.len() as u32).to_le_bytes());
-        Ok(announcement.to_vec())
+        let mut source = FakeInterruptSource {
+            sensor: self,
+            kind: FakeInterrupt::Announcement,
+        };
+        timestamp::demux_interrupt(&mut source)
     }
 
     fn read_bulk(&mut self, _len: usize, _timeout: Duration) -> Result<Vec<u8>, UsbError> {
@@ -706,6 +733,70 @@ impl UsbIo for HandshakeSensor {
     }
 
     fn read_finger(&mut self, _timeout: Duration) -> Result<Vec<u8>, UsbError> {
+        let mut source = FakeInterruptSource {
+            sensor: self,
+            kind: FakeInterrupt::Finger,
+        };
+        timestamp::demux_interrupt(&mut source)
+    }
+
+    fn sync_timestamp(&mut self, packed: u32) -> Result<(), UsbError> {
+        if let Some(error) = &self.sync_error {
+            return Err(error.clone());
+        }
+        self.syncs.borrow_mut().push(packed);
+        self.timestamps.push(packed);
+        Ok(())
+    }
+
+    fn take_timestamps(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.timestamps)
+    }
+}
+
+/// The scripted sensor's raw interrupt reads, with the demux able to answer a type-5 event.
+enum FakeInterrupt {
+    Announcement,
+    Finger,
+}
+
+struct FakeInterruptSource<'a> {
+    sensor: &'a mut HandshakeSensor,
+    kind: FakeInterrupt,
+}
+
+impl TimestampInterrupt for FakeInterruptSource<'_> {
+    fn read_interrupt(&mut self) -> Result<Vec<u8>, UsbError> {
+        match self.kind {
+            FakeInterrupt::Announcement => self.sensor.next_announcement(),
+            FakeInterrupt::Finger => self.sensor.next_finger(),
+        }
+    }
+
+    fn answer_timestamp(&mut self) -> Result<(), UsbError> {
+        self.sensor
+            .sync_timestamp(timestamp::pack(SystemTime::now()))
+    }
+}
+
+impl HandshakeSensor {
+    fn next_announcement(&mut self) -> Result<Vec<u8>, UsbError> {
+        if self.timestamp_before_announcement {
+            self.timestamp_before_announcement = false;
+            return Ok(timestamp::HOST_TIMESTAMP_INTERRUPT.to_le_bytes().to_vec());
+        }
+        let reply = self.pending.as_ref().expect("out ran first");
+        let mut announcement = [0u8; ANNOUNCEMENT_LEN];
+        announcement[..4].copy_from_slice(&reply.status.to_le_bytes());
+        announcement[4..].copy_from_slice(&(reply.body.len() as u32).to_le_bytes());
+        Ok(announcement.to_vec())
+    }
+
+    fn next_finger(&mut self) -> Result<Vec<u8>, UsbError> {
+        if self.timestamp_before_finger {
+            self.timestamp_before_finger = false;
+            return Ok(timestamp::HOST_TIMESTAMP_INTERRUPT.to_le_bytes().to_vec());
+        }
         if let Some(flag) = &self.signal_during_finger {
             flag.raise(signal_hook::consts::signal::SIGINT);
         }

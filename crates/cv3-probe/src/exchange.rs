@@ -42,6 +42,20 @@ pub trait UsbIo {
     /// implementation cancels it on timeout or on a shutdown request, and reaps the cancelled
     /// completion, so the interface stays usable. A command transfer must never take this path.
     fn read_finger(&mut self, timeout: Duration) -> Result<Vec<u8>, UsbError>;
+
+    /// Answers a `CV_GET_HOST_TIMESTAMP_INTERRUPT` with the packed host timestamp.
+    ///
+    /// This is a vendor device control request, not a bulk frame: it never appears in a transcript
+    /// and never touches the command path. The real transport calls it from its interrupt
+    /// demultiplexing and once at session start.
+    fn sync_timestamp(&mut self, packed: u32) -> Result<(), UsbError>;
+
+    /// The timestamp syncs sent since the last call, for `--hex`.
+    ///
+    /// A transport that has no diagnostics returns nothing, which is the default.
+    fn take_timestamps(&mut self) -> Vec<u32> {
+        Vec::new()
+    }
 }
 
 /// What the sensor announced and, if it announced one, the body that followed.
@@ -196,6 +210,7 @@ mod tests {
         Interrupt(Duration),
         Bulk(usize, Duration),
         Finger(Duration),
+        Timestamp(u32),
     }
 
     struct MockIo {
@@ -203,6 +218,8 @@ mod tests {
         bulk: Result<Vec<u8>, UsbError>,
         finger: Result<Vec<u8>, UsbError>,
         out_error: Option<UsbError>,
+        sync_error: Option<UsbError>,
+        timestamps: Vec<u32>,
         calls: RefCell<Vec<Call>>,
     }
 
@@ -216,6 +233,8 @@ mod tests {
                 bulk: Ok(vec![0xAA; reply_len as usize]),
                 finger: Ok(0x03u32.to_le_bytes().to_vec()),
                 out_error: None,
+                sync_error: None,
+                timestamps: Vec::new(),
                 calls: RefCell::new(Vec::new()),
             }
         }
@@ -248,6 +267,31 @@ mod tests {
             self.calls.borrow_mut().push(Call::Finger(timeout));
             self.finger.clone()
         }
+
+        fn sync_timestamp(&mut self, packed: u32) -> Result<(), UsbError> {
+            self.calls.borrow_mut().push(Call::Timestamp(packed));
+            match &self.sync_error {
+                Some(error) => Err(error.clone()),
+                None => {
+                    self.timestamps.push(packed);
+                    Ok(())
+                }
+            }
+        }
+
+        fn take_timestamps(&mut self) -> Vec<u32> {
+            std::mem::take(&mut self.timestamps)
+        }
+    }
+
+    #[test]
+    fn a_timestamp_sync_is_a_recorded_host_control_call() {
+        let mut io = MockIo::new(0, 0);
+
+        assert_eq!(io.sync_timestamp(0x1234_5678), Ok(()));
+        assert_eq!(io.calls(), [Call::Timestamp(0x1234_5678)]);
+        assert_eq!(io.take_timestamps(), [0x1234_5678]);
+        assert_eq!(io.take_timestamps(), [], "the log is drained");
     }
 
     #[test]

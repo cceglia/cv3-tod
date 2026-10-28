@@ -8,12 +8,15 @@
 //! error, and when a shutdown signal unwinds the flow.
 
 use core::fmt;
+use std::io::Write;
+use std::time::SystemTime;
 
 use cv3_core::proto::{PRODUCT_ID, VENDOR_ID};
 
 use crate::exchange::{Exchange, UsbIo};
 use crate::layout::{EndpointLayout, InterfaceDescriptor, LayoutError, SENSOR_INTERFACE, validate};
 use crate::signals::{Shutdown, SignalFlag};
+use crate::timestamp;
 pub use crate::usb::UsbError;
 
 /// A device the OS reported, before it is opened.
@@ -86,6 +89,11 @@ impl CommandSession {
     /// The exchange every command goes through.
     pub fn exchange(&mut self) -> Exchange<'_> {
         Exchange::new(self.io.as_mut())
+    }
+
+    /// Timestamp syncs sent since the last call, for the `--hex` dump.
+    pub fn take_timestamps(&mut self) -> Vec<u32> {
+        self.io.take_timestamps()
     }
 }
 
@@ -231,9 +239,14 @@ pub fn probe(
 /// the interface after checking the descriptor, the returned [`CommandSession`] owns the claim
 /// until it is dropped, so one session can carry a whole operation. The shutdown handle is
 /// threaded into the transport so the finger wait can be cancelled without touching a command.
+///
+/// One host timestamp is sent before the handshake, so a run starts with a synced clock even when
+/// no interrupt type 5 arrives. It is best effort: a failure is written to `err` and the command
+/// continues, because the sensor may not need the clock at all.
 pub fn open_for_command(
     backend: &mut dyn UsbBackend,
     shutdown: &dyn Shutdown,
+    err: &mut dyn Write,
 ) -> Result<CommandSession, ProbeError> {
     interrupted(shutdown)?;
 
@@ -243,9 +256,13 @@ pub fn open_for_command(
     let sensor = select_sensor(devices)?;
 
     interrupted(shutdown)?;
-    let io = backend
+    let mut io = backend
         .open_command(&sensor, shutdown.cancellation())
         .map_err(|error| stage_error(Stage::Opening, error))?;
+
+    if let Err(error) = io.sync_timestamp(timestamp::pack(SystemTime::now())) {
+        let _ = writeln!(err, "cvctl: timestamp sync failed: {error}");
+    }
 
     Ok(CommandSession { io })
 }

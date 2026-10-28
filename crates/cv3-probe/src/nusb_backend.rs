@@ -16,17 +16,18 @@
 //! the core turns into its own cancellation event and teardown. No command transfer takes this
 //! path: `out`, `read_interrupt` and `read_bulk` never look at the cancellation handle.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use cv3_core::proto::{endpoint, timeout};
 use nusb::MaybeFuture;
 use nusb::descriptors::TransferType as NusbTransferType;
-use nusb::transfer::{Bulk, In, Interrupt, Out, TransferError};
+use nusb::transfer::{Bulk, ControlOut, ControlType, In, Interrupt, Out, Recipient, TransferError};
 
 use crate::discovery::{FoundSensor, SensorDevice, UsbBackend};
 use crate::exchange::UsbIo;
 use crate::layout::{EndpointDescriptor, InterfaceDescriptor, TransferType};
 use crate::signals::SignalFlag;
+use crate::timestamp::{self, TimestampInterrupt};
 use crate::usb::UsbError;
 
 /// The longest a finger wait blocks before it checks for a shutdown request.
@@ -158,6 +159,8 @@ pub struct NusbIo {
     poisoned: bool,
     /// Polled only by the finger wait, never by a command transfer.
     cancellation: Option<SignalFlag>,
+    /// Timestamp syncs that succeeded, waiting to be printed by a `--hex` run.
+    timestamps: Vec<u32>,
 }
 
 impl NusbIo {
@@ -166,6 +169,7 @@ impl NusbIo {
             interface: Some(interface),
             poisoned: false,
             cancellation,
+            timestamps: Vec::new(),
         }
     }
 
@@ -209,23 +213,8 @@ impl UsbIo for NusbIo {
     }
 
     fn read_interrupt(&mut self, wait: Duration) -> Result<Vec<u8>, UsbError> {
-        let interface = self.interface()?.clone();
-        let mut pipe = interface
-            .endpoint::<Interrupt, In>(endpoint::INTERRUPT)
-            .map_err(map_error)?;
-        let request = pipe.max_packet_size().max(1);
-        pipe.submit(nusb::transfer::Buffer::new(request));
-        match pipe.wait_next_complete(wait) {
-            Some(completion) => {
-                completion.status.map_err(map_transfer)?;
-                Ok(completion.buffer[..completion.actual_len].to_vec())
-            }
-            None => {
-                std::mem::forget(pipe);
-                self.poison();
-                Err(UsbError::Timeout)
-            }
-        }
+        let mut source = AnnouncementSource { io: self, wait };
+        timestamp::demux_interrupt(&mut source)
     }
 
     fn read_bulk(&mut self, len: usize, wait: Duration) -> Result<Vec<u8>, UsbError> {
@@ -252,14 +241,97 @@ impl UsbIo for NusbIo {
     }
 
     fn read_finger(&mut self, wait: Duration) -> Result<Vec<u8>, UsbError> {
+        let mut source = FingerSource {
+            io: self,
+            deadline: Instant::now() + wait,
+        };
+        timestamp::demux_interrupt(&mut source)
+    }
+
+    fn sync_timestamp(&mut self, packed: u32) -> Result<(), UsbError> {
         let interface = self.interface()?.clone();
+        interface
+            .control_out(
+                ControlOut {
+                    control_type: ControlType::Vendor,
+                    recipient: Recipient::Device,
+                    request: timestamp::HOST_TIMESTAMP_REQUEST,
+                    value: packed as u16,
+                    index: (packed >> 16) as u16,
+                    data: &[],
+                },
+                Duration::from_millis(timestamp::SYNC_TIMEOUT_MS),
+            )
+            .wait()
+            .map_err(map_transfer)?;
+        self.timestamps.push(packed);
+        Ok(())
+    }
+
+    fn take_timestamps(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.timestamps)
+    }
+}
+
+/// One announcement read, with the demultiplexer able to answer a timestamp request in between.
+struct AnnouncementSource<'a> {
+    io: &'a mut NusbIo,
+    wait: Duration,
+}
+
+impl TimestampInterrupt for AnnouncementSource<'_> {
+    fn read_interrupt(&mut self) -> Result<Vec<u8>, UsbError> {
+        let interface = self.io.interface()?.clone();
+        let mut pipe = interface
+            .endpoint::<Interrupt, In>(endpoint::INTERRUPT)
+            .map_err(map_error)?;
+        let request = pipe.max_packet_size().max(1);
+        pipe.submit(nusb::transfer::Buffer::new(request));
+        match pipe.wait_next_complete(self.wait) {
+            Some(completion) => {
+                completion.status.map_err(map_transfer)?;
+                Ok(completion.buffer[..completion.actual_len].to_vec())
+            }
+            None => {
+                std::mem::forget(pipe);
+                self.io.poison();
+                Err(UsbError::Timeout)
+            }
+        }
+    }
+
+    fn answer_timestamp(&mut self) -> Result<(), UsbError> {
+        self.io.sync_timestamp(timestamp::pack(SystemTime::now()))
+    }
+}
+
+/// One finger wait, with the demultiplexer able to answer a timestamp request in between.
+///
+/// The deadline spans the whole wait: answering a request does not restart it, so a sensor that
+/// keeps asking cannot extend the finger timeout.
+struct FingerSource<'a> {
+    io: &'a mut NusbIo,
+    deadline: Instant,
+}
+
+impl TimestampInterrupt for FingerSource<'_> {
+    fn read_interrupt(&mut self) -> Result<Vec<u8>, UsbError> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(UsbError::Timeout);
+        }
+        let interface = self.io.interface()?.clone();
         let mut pipe = interface
             .endpoint::<Interrupt, In>(endpoint::INTERRUPT)
             .map_err(map_error)?;
         let request = pipe.max_packet_size().max(1);
         pipe.submit(nusb::transfer::Buffer::new(request));
         let mut transfer = InterruptTransfer { pipe };
-        wait_for_finger(&mut transfer, wait, self.cancellation.as_ref())
+        wait_for_finger(&mut transfer, remaining, self.io.cancellation.as_ref())
+    }
+
+    fn answer_timestamp(&mut self) -> Result<(), UsbError> {
+        self.io.sync_timestamp(timestamp::pack(SystemTime::now()))
     }
 }
 

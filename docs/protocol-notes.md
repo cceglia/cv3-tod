@@ -6,6 +6,41 @@ reference material** (the audited third-party implementation and its write-up, k
 build). Most of this document is the second kind today; it exists so the difference is never
 blurred.
 
+## Host timestamp request (interrupt type 5)
+
+**Read from the reference, not yet measured with this probe.** Interrupt endpoint `0x85` can
+deliver a first `u32` of `5`, which Dell's Windows driver calls
+`CV_GET_HOST_TIMESTAMP_INTERRUPT`. The Windows driver demultiplexes it before completing a pending
+command; Broadcom's Linux driver does not, attempts the next bulk read and times out, which aborts
+enrolment.
+
+The host answers with a vendor/device OUT control request:
+
+- `bmRequestType = 0x40` (vendor, device, host to device)
+- `bRequest = 0x0d`
+- no data stage
+- `wValue` is the low 16 bits of the packed timestamp, `wIndex` the high 16 bits
+
+The packed `u32`, least significant bit first:
+
+| Field | Bits |
+|---|---|
+| day | 0..4 |
+| month | 5..8 |
+| year since 2000 | 9..14 |
+| hour | 15..19 |
+| minute | 20..25 |
+| second | 26..31 |
+
+The vendor packs **local** civil time; this probe packs **UTC**, because a `SystemTime` carries no
+timezone. The field widths and positions are what the controller consumes, so the encoding is
+otherwise identical. The year field is six bits (2000..2063) and saturates at either end.
+
+`cvctl` answers type-5 events in the USB transport — during both the reply-announcement read and
+the finger wait, with a bounded number of retries — and sends one sync before the handshake so a
+run starts with a synced clock even when no type-5 event arrives. With `--hex` the host-side
+control appears as `* timestamp <packed:08x>`, alongside the `>`/`<` bulk lines.
+
 ## Measured on 2026-10-28
 
 Measured with `cvctl` on the sensor, in a root hardware run whose log is

@@ -170,6 +170,10 @@ mod tests {
                 .clone()
                 .unwrap_or_else(|| Ok(interrupt::FINGER.to_le_bytes().to_vec()))
         }
+
+        fn sync_timestamp(&mut self, _packed: u32) -> Result<(), UsbError> {
+            Ok(())
+        }
     }
 
     /// Sends one frame, then reports the event it received.

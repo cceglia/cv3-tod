@@ -442,7 +442,10 @@ fn with_transport<R>(
     err: &mut dyn Write,
     run_operation: impl FnOnce(&mut dyn Transport) -> R,
 ) -> (R, Option<std::io::Error>) {
-    match record {
+    // The session-start sync happened before the operation; show it before the first frame. Syncs
+    // that answer a type-5 event happen below the transport seam, so they are shown after it.
+    dump_timestamps(channel, dump_hex, err);
+    let outcome = match record {
         Some(path) => {
             let recording = RecordingTransport::new(channel.exchange(), command);
             let (result, recording) = run_through(recording, dump_hex, err, run_operation);
@@ -454,6 +457,21 @@ fn with_transport<R>(
             let (result, _) = run_through(channel.exchange(), dump_hex, err, run_operation);
             (result, None)
         }
+    };
+    dump_timestamps(channel, dump_hex, err);
+    outcome
+}
+
+/// Writes the timestamp syncs sent since the last call as host-side control lines.
+///
+/// They have no bulk frame, so they do not share the `> ` prefix; `* ` marks a host control
+/// transfer in the same dump. Without `--hex` nothing is written.
+fn dump_timestamps(channel: &mut CommandSession, dump_hex: bool, err: &mut dyn Write) {
+    if !dump_hex {
+        return;
+    }
+    for packed in channel.take_timestamps() {
+        let _ = writeln!(err, "* timestamp {packed:08x}");
     }
 }
 
@@ -513,7 +531,7 @@ fn handshake(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
-    let mut channel = match open_for_command(backend, shutdown) {
+    let mut channel = match open_for_command(backend, shutdown, err) {
         Ok(channel) => channel,
         Err(error) => {
             report(&error, err);
@@ -577,7 +595,7 @@ fn open(
             return EXIT_OTHER;
         }
     };
-    let mut channel = match open_for_command(backend, shutdown) {
+    let mut channel = match open_for_command(backend, shutdown, err) {
         Ok(channel) => channel,
         Err(error) => {
             report(&error, err);
@@ -628,7 +646,7 @@ fn close(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
-    let mut channel = match open_for_command(backend, shutdown) {
+    let mut channel = match open_for_command(backend, shutdown, err) {
         Ok(channel) => channel,
         Err(error) => {
             report(&error, err);
@@ -688,7 +706,7 @@ fn capture(
             return EXIT_OTHER;
         }
     };
-    let mut channel = match open_for_command(backend, shutdown) {
+    let mut channel = match open_for_command(backend, shutdown, err) {
         Ok(channel) => channel,
         Err(error) => {
             report(&error, err);
@@ -843,7 +861,7 @@ fn enroll(
             return EXIT_OTHER;
         }
     };
-    let mut channel = match open_for_command(backend, shutdown) {
+    let mut channel = match open_for_command(backend, shutdown, err) {
         Ok(channel) => channel,
         Err(error) => {
             report(&error, err);
@@ -962,7 +980,7 @@ fn enroll_then_verify(
     }
     let [open_iv, enrol_iv, capture_iv, match_iv] = ivs;
 
-    let mut channel = match open_for_command(backend, shutdown) {
+    let mut channel = match open_for_command(backend, shutdown, err) {
         Ok(channel) => channel,
         Err(error) => {
             report(&error, err);
@@ -1208,7 +1226,7 @@ fn verify(
             return EXIT_OTHER;
         }
     };
-    let mut channel = match open_for_command(backend, shutdown) {
+    let mut channel = match open_for_command(backend, shutdown, err) {
         Ok(channel) => channel,
         Err(error) => {
             report(&error, err);
@@ -1365,7 +1383,7 @@ fn cancel_then_verify(
         match_iv,
     };
 
-    let mut channel = match open_for_command(backend, shutdown) {
+    let mut channel = match open_for_command(backend, shutdown, err) {
         Ok(channel) => channel,
         Err(error) => {
             report(&error, err);
@@ -1970,10 +1988,15 @@ mod tests {
         assert_eq!(device[1], format!("< {}", hex(&expected_device[1])));
         assert_eq!(device[2], "< empty");
 
+        let timestamps = err
+            .lines()
+            .filter(|line| line.starts_with("* timestamp "))
+            .count();
+        assert_eq!(timestamps, 1, "the session-start sync is shown: {err}");
         assert_eq!(
             err.lines().count(),
-            sent.len() * 2,
-            "each frame has one line in each direction: {err}"
+            sent.len() * 2 + timestamps,
+            "each frame has one line in each direction, plus the host control line: {err}"
         );
     }
 
@@ -3551,6 +3574,121 @@ mod tests {
             "five entries plus the completed (3, 20, template_id)"
         );
         assert_eq!(match_frame.len(), 188, "128 plaintext bytes plus padding");
+    }
+
+    #[test]
+    fn a_command_session_sends_one_timestamp_sync_on_open() {
+        let mut usb = FakeUsb::with_sensor();
+        let shutdown = SignalFlag::new();
+
+        let (code, _out, err) = run_with(&["handshake"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(err, "", "a successful sync is silent without --hex");
+        assert_eq!(
+            usb.syncs.borrow().len(),
+            1,
+            "the session-start sync runs before the handshake"
+        );
+    }
+
+    #[test]
+    fn a_host_timestamp_request_before_an_announcement_is_answered_and_verify_completes() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.timestamp_before_announcement = true;
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(err, "", "the request is answered silently");
+        assert_eq!(
+            out,
+            verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52),
+            "the real announcement still drives the reply"
+        );
+        assert_eq!(
+            usb.syncs.borrow().len(),
+            2,
+            "one sync at session start and one for the type-5 event"
+        );
+    }
+
+    #[test]
+    fn a_host_timestamp_request_during_the_finger_wait_is_answered_and_verify_completes() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.timestamp_before_finger = true;
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(err, "", "the request is answered silently");
+        assert_eq!(
+            out,
+            verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52),
+            "the real finger event still drives the match"
+        );
+        assert_eq!(
+            usb.syncs.borrow().len(),
+            2,
+            "one sync at session start and one for the type-5 event"
+        );
+    }
+
+    #[test]
+    fn a_failed_session_start_timestamp_sync_is_logged_and_the_command_still_runs() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.sync_error = Some(UsbError::Stall);
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "the sync is best effort: {err}");
+        assert!(
+            err.contains("timestamp sync failed: endpoint stalled"),
+            "{err}"
+        );
+        assert_eq!(
+            out,
+            verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52),
+            "stdout is unchanged"
+        );
+    }
+
+    #[test]
+    fn a_failed_timestamp_sync_for_a_type_5_event_is_a_transport_error() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.timestamp_before_announcement = true;
+        usb.sync_error = Some(UsbError::Stall);
+        let shutdown = SignalFlag::new();
+
+        let (code, _out, err) = run_with(&["handshake"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_TRANSPORT, "{err}");
+        assert!(err.contains("handshake failed"), "{err}");
+        assert!(err.contains("endpoint stalled"), "{err}");
+    }
+
+    #[test]
+    fn hex_shows_the_session_start_timestamp_as_a_host_control_line() {
+        let mut usb = FakeUsb::with_sensor();
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["verify", "--hex"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(
+            out,
+            verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52),
+            "the decoded stdout is unchanged by the diagnostic line"
+        );
+        let packed = err
+            .lines()
+            .find_map(|line| line.strip_prefix("* timestamp "))
+            .unwrap_or_else(|| panic!("the sync line is in the dump: {err}"));
+        assert_eq!(packed.len(), 8, "the packed value is eight hex digits");
+        assert!(packed.chars().all(|digit| digit.is_ascii_hexdigit()));
     }
 
     #[test]
