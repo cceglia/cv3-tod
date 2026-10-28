@@ -2,7 +2,7 @@
 
 ### Issue tracker
 
-Issues and specs are markdown files under `.scratch/<feature-slug>/` in this repo. See `docs/agents/issue-tracker.md`.
+Issues and specs are markdown files under `docs/specs/<feature-slug>/` in this repo. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
