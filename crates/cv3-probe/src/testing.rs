@@ -108,6 +108,8 @@ pub struct FakeUsb {
     pub match_plaintext: Option<Vec<u8>>,
     /// If set, the scripted sensor fails the wrapped `0x73` match in the transport.
     pub match_command_error: Option<UsbError>,
+    /// The decrypted TLV of every `0x73` request the scripted sensor received, in order.
+    pub match_tlvs: Rc<RefCell<Vec<Vec<u8>>>>,
     /// What the finger wait delivers. `None` is a genuine `0x03` finger event.
     pub finger_event: Option<Result<Vec<u8>, UsbError>>,
     /// Per-wait finger results consumed in order before falling back to `finger_event`, so a test
@@ -160,6 +162,7 @@ impl Default for FakeUsb {
             match_status: 0,
             match_plaintext: None,
             match_command_error: None,
+            match_tlvs: Rc::new(RefCell::new(Vec::new())),
             finger_event: None,
             finger_events: Vec::new(),
             signal_during_command: None,
@@ -252,6 +255,7 @@ impl UsbBackend for FakeUsb {
             match_status: self.match_status,
             match_plaintext: self.match_plaintext.clone(),
             match_command_error: self.match_command_error.clone(),
+            match_tlvs: Rc::clone(&self.match_tlvs),
             accepted_updates: 0,
             finger_event: self.finger_event.clone(),
             finger_events: self.finger_events.clone(),
@@ -384,6 +388,8 @@ pub struct HandshakeSensor {
     pub match_status: u32,
     pub match_plaintext: Option<Vec<u8>>,
     pub match_command_error: Option<UsbError>,
+    /// The decrypted TLV of each `0x73` request, recorded for the probe's tests.
+    pub match_tlvs: Rc<RefCell<Vec<Vec<u8>>>>,
     pub accepted_updates: usize,
     pub finger_event: Option<Result<Vec<u8>, UsbError>>,
     pub finger_events: Vec<Result<Vec<u8>, UsbError>>,
@@ -413,6 +419,35 @@ impl HandshakeSensor {
         let mut key = [0u8; 16];
         key.copy_from_slice(&digest[..16]);
         self.session_key = Some(key);
+    }
+
+    /// Records the leading TLV of a wrapped `0x73` request, decrypting it with the session key.
+    ///
+    /// The TLV length is in the frame header at `PARAM_LEN_OFFSET`; the ciphertext follows the
+    /// 44-byte header. Best effort: a malformed request records nothing rather than panicking.
+    fn remember_match_tlv(&self, frame: &[u8]) {
+        let Some(key) = self.session_key else {
+            return;
+        };
+        if frame.len() < frame::HEADER_LEN + crypto::BLOCK_LEN {
+            return;
+        }
+        let tlv_len = u32::from_le_bytes([
+            frame[frame::PARAM_LEN_OFFSET],
+            frame[frame::PARAM_LEN_OFFSET + 1],
+            frame[frame::PARAM_LEN_OFFSET + 2],
+            frame[frame::PARAM_LEN_OFFSET + 3],
+        ]) as usize;
+        let mut iv = [0u8; crypto::BLOCK_LEN];
+        iv.copy_from_slice(&frame[frame::IV_OFFSET..frame::IV_OFFSET + crypto::BLOCK_LEN]);
+        let Ok(plaintext) = crypto::decrypt_cbc(&key, &iv, &frame[frame::HEADER_LEN..]) else {
+            return;
+        };
+        if tlv_len <= plaintext.len() {
+            self.match_tlvs
+                .borrow_mut()
+                .push(plaintext[..tlv_len].to_vec());
+        }
     }
 
     fn wrapped_body(
@@ -640,6 +675,7 @@ impl UsbIo for HandshakeSensor {
                 if let Some(error) = &self.match_command_error {
                     return Err(error.clone());
                 }
+                self.remember_match_tlv(frame);
             }
             cmd::CANCEL_CAPTURE => {
                 if let Some(error) = &self.cancel_command_error {

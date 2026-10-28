@@ -211,6 +211,21 @@ impl Session {
         self.next_sequence
     }
 
+    /// Rewinds the wrap sequence by one, for a re-arm at the same sequence after a cancel.
+    ///
+    /// **Measured behaviour of this sensor, 2026-10-28.** After the first `0x66` arm at sequence N
+    /// answered `0x00` and a mid-session `0x68` cancelled the capture, a re-arm at N+1 was rejected
+    /// with `0x0F`; the sensor still expected the arm at N. This method is what
+    /// `cvctl cancel-then-verify` uses before its re-arm. The alternative reading (retry at N+1) is
+    /// recorded in `docs/protocol-notes.md` and can still be measured with
+    /// `cvctl cancel-then-verify --retry-next`.
+    ///
+    /// The caller invokes this only after a wrapped reply that advanced the counter (the arm's
+    /// `0x00` or `0x85` with a body), so the counter never starts at zero here.
+    pub fn rewind_sequence(&mut self) {
+        self.next_sequence = self.next_sequence.wrapping_sub(1);
+    }
+
     /// Builds one wrapped session command.
     ///
     /// The header is built first, with its final total length and IV, because the token covers it.
@@ -1274,6 +1289,18 @@ mod tests {
             assert_sequence(rule, 5, false, proto::status::OK, 5);
             assert_sequence(rule, 5, false, 0x85, 5);
         }
+    }
+
+    #[test]
+    fn rewinding_after_a_cancel_puts_the_sequence_back_one() {
+        let mut session = session_at(3);
+        session.rewind_sequence();
+
+        assert_eq!(
+            session.next_sequence(),
+            2,
+            "the re-arm after a cancel carries the first arm's sequence"
+        );
     }
 
     #[test]

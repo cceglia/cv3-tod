@@ -3,15 +3,17 @@
 //! ```text
 //! host → sensor  0x66 wrapped, attr 0x47   arm a capture (a [`Capture`])
 //! sensor → host                             the finger event
-//! host → sensor  0x73 wrapped, attr 0x47   TLV 68 bytes, plaintext 112 bytes
+//! host → sensor  0x73 wrapped, attr 0x47   TLV 88 bytes, plaintext 128 bytes
 //! sensor → host  wrapped reply             verdict word at plaintext +8,
 //!                                          20-byte value at plaintext +32 when long enough
 //! ```
 //!
-//! [`Match`] sends the exact 68-byte request the audited reference sends. The block is
-//! **firmware-shaped, not a well-formed TLV list**: its last entry, `(3, 20)`, declares twenty
-//! value bytes that are not there, and the block ends at that eight-byte header. Reproducing it
-//! byte for byte is the point; a "corrected" TLV list is a different request.
+//! [`Match`] sends the five entries the audited reference sends and completes the last one:
+//! `(3, 20, template_id)`. The reference's block stops at that entry's eight-byte header, so its
+//! request is 68 bytes; on 2026-10-28 this sensor answered that truncated request with `0x59` for
+//! both an enrolled and an unenrolled finger. The sensor exposes `cv_fingerprint_verify_w_hash`,
+//! which takes a template id, so the driver supplies one (twenty zero bytes when the caller has
+//! none). **The completed 88-byte request has not been measured yet.**
 //!
 //! The reply is wrapped and carries no MAC. Its plaintext is read at fixed offsets, never by
 //! scanning: the verdict word is the `u32` at `+8` and the value is the twenty bytes at `+32`
@@ -44,11 +46,11 @@ use crate::operation::Operation;
 use crate::proto::{self, attr, cmd};
 use crate::session::{Session, Teardown, UnwrapError, WrapError};
 
-/// Length of the `0x73` parameter block, exactly as the reference sends it.
-pub const MATCH_TLV_LEN: usize = 68;
-/// Plaintext length the reference sends with `0x73`.
-pub const MATCH_PLAINTEXT_LEN: usize = 112;
-/// Length of the value at plaintext `+32`.
+/// Length of the `0x73` parameter block: five full entries plus `(3, 20, template_id)`.
+pub const MATCH_TLV_LEN: usize = 88;
+/// Plaintext length the driver sends with `0x73`: 88 TLV bytes, the 32-byte token, zero-padded.
+pub const MATCH_PLAINTEXT_LEN: usize = 128;
+/// Length of the value at plaintext `+32`, and of the template id in the request.
 pub const MATCH_VALUE_LEN: usize = 20;
 /// Offset of the little-endian verdict word inside the decrypted plaintext.
 pub const VERDICT_OFFSET: usize = 8;
@@ -59,11 +61,13 @@ pub const VERDICT_MATCH: u32 = 1;
 /// The verdict word that means "no match".
 pub const VERDICT_NO_MATCH: u32 = 0;
 
-/// The 68-byte `0x73` parameter block, reproduced from the reference.
+/// The 88-byte `0x73` parameter block.
 ///
-/// Five `(tag, 4, value)` entries then `(3, 20)` with **no value bytes**: the last eight bytes are
-/// only the tag and length. The block is deliberately not a well-formed TLV list.
-pub fn match_tlv(handle: u32) -> [u8; MATCH_TLV_LEN] {
+/// Five `(tag, 4, value)` entries then `(3, 20, template_id)`. The audited reference ends the
+/// block at the final entry's eight-byte header, leaving the declared value bytes absent; that
+/// 68-byte request was measured to be refused with `0x59`. Here the value is the caller's
+/// template id, or twenty zero bytes when none is supplied.
+pub fn match_tlv(handle: u32, template_id: Option<&[u8; MATCH_VALUE_LEN]>) -> [u8; MATCH_TLV_LEN] {
     let mut tlv = [0u8; MATCH_TLV_LEN];
     let entries: [(usize, u32, u32); 5] = [
         (0, 0, handle),
@@ -77,9 +81,11 @@ pub fn match_tlv(handle: u32) -> [u8; MATCH_TLV_LEN] {
         tlv[at + 4..at + 8].copy_from_slice(&4u32.to_le_bytes());
         tlv[at + 8..at + 12].copy_from_slice(&value.to_le_bytes());
     }
-    // The final entry declares a 20-byte value and supplies none; the block ends here.
     tlv[60..64].copy_from_slice(&3u32.to_le_bytes());
     tlv[64..68].copy_from_slice(&(MATCH_VALUE_LEN as u32).to_le_bytes());
+    if let Some(template_id) = template_id {
+        tlv[68..88].copy_from_slice(template_id);
+    }
     tlv
 }
 
@@ -123,7 +129,17 @@ pub enum MatchError {
     /// The sensor rejected the wrap sequence (`0x0F`).
     WrongSequence,
     /// The sensor answered `0x73` with another non-zero status.
-    SensorStatus(u32),
+    ///
+    /// The reply length and, when the body decrypted, the plaintext are kept so a hardware run can
+    /// see a `0x59` that still carried a body; the message prints the first bytes of the plaintext.
+    SensorStatus {
+        /// The status word the sensor returned.
+        status: u32,
+        /// The raw wrapped reply body length, header included (`0` for a body-less reply).
+        reply_len: usize,
+        /// The decrypted plaintext, when the body was a valid wrapped frame that decrypted.
+        plaintext: Option<Vec<u8>>,
+    },
     /// The command completed without an announced body.
     MissingReply,
     /// The reply decrypted, but it is too short to carry the verdict word at `+8`.
@@ -152,11 +168,24 @@ impl fmt::Display for MatchError {
                 "sensor rejected the wrap sequence (status 0x0f) on the 0x73 match: the command \
                  carried a stale or unexpected sequence",
             ),
-            Self::SensorStatus(status) => {
+            Self::SensorStatus {
+                status,
+                reply_len,
+                plaintext,
+            } => {
                 write!(
                     f,
-                    "sensor rejected the 0x73 match with status {status:#04x}"
-                )
+                    "sensor rejected the 0x73 match with status {status:#04x} (raw reply \
+                     {reply_len} bytes)"
+                )?;
+                match plaintext {
+                    Some(bytes) => {
+                        write!(f, "; decrypted plaintext {} bytes: ", bytes.len())?;
+                        write_first_hex(f, bytes)
+                    }
+                    None if *reply_len == 0 => f.write_str("; the reply carried no body"),
+                    None => f.write_str("; the body did not decrypt"),
+                }
             }
             Self::MissingReply => f.write_str("sensor answered the 0x73 match without a body"),
             Self::MissingVerdict {
@@ -203,18 +232,32 @@ pub struct Match {
     session: Option<Session>,
     handle: u32,
     iv: [u8; crypto::BLOCK_LEN],
+    template_id: Option<[u8; MATCH_VALUE_LEN]>,
     state: MatchState,
 }
 
 impl Match {
     /// Builds a match for a live session that has already captured a finger.
+    ///
+    /// The last TLV entry carries twenty zero bytes unless [`Self::with_template_id`] supplies the
+    /// template id the enrolment committed with.
     pub fn new(session: Session, iv: [u8; crypto::BLOCK_LEN]) -> Self {
         Self {
             handle: session.handle,
             session: Some(session),
             iv,
+            template_id: None,
             state: MatchState::NotStarted,
         }
+    }
+
+    /// Supplies the 20-byte template id the `0x73` request names.
+    ///
+    /// `None` sends twenty zero bytes, which is the request the driver sent before the template id
+    /// was known to be part of the block. The caller that has an enrolment id should pass it.
+    pub fn with_template_id(mut self, template_id: Option<[u8; MATCH_VALUE_LEN]>) -> Self {
+        self.template_id = template_id;
+        self
     }
 
     fn finish(&mut self, outcome: MatchOutcome) -> Action<MatchOutcome> {
@@ -243,7 +286,7 @@ impl Match {
         session.wrap(
             cmd::MATCH,
             attr::CAPTURE,
-            &match_tlv(session.handle),
+            &match_tlv(session.handle, self.template_id.as_ref()),
             MATCH_PLAINTEXT_LEN,
             &self.iv,
             session.next_sequence(),
@@ -262,7 +305,19 @@ impl Match {
             return self.begin_teardown(MatchError::WrongSequence);
         }
         if status != proto::status::OK {
-            return self.begin_teardown(MatchError::SensorStatus(status));
+            // A refusal can still carry a body; keep it for the hardware diagnostic instead of
+            // discarding it with the status.
+            let reply_len = body.len();
+            let plaintext = self
+                .session
+                .as_ref()
+                .and_then(|session| session.key().unwrap(&body).ok())
+                .map(|reply| reply.plaintext);
+            return self.begin_teardown(MatchError::SensorStatus {
+                status,
+                reply_len,
+                plaintext,
+            });
         }
         if body.is_empty() {
             return self.begin_teardown(MatchError::MissingReply);
@@ -314,6 +369,18 @@ fn le32(bytes: &[u8], offset: usize) -> u32 {
         bytes[offset + 2],
         bytes[offset + 3],
     ])
+}
+
+/// Writes at most the first 64 bytes as hex, so a refusal's body cannot flood a terminal.
+fn write_first_hex(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
+    const LIMIT: usize = 64;
+    for byte in bytes.iter().take(LIMIT) {
+        write!(f, "{byte:02x}")?;
+    }
+    if bytes.len() > LIMIT {
+        f.write_str("...")?;
+    }
+    Ok(())
 }
 
 impl Operation for Match {
@@ -415,6 +482,7 @@ pub struct Verify {
     session: Option<Session>,
     capture_iv: [u8; crypto::BLOCK_LEN],
     match_iv: [u8; crypto::BLOCK_LEN],
+    template_id: Option<[u8; MATCH_VALUE_LEN]>,
     state: VerifyState,
 }
 
@@ -422,7 +490,8 @@ impl Verify {
     /// Builds a verification for a live session.
     ///
     /// `capture_iv` is the IV for the `0x66` arm and `match_iv` the IV for the `0x73` match. They
-    /// must differ; the caller draws both from the operating system.
+    /// must differ; the caller draws both from the operating system. The match sends twenty zero
+    /// bytes as its template id unless [`Self::with_template_id`] supplies one.
     pub fn new(
         session: Session,
         capture_iv: [u8; crypto::BLOCK_LEN],
@@ -432,8 +501,15 @@ impl Verify {
             session: Some(session),
             capture_iv,
             match_iv,
+            template_id: None,
             state: VerifyState::NotStarted,
         }
+    }
+
+    /// Supplies the 20-byte template id the composed [`Match`] request names.
+    pub fn with_template_id(mut self, template_id: Option<[u8; MATCH_VALUE_LEN]>) -> Self {
+        self.template_id = template_id;
+        self
     }
 
     fn finish(&mut self, outcome: VerifyOutcome) -> Action<VerifyOutcome> {
@@ -473,7 +549,8 @@ impl Verify {
     ) -> Action<VerifyOutcome> {
         match result {
             Ok(CapturedSample { session, .. }) => {
-                let mut matching = Match::new(session, self.match_iv);
+                let mut matching =
+                    Match::new(session, self.match_iv).with_template_id(self.template_id);
                 self.advance_match(matching.start(), matching)
             }
             // The capture already ran its own teardown; repeating it would send a second
@@ -546,10 +623,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_match_tlv_is_the_reference_block_and_ends_at_the_last_header() {
-        let tlv = match_tlv(0x1122_3344);
+    fn the_match_tlv_is_the_reference_block_plus_the_template_id() {
+        let template = [0xa5u8; MATCH_VALUE_LEN];
+        let tlv = match_tlv(0x1122_3344, Some(&template));
 
-        assert_eq!(tlv.len(), 68);
+        assert_eq!(tlv.len(), 88);
         assert_eq!(&tlv[0..4], &0u32.to_le_bytes(), "tag 0");
         assert_eq!(&tlv[4..8], &4u32.to_le_bytes(), "length 4");
         assert_eq!(&tlv[8..12], &0x1122_3344u32.to_le_bytes(), "handle");
@@ -572,15 +650,52 @@ mod tests {
 
         assert_eq!(&tlv[60..64], &3u32.to_le_bytes(), "tag 3");
         assert_eq!(&tlv[64..68], &20u32.to_le_bytes(), "declares 20 bytes");
+        assert_eq!(&tlv[68..88], &template, "the caller's template id");
     }
 
     #[test]
-    fn the_last_entry_supplies_no_value_bytes() {
-        let tlv = match_tlv(1);
+    fn a_match_without_a_template_id_sends_twenty_zero_bytes() {
+        let tlv = match_tlv(1, None);
         assert_eq!(
             tlv.len(),
-            8 + 5 * 12,
-            "five full entries plus one bare header"
+            88,
+            "five full entries plus a complete last entry"
         );
+        assert!(
+            tlv[68..88].iter().all(|byte| *byte == 0),
+            "no id means zeros"
+        );
+
+        let explicit = [0u8; MATCH_VALUE_LEN];
+        assert_eq!(tlv, match_tlv(1, Some(&explicit)));
+    }
+
+    #[test]
+    fn a_non_zero_status_keeps_the_reply_and_plaintext_for_the_message() {
+        let error = MatchError::SensorStatus {
+            status: 0x59,
+            reply_len: 108,
+            plaintext: Some(vec![0xab; 52]),
+        };
+        let text = error.to_string();
+
+        assert!(text.contains("status 0x59"), "{text}");
+        assert!(text.contains("raw reply 108 bytes"), "{text}");
+        assert!(text.contains("decrypted plaintext 52 bytes"), "{text}");
+        assert!(text.contains(&"ab".repeat(52)), "{text}");
+    }
+
+    #[test]
+    fn the_diagnostic_hex_is_bounded_to_the_first_64_bytes() {
+        let error = MatchError::SensorStatus {
+            status: 0x59,
+            reply_len: 108,
+            plaintext: Some(vec![0xcd; 100]),
+        };
+        let text = error.to_string();
+
+        assert!(text.contains(&"cd".repeat(64)), "{text}");
+        assert!(!text.contains(&"cd".repeat(65)), "{text}");
+        assert!(text.contains("..."), "{text}");
     }
 }

@@ -3,14 +3,14 @@
 //! Every expected frame is built with the same codec the implementation uses, from constants
 //! written out independently here: the command numbers, attributes, TLV layouts and sequence
 //! numbers come from the protocol description, not from the module under test. The `0x73` request
-//! is asserted byte for byte because its last TLV entry carries no value bytes at all.
+//! is asserted byte for byte, including the completed `(3, 20, template_id)` entry.
 
 mod common;
 
 use common::{
     HANDLE, MATCH_PLAINTEXT_LEN, MATCH_TLV_LEN, MATCH_VALUE, SAMPLE_HASH, arm_frame, capture_reply,
-    fixed_iv, match_frame, match_frame_at, match_plaintext, match_plaintext_with_len, match_reply,
-    match_tlv, opened_session, sample_hash_plaintext,
+    fixed_iv, match_frame, match_frame_at, match_frame_at_with, match_frame_with, match_plaintext,
+    match_plaintext_with_len, match_reply, match_tlv, opened_session, sample_hash_plaintext,
 };
 use cv3_core::crypto;
 use cv3_core::frame;
@@ -118,7 +118,7 @@ fn a_verify_arms_waits_matches_and_reports_the_reply() {
 }
 
 #[test]
-fn the_match_frame_is_the_reference_tlv_at_plaintext_len_112() {
+fn the_match_frame_is_eighty_eight_tlv_bytes_at_plaintext_len_128() {
     let mut transport = ScriptedTransport::default();
     let session = opened_session(&mut transport);
     let key = *session.key().as_bytes();
@@ -141,11 +141,11 @@ fn the_match_frame_is_the_reference_tlv_at_plaintext_len_112() {
 
     assert_eq!(
         frame.len(),
-        172,
-        "112 plaintext bytes pad to 128 ciphertext bytes"
+        188,
+        "128 plaintext bytes pad to 144 ciphertext bytes"
     );
     assert_eq!(le32(frame, 0), 1, "magic");
-    assert_eq!(le32(frame, 4), 172, "total length");
+    assert_eq!(le32(frame, 4), 188, "total length");
     assert_eq!(&frame[8..10], &cmd::MATCH.to_le_bytes(), "0x73");
     assert_eq!(frame[10], attr::CAPTURE, "attribute 0x47");
     assert_eq!(frame[11], 0x02, "wrapped encoding");
@@ -156,7 +156,7 @@ fn the_match_frame_is_the_reference_tlv_at_plaintext_len_112() {
     iv.copy_from_slice(&frame[24..40]);
     let plaintext = crypto::decrypt_cbc(&key, &iv, &frame[44..]).expect("the request decrypts");
     assert_eq!(plaintext.len(), MATCH_PLAINTEXT_LEN);
-    assert_eq!(&plaintext[..MATCH_TLV_LEN], &match_tlv(HANDLE));
+    assert_eq!(&plaintext[..MATCH_TLV_LEN], &match_tlv(HANDLE, None));
     assert!(
         plaintext[MATCH_TLV_LEN + 32..]
             .iter()
@@ -164,6 +164,46 @@ fn the_match_frame_is_the_reference_tlv_at_plaintext_len_112() {
         "the rest of the plaintext is zero padding after the token"
     );
     assert_eq!(verification.verdict.plaintext_len, 52);
+}
+
+#[test]
+fn a_match_can_name_the_template_id_the_enrolment_committed() {
+    let mut transport = ScriptedTransport::default();
+    let session = opened_session(&mut transport);
+    let key = *session.key().as_bytes();
+    let template = [0x5au8; 20];
+    let expected = match_frame_with(&session, &match_iv(), Some(&template));
+
+    transport.push(ScriptedOutcome::Reply {
+        status: 0,
+        body: match_reply(&session, 0, &match_plaintext(1, Some(&MATCH_VALUE))),
+    });
+    let mut operation = Match::new(session, match_iv()).with_template_id(Some(template));
+    run(&mut operation, &mut transport).expect("the reply decodes");
+
+    let frame = &transport.sent()[3];
+    assert_eq!(frame, &expected, "the request carries the template id");
+    let mut iv = [0u8; crypto::BLOCK_LEN];
+    iv.copy_from_slice(&frame[24..40]);
+    let plaintext = crypto::decrypt_cbc(&key, &iv, &frame[44..]).expect("the request decrypts");
+    assert_eq!(&plaintext[60..64], &3u32.to_le_bytes(), "tag 3");
+    assert_eq!(&plaintext[64..68], &20u32.to_le_bytes(), "length 20");
+    assert_eq!(&plaintext[68..88], &template, "the caller's template id");
+}
+
+#[test]
+fn a_verify_can_name_the_template_id_for_its_composed_match() {
+    let mut transport = ScriptedTransport::default();
+    let session = opened_session(&mut transport);
+    let template = [0x33u8; 20];
+    push_capture(&mut transport, &session);
+    push_match(&mut transport, &session, 1);
+    let expected_match = match_frame_at_with(&session, &match_iv(), 2, Some(&template));
+    let mut verify =
+        Verify::new(session, capture_iv(), match_iv()).with_template_id(Some(template));
+
+    run(&mut verify, &mut transport).expect("the finger matched");
+    assert_eq!(transport.sent()[4], expected_match);
 }
 
 #[test]
@@ -281,9 +321,10 @@ fn a_sensor_status_on_the_match_reply_tears_down_and_is_distinct() {
     let mut transport = ScriptedTransport::default();
     let session = opened_session(&mut transport);
 
+    let reply = match_reply(&session, 0x0c, &[]);
     transport.push(ScriptedOutcome::Reply {
         status: 0x0c,
-        body: match_reply(&session, 0x0c, &[]),
+        body: reply.clone(),
     });
     transport.push(teardown_replies()[0].clone());
     transport.push(teardown_replies()[1].clone());
@@ -291,7 +332,48 @@ fn a_sensor_status_on_the_match_reply_tears_down_and_is_distinct() {
 
     assert_eq!(
         run(&mut operation, &mut transport),
-        Err(MatchError::SensorStatus(0x0c))
+        Err(MatchError::SensorStatus {
+            status: 0x0c,
+            reply_len: reply.len(),
+            plaintext: Some(Vec::new()),
+        })
+    );
+    let sent = transport.sent();
+    assert_eq!(sent[4], frame::build_cancel_capture(HANDLE));
+    assert_eq!(sent[5], frame::build_close_handle(HANDLE));
+    transport.assert_exhausted();
+}
+
+#[test]
+fn the_measured_zero_five_nine_status_keeps_the_reply_for_diagnostics() {
+    let mut transport = ScriptedTransport::default();
+    let session = opened_session(&mut transport);
+
+    // The 2026-10-28 sensor answered the match with 0x59 and a body that decrypts.
+    let reply = match_reply(&session, 0x59, &match_plaintext(0, Some(&MATCH_VALUE)));
+    transport.push(ScriptedOutcome::Reply {
+        status: 0x59,
+        body: reply.clone(),
+    });
+    transport.push(teardown_replies()[0].clone());
+    transport.push(teardown_replies()[1].clone());
+    let mut operation = Match::new(session, match_iv());
+
+    let error = run(&mut operation, &mut transport).expect_err("the sensor refused");
+    let text = error.to_string();
+    assert!(text.contains("status 0x59"), "{text}");
+    assert!(
+        text.contains(&format!("raw reply {} bytes", reply.len())),
+        "{text}"
+    );
+    assert!(text.contains("decrypted plaintext 52 bytes"), "{text}");
+    assert_eq!(
+        error,
+        MatchError::SensorStatus {
+            status: 0x59,
+            reply_len: reply.len(),
+            plaintext: Some(match_plaintext(0, Some(&MATCH_VALUE))),
+        }
     );
     let sent = transport.sent();
     assert_eq!(sent[4], frame::build_cancel_capture(HANDLE));
@@ -502,9 +584,10 @@ fn a_match_failure_after_a_successful_capture_tears_down_once() {
     let mut transport = ScriptedTransport::default();
     let session = opened_session(&mut transport);
     push_capture(&mut transport, &session);
+    let reply = match_reply(&session, 0x0c, &[]);
     transport.push(ScriptedOutcome::Reply {
         status: 0x0c,
-        body: match_reply(&session, 0x0c, &[]),
+        body: reply.clone(),
     });
     transport.push(teardown_replies()[0].clone());
     transport.push(teardown_replies()[1].clone());
@@ -512,7 +595,11 @@ fn a_match_failure_after_a_successful_capture_tears_down_once() {
 
     assert_eq!(
         run(&mut verify, &mut transport),
-        Err(VerifyError::Match(MatchError::SensorStatus(0x0c)))
+        Err(VerifyError::Match(MatchError::SensorStatus {
+            status: 0x0c,
+            reply_len: reply.len(),
+            plaintext: Some(Vec::new()),
+        }))
     );
     let sent = transport.sent();
     assert_eq!(

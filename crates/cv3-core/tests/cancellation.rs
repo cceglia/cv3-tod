@@ -143,6 +143,61 @@ fn one_session_arms_cancels_and_then_verifies_with_the_documented_frames_and_seq
 }
 
 #[test]
+fn a_cancelled_capture_rearms_at_the_first_arms_sequence_by_default() {
+    for (rewind, expected_second_arm, label) in [
+        (true, 1, "default: rewind to N"),
+        (false, 2, "--retry-next: N+1"),
+    ] {
+        let mut transport = ScriptedTransport::default();
+        let session = opened_session(&mut transport);
+        assert_eq!(session.next_sequence(), 1, "0x02 consumed sequence zero");
+
+        let first_arm_iv = iv(0x60);
+        push_arm(&mut transport, &session);
+        let armed = match run(&mut ArmCapture::new(session, first_arm_iv), &mut transport)
+            .expect("the first arm captures")
+        {
+            ArmOutcome::Armed(armed) => armed,
+            other => panic!("{label}: expected an armed capture, got {other:?}"),
+        };
+        assert_eq!(
+            armed.session.next_sequence(),
+            2,
+            "{label}: the first arm reply advanced"
+        );
+
+        transport.push(ScriptedOutcome::ReplyWithoutBody);
+        let mut session = run(&mut CancelCapture::new(armed.session), &mut transport)
+            .expect("the mid-session cancel succeeds");
+        if rewind {
+            session.rewind_sequence();
+        }
+
+        let second_arm_iv = iv(0x70);
+        let expected = arm_frame_at(&session, &second_arm_iv, expected_second_arm);
+        push_arm(&mut transport, &session);
+        let rearmed = match run(&mut ArmCapture::new(session, second_arm_iv), &mut transport)
+            .expect("the re-arm captures")
+        {
+            ArmOutcome::Armed(armed) => armed,
+            other => panic!("{label}: expected an armed capture, got {other:?}"),
+        };
+
+        assert_eq!(
+            transport.sent()[5],
+            expected,
+            "{label}: the second 0x66 carries sequence {expected_second_arm}"
+        );
+        assert_eq!(
+            rearmed.session.next_sequence(),
+            expected_second_arm + 1,
+            "{label}: the re-arm reply advances from there"
+        );
+        transport.assert_exhausted();
+    }
+}
+
+#[test]
 fn the_mid_session_cancel_frame_is_plain_with_the_live_handle_and_twelve_bytes() {
     let frame = frame::build_cancel_capture_mid(HANDLE);
 

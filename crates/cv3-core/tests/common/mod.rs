@@ -186,17 +186,17 @@ pub const MATCH_VALUE: [u8; 20] = [
     0xd0, 0xd1, 0xd2, 0xd3,
 ];
 
-/// Length of the `0x73` parameter block, exactly as the audited reference sends it.
-pub const MATCH_TLV_LEN: usize = 68;
-/// Plaintext length the reference sends with `0x73`.
-pub const MATCH_PLAINTEXT_LEN: usize = 112;
+/// Length of the `0x73` parameter block: five entries plus `(3, 20, template_id)`.
+pub const MATCH_TLV_LEN: usize = 88;
+/// Plaintext length the driver sends with `0x73`.
+pub const MATCH_PLAINTEXT_LEN: usize = 128;
 
-/// The documented 68-byte `0x73` parameter block, built independently of the implementation.
+/// The documented 88-byte `0x73` parameter block, built independently of the implementation.
 ///
-/// Five `(tag, 4, value)` entries followed by `(3, 20)` whose value bytes are deliberately absent:
-/// the reference ends the block at the final 8-byte header. This is a firmware-shaped request, not
-/// a well-formed TLV list.
-pub fn match_tlv(handle: u32) -> [u8; MATCH_TLV_LEN] {
+/// Five `(tag, 4, value)` entries followed by `(3, 20, template_id)`. The audited reference stops
+/// after the final entry's eight-byte header; that 68-byte request was refused with `0x59` on
+/// 2026-10-28, so the driver completes the value. `None` supplies twenty zero bytes.
+pub fn match_tlv(handle: u32, template_id: Option<&[u8; 20]>) -> [u8; MATCH_TLV_LEN] {
     let mut tlv = [0u8; MATCH_TLV_LEN];
     let entries: [(usize, u32, u32); 5] = [
         (0, 0, handle),
@@ -212,21 +212,43 @@ pub fn match_tlv(handle: u32) -> [u8; MATCH_TLV_LEN] {
     }
     tlv[60..64].copy_from_slice(&3u32.to_le_bytes());
     tlv[64..68].copy_from_slice(&20u32.to_le_bytes());
+    if let Some(template_id) = template_id {
+        tlv[68..88].copy_from_slice(template_id);
+    }
     tlv
 }
 
 /// The exact wrapped `0x73` frame a match must send for `session` at its next sequence.
 pub fn match_frame(session: &Session, iv: &[u8; 16]) -> Vec<u8> {
-    match_frame_at(session, iv, session.next_sequence())
+    match_frame_with(session, iv, None)
+}
+
+/// The exact wrapped `0x73` frame for `session` at its next sequence with a template id.
+pub fn match_frame_with(
+    session: &Session,
+    iv: &[u8; 16],
+    template_id: Option<&[u8; 20]>,
+) -> Vec<u8> {
+    match_frame_at_with(session, iv, session.next_sequence(), template_id)
 }
 
 /// The exact wrapped `0x73` frame for `session` at an explicit wrap sequence.
 pub fn match_frame_at(session: &Session, iv: &[u8; 16], sequence: u32) -> Vec<u8> {
+    match_frame_at_with(session, iv, sequence, None)
+}
+
+/// The exact wrapped `0x73` frame at an explicit sequence with a template id.
+pub fn match_frame_at_with(
+    session: &Session,
+    iv: &[u8; 16],
+    sequence: u32,
+    template_id: Option<&[u8; 20]>,
+) -> Vec<u8> {
     session
         .wrap(
             cmd::MATCH,
             attr::CAPTURE,
-            &match_tlv(session.handle),
+            &match_tlv(session.handle, template_id),
             MATCH_PLAINTEXT_LEN,
             iv,
             sequence,

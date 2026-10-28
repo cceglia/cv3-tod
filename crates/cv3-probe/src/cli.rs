@@ -58,8 +58,8 @@ const USAGE: &str = "usage: cvctl devices
        cvctl capture [--hex]
        cvctl enroll [--hex]
        cvctl enroll-then-verify [--hex]
-       cvctl verify [--hex]
-       cvctl cancel-then-verify [--hex]
+       cvctl verify [--template <40 hex>] [--hex]
+       cvctl cancel-then-verify [--retry-next] [--hex]
        cvctl replay <file>";
 
 /// One parsed invocation.
@@ -90,9 +90,11 @@ enum Command<'a> {
     },
     Verify {
         hex: bool,
+        template: Option<[u8; cv3_core::verify::MATCH_VALUE_LEN]>,
     },
     CancelThenVerify {
         hex: bool,
+        retry_next: bool,
     },
     Replay {
         file: &'a str,
@@ -105,6 +107,19 @@ struct Flags<'a> {
     bad_sequence: bool,
     hex: bool,
     record: Option<&'a str>,
+    template: Option<[u8; cv3_core::verify::MATCH_VALUE_LEN]>,
+    retry_next: bool,
+}
+
+/// Which optional flags a subcommand accepts. Every one defaults to refused, so a flag on the
+/// wrong command is a usage error rather than silently ignored.
+#[derive(Clone, Copy, Default)]
+struct Accepted {
+    show_key: bool,
+    bad_sequence: bool,
+    record: bool,
+    template: bool,
+    retry_next: bool,
 }
 
 /// Parses the command line by hand: no dependency, and every unknown or repeated flag is a usage
@@ -114,7 +129,14 @@ fn parse(args: &[String]) -> Option<Command<'_>> {
     match command.as_str() {
         "devices" if rest.is_empty() => Some(Command::Devices),
         "handshake" => {
-            let flags = parse_flags(rest, true, false, true)?;
+            let flags = parse_flags(
+                rest,
+                Accepted {
+                    show_key: true,
+                    record: true,
+                    ..Accepted::default()
+                },
+            )?;
             Some(Command::Handshake {
                 show_key: flags.show_key,
                 hex: flags.hex,
@@ -122,7 +144,14 @@ fn parse(args: &[String]) -> Option<Command<'_>> {
             })
         }
         "open" => {
-            let flags = parse_flags(rest, false, true, true)?;
+            let flags = parse_flags(
+                rest,
+                Accepted {
+                    bad_sequence: true,
+                    record: true,
+                    ..Accepted::default()
+                },
+            )?;
             Some(Command::Open {
                 bad_sequence: flags.bad_sequence,
                 hex: flags.hex,
@@ -130,31 +159,55 @@ fn parse(args: &[String]) -> Option<Command<'_>> {
             })
         }
         "close" => {
-            let flags = parse_flags(rest, false, false, true)?;
+            let flags = parse_flags(
+                rest,
+                Accepted {
+                    record: true,
+                    ..Accepted::default()
+                },
+            )?;
             Some(Command::Close {
                 hex: flags.hex,
                 record: flags.record,
             })
         }
         "capture" => {
-            let flags = parse_flags(rest, false, false, false)?;
+            let flags = parse_flags(rest, Accepted::default())?;
             Some(Command::Capture { hex: flags.hex })
         }
         "enroll" => {
-            let flags = parse_flags(rest, false, false, false)?;
+            let flags = parse_flags(rest, Accepted::default())?;
             Some(Command::Enroll { hex: flags.hex })
         }
         "enroll-then-verify" => {
-            let flags = parse_flags(rest, false, false, false)?;
+            let flags = parse_flags(rest, Accepted::default())?;
             Some(Command::EnrollThenVerify { hex: flags.hex })
         }
         "verify" => {
-            let flags = parse_flags(rest, false, false, false)?;
-            Some(Command::Verify { hex: flags.hex })
+            let flags = parse_flags(
+                rest,
+                Accepted {
+                    template: true,
+                    ..Accepted::default()
+                },
+            )?;
+            Some(Command::Verify {
+                hex: flags.hex,
+                template: flags.template,
+            })
         }
         "cancel-then-verify" => {
-            let flags = parse_flags(rest, false, false, false)?;
-            Some(Command::CancelThenVerify { hex: flags.hex })
+            let flags = parse_flags(
+                rest,
+                Accepted {
+                    retry_next: true,
+                    ..Accepted::default()
+                },
+            )?;
+            Some(Command::CancelThenVerify {
+                hex: flags.hex,
+                retry_next: flags.retry_next,
+            })
         }
         "replay" => match rest {
             [file] => Some(Command::Replay { file }),
@@ -164,35 +217,53 @@ fn parse(args: &[String]) -> Option<Command<'_>> {
     }
 }
 
-fn parse_flags<'a>(
-    args: &'a [String],
-    allow_show_key: bool,
-    allow_bad_sequence: bool,
-    allow_record: bool,
-) -> Option<Flags<'a>> {
+fn parse_flags<'a>(args: &'a [String], accepted: Accepted) -> Option<Flags<'a>> {
     let mut flags = Flags {
         show_key: false,
         bad_sequence: false,
         hex: false,
         record: None,
+        template: None,
+        retry_next: false,
     };
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--show-key" if allow_show_key && !flags.show_key => flags.show_key = true,
-            "--bad-sequence" if allow_bad_sequence && !flags.bad_sequence => {
+            "--show-key" if accepted.show_key && !flags.show_key => flags.show_key = true,
+            "--bad-sequence" if accepted.bad_sequence && !flags.bad_sequence => {
                 flags.bad_sequence = true;
             }
             "--hex" if !flags.hex => flags.hex = true,
-            "--record" if allow_record && flags.record.is_none() => {
+            "--record" if accepted.record && flags.record.is_none() => {
                 index += 1;
                 flags.record = Some(args.get(index)?.as_str());
+            }
+            "--template" if accepted.template && flags.template.is_none() => {
+                index += 1;
+                flags.template = Some(parse_template(args.get(index)?)?);
+            }
+            "--retry-next" if accepted.retry_next && !flags.retry_next => {
+                flags.retry_next = true;
             }
             _ => return None,
         }
         index += 1;
     }
     Some(flags)
+}
+
+/// Parses exactly forty hex digits into the 20-byte template id a `0x73` request names.
+fn parse_template(text: &str) -> Option<[u8; cv3_core::verify::MATCH_VALUE_LEN]> {
+    if text.len() != 40 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut id = [0u8; cv3_core::verify::MATCH_VALUE_LEN];
+    for (index, slot) in id.iter_mut().enumerate() {
+        let high = (text.as_bytes()[2 * index] as char).to_digit(16)? as u8;
+        let low = (text.as_bytes()[2 * index + 1] as char).to_digit(16)? as u8;
+        *slot = (high << 4) | low;
+    }
+    Some(id)
 }
 
 /// Runs one invocation and returns its exit status.
@@ -223,9 +294,11 @@ pub fn run(
         Some(Command::EnrollThenVerify { hex }) => {
             enroll_then_verify(backend, shutdown, hex, out, err)
         }
-        Some(Command::Verify { hex }) => verify(backend, shutdown, hex, out, err),
-        Some(Command::CancelThenVerify { hex }) => {
-            cancel_then_verify(backend, shutdown, hex, out, err)
+        Some(Command::Verify { hex, template }) => {
+            verify(backend, shutdown, hex, template, out, err)
+        }
+        Some(Command::CancelThenVerify { hex, retry_next }) => {
+            cancel_then_verify(backend, shutdown, hex, retry_next, out, err)
         }
         Some(Command::Replay { file }) => replay(file, out, err),
         None => {
@@ -856,8 +929,9 @@ fn enroll_then_verify_over(
         ..
     } = enrol_session(transport, session, enrol_iv, out).map_err(EnrollThenVerifyFailure::Enrol)?;
     let _ = writeln!(out, "template id {} ({})", hex(&template_id), source);
+    let _ = writeln!(out, "match template id {}", hex(&template_id));
 
-    let mut verify = Verify::new(session, capture_iv, match_iv);
+    let mut verify = Verify::new(session, capture_iv, match_iv).with_template_id(Some(template_id));
     match drive(&mut verify, transport) {
         Ok(Verification { verdict, session }) => {
             let mut teardown = Teardown::new(session.handle);
@@ -966,12 +1040,13 @@ fn verify_over(
     open_iv: [u8; cv3_core::crypto::BLOCK_LEN],
     capture_iv: [u8; cv3_core::crypto::BLOCK_LEN],
     match_iv: [u8; cv3_core::crypto::BLOCK_LEN],
+    template_id: Option<[u8; cv3_core::verify::MATCH_VALUE_LEN]>,
 ) -> Result<(Verdict, Result<(), TeardownError>), VerifyFailure> {
     let run = handshake_over(transport, secrets, true).map_err(VerifyFailure::Handshake)?;
     let mut open = OpenSession::new(run.session, open_iv);
     let session = drive(&mut open, transport).map_err(VerifyFailure::Open)?;
 
-    let mut verify = Verify::new(session, capture_iv, match_iv);
+    let mut verify = Verify::new(session, capture_iv, match_iv).with_template_id(template_id);
     match drive(&mut verify, transport) {
         Ok(Verification { verdict, session }) => {
             let mut teardown = Teardown::new(session.handle);
@@ -1057,10 +1132,14 @@ fn verify_error_code(error: &VerifyError) -> u8 {
         VerifyError::Capture(error) => capture_error_code(error),
         VerifyError::Match(MatchError::WrongSequence) => EXIT_SEQUENCE,
         VerifyError::Match(MatchError::Transport(_)) => EXIT_TRANSPORT,
-        VerifyError::Match(MatchError::SensorStatus(code)) if *code == status::BAD_SEQUENCE => {
+        VerifyError::Match(MatchError::SensorStatus { status, .. })
+            if *status == status::BAD_SEQUENCE =>
+        {
             EXIT_SEQUENCE
         }
-        VerifyError::Match(MatchError::SensorStatus(code)) if *code == status::CAPTURE_PENDING => {
+        VerifyError::Match(MatchError::SensorStatus { status, .. })
+            if *status == status::CAPTURE_PENDING =>
+        {
             EXIT_CAPTURE_PENDING
         }
         _ => EXIT_OTHER,
@@ -1104,6 +1183,7 @@ fn verify(
     backend: &mut dyn UsbBackend,
     shutdown: &dyn Shutdown,
     dump_hex: bool,
+    template_id: Option<[u8; cv3_core::verify::MATCH_VALUE_LEN]>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
@@ -1143,11 +1223,21 @@ fn verify(
         }
     };
     let (outcome, _) = with_transport(&mut channel, "verify", None, dump_hex, err, |transport| {
-        verify_over(transport, secrets, open_iv, capture_iv, match_iv)
+        verify_over(
+            transport,
+            secrets,
+            open_iv,
+            capture_iv,
+            match_iv,
+            template_id,
+        )
     });
 
     let code = match outcome {
         Ok((verdict, teardown)) => {
+            if let Some(template_id) = template_id {
+                let _ = writeln!(out, "match template id {}", hex(&template_id));
+            }
             print_verdict(&verdict, out);
             if let Err(error) = teardown {
                 let _ = writeln!(err, "cvctl: {error}");
@@ -1186,39 +1276,58 @@ enum CancelThenVerifyFailure {
     Verify(VerifyError),
 }
 
+/// One IV per wrapped command in the cancel-then-verify run.
+struct CancelIvs {
+    open: [u8; BLOCK_LEN],
+    arm: [u8; BLOCK_LEN],
+    capture: [u8; BLOCK_LEN],
+    match_iv: [u8; BLOCK_LEN],
+}
+
 /// Opens **one** session, arms a capture, cancels it before any finger, then verifies in it.
 ///
 /// The wire order is `0x02`, `0x66`, the mid-session `0x68`, `0x66`, the finger event and `0x73`.
-/// The mid-session cancel is plain and leaves the wrap sequence where the first arm reply put it,
-/// which is what makes this run the experiment for the capture-pending rule as well: the second
-/// arm carries the reference reading's number. The caller tears the one session down afterwards.
+/// The first arm's status and the sequence each `0x66` carries are printed, because the re-arm's
+/// sequence is the experiment. The default rewinds the counter to the first arm's sequence, which
+/// is what this sensor was measured to require after a cancel; `retry_next` instead keeps the
+/// reference reading and re-arms at N+1. The caller tears the one session down afterwards.
 fn cancel_then_verify_over(
     transport: &mut dyn Transport,
     secrets: RunSecrets,
-    open_iv: [u8; BLOCK_LEN],
-    arm_iv: [u8; BLOCK_LEN],
-    capture_iv: [u8; BLOCK_LEN],
-    match_iv: [u8; BLOCK_LEN],
+    ivs: CancelIvs,
+    retry_next: bool,
+    out: &mut dyn Write,
 ) -> Result<(Verdict, Result<(), TeardownError>), CancelThenVerifyFailure> {
     let run =
         handshake_over(transport, secrets, true).map_err(CancelThenVerifyFailure::Handshake)?;
-    let mut open = OpenSession::new(run.session, open_iv);
+    let mut open = OpenSession::new(run.session, ivs.open);
     let session = drive(&mut open, transport).map_err(CancelThenVerifyFailure::Open)?;
 
     // Arm only: consume the 0x66 reply and keep the session, without waiting for a finger. A
     // 0x85 reply is an outcome, not a failure: the stale capture is cancelled next, and the
     // re-arm inside the verification then carries the sequence the two readings disagree about.
-    let mut arm = ArmCapture::new(session, arm_iv);
-    let session = match drive(&mut arm, transport).map_err(CancelThenVerifyFailure::Capture)? {
-        ArmOutcome::Armed(CapturedSample { session, .. }) => session,
-        ArmOutcome::AlreadyPending(session) => session,
-    };
+    let first_arm_sequence = session.next_sequence();
+    let mut arm = ArmCapture::new(session, ivs.arm);
+    let (session, first_arm_status) =
+        match drive(&mut arm, transport).map_err(CancelThenVerifyFailure::Capture)? {
+            ArmOutcome::Armed(CapturedSample { session, .. }) => (session, 0x00),
+            ArmOutcome::AlreadyPending(session) => (session, 0x85),
+        };
+    let _ = writeln!(out, "first arm status {first_arm_status:#04x}");
+    let _ = writeln!(out, "arm sequence {first_arm_sequence}");
 
     // Clear the armed capture with the session-scoped cancel, which leaves the session open.
     let mut cancel = CancelCapture::new(session);
-    let session = drive(&mut cancel, transport).map_err(CancelThenVerifyFailure::Cancel)?;
+    let mut session = drive(&mut cancel, transport).map_err(CancelThenVerifyFailure::Cancel)?;
 
-    let mut verify = Verify::new(session, capture_iv, match_iv);
+    // The measured behaviour: the sensor still expects the arm at the first arm's sequence, so
+    // the default rewinds the counter. `--retry-next` keeps the reference reading for comparison.
+    if !retry_next {
+        session.rewind_sequence();
+    }
+    let _ = writeln!(out, "re-arm sequence {}", session.next_sequence());
+
+    let mut verify = Verify::new(session, ivs.capture, ivs.match_iv);
     match drive(&mut verify, transport) {
         Ok(Verification { verdict, session }) => {
             let mut teardown = Teardown::new(session.handle);
@@ -1234,6 +1343,7 @@ fn cancel_then_verify(
     backend: &mut dyn UsbBackend,
     shutdown: &dyn Shutdown,
     dump_hex: bool,
+    retry_next: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
@@ -1247,7 +1357,13 @@ fn cancel_then_verify(
             }
         };
     }
-    let [open_iv, arm_iv, capture_iv, match_iv] = ivs;
+    let [open, arm, capture, match_iv] = ivs;
+    let ivs = CancelIvs {
+        open,
+        arm,
+        capture,
+        match_iv,
+    };
 
     let mut channel = match open_for_command(backend, shutdown) {
         Ok(channel) => channel,
@@ -1270,9 +1386,7 @@ fn cancel_then_verify(
         None,
         dump_hex,
         err,
-        |transport| {
-            cancel_then_verify_over(transport, secrets, open_iv, arm_iv, capture_iv, match_iv)
-        },
+        |transport| cancel_then_verify_over(transport, secrets, ivs, retry_next, out),
     );
 
     let code = match outcome {
@@ -2714,14 +2828,136 @@ mod tests {
             "sample 1 accepted (1/12)\n\
              sample 2 accepted (2/12)\n\
              template id {} (sensor enrolment id)\n\
+             match template id {}\n\
              {}",
+            hex(&ENROLMENT_ID),
             hex(&ENROLMENT_ID),
             verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
         );
         assert_eq!(
             out, expected,
-            "progress, the template id, then the verdict detail"
+            "progress, the template id and the id the match used, then the verdict detail"
         );
+    }
+
+    #[test]
+    fn enroll_then_verify_sends_the_committed_enrolment_id_in_the_match_tlv() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.completion_after = Some(2);
+        let shutdown = SignalFlag::new();
+
+        let (code, _out, err) = run_with(&["enroll-then-verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        let tlvs = usb.match_tlvs.borrow();
+        assert_eq!(tlvs.len(), 1, "one 0x73 request");
+        assert_eq!(tlvs[0].len(), 88, "the completed TLV block");
+        assert_eq!(&tlvs[0][60..64], &3u32.to_le_bytes(), "tag 3");
+        assert_eq!(&tlvs[0][64..68], &20u32.to_le_bytes(), "length 20");
+        assert_eq!(
+            &tlvs[0][68..88],
+            &ENROLMENT_ID,
+            "the match names the enrolment id the commit returned"
+        );
+    }
+
+    #[test]
+    fn verify_template_sends_the_callers_id_and_prints_it() {
+        let mut usb = FakeUsb::with_sensor();
+        let shutdown = SignalFlag::new();
+        let template = hex(&ENROLMENT_ID);
+
+        let (code, out, err) = run_with(&["verify", "--template", &template], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(err, "");
+        assert_eq!(
+            out,
+            format!(
+                "match template id {template}\n{}",
+                verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
+            )
+        );
+        let tlvs = usb.match_tlvs.borrow();
+        assert_eq!(&tlvs[0][68..88], &ENROLMENT_ID);
+    }
+
+    #[test]
+    fn verify_without_a_template_sends_twenty_zero_bytes() {
+        let mut usb = FakeUsb::with_sensor();
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(err, "");
+        assert!(!out.contains("match template id"), "{out}");
+        let tlvs = usb.match_tlvs.borrow();
+        assert!(
+            tlvs[0][68..88].iter().all(|byte| *byte == 0),
+            "no id means the zero value"
+        );
+    }
+
+    #[test]
+    fn a_malformed_template_flag_is_a_usage_error() {
+        let shutdown = SignalFlag::new();
+        for template in ["00", &"0".repeat(39), &"z".repeat(40)] {
+            let mut usb = FakeUsb::with_sensor();
+            let (code, out, err) =
+                run_with(&["verify", "--template", template], &mut usb, &shutdown);
+
+            assert_eq!(code, EXIT_OTHER, "{template}");
+            assert_eq!(out, "");
+            assert_eq!(err, format!("{USAGE}\n"), "{template}");
+            assert!(usb.calls().is_empty(), "nothing touches the sensor");
+        }
+    }
+
+    #[test]
+    fn retry_next_is_accepted_only_by_cancel_then_verify() {
+        let mut usb = FakeUsb::with_sensor();
+        let shutdown = SignalFlag::new();
+        let (code, out, err) =
+            run_with(&["cancel-then-verify", "--retry-next"], &mut usb, &shutdown);
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(out.lines().next(), Some("first arm status 0x00"));
+
+        let mut usb = FakeUsb::with_sensor();
+        let (code, out, err) = run_with(&["verify", "--retry-next"], &mut usb, &shutdown);
+        assert_eq!(code, EXIT_OTHER);
+        assert_eq!(out, "");
+        assert_eq!(err, format!("{USAGE}\n"));
+        assert!(usb.calls().is_empty());
+    }
+
+    #[test]
+    fn verify_reports_the_measured_0x59_with_the_reply_length_and_plaintext() {
+        let mut usb = FakeUsb::with_sensor();
+        let plaintext = match_plaintext(0, Some(&MATCH_VALUE));
+        usb.match_status = 0x59;
+        usb.match_plaintext = Some(plaintext.clone());
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OTHER);
+        assert_eq!(out, "", "a refusal is never printed as a verdict");
+        assert!(err.contains("status 0x59"), "{err}");
+        assert!(
+            err.contains(&format!("raw reply {} bytes", frame::HEADER_LEN + 64)),
+            "the raw reply length is visible: {err}"
+        );
+        assert!(
+            err.contains("decrypted plaintext 52 bytes"),
+            "the decrypted length is visible: {err}"
+        );
+        assert!(
+            err.contains(&hex(&plaintext)),
+            "the plaintext is visible: {err}"
+        );
+        assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
+        assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some());
     }
 
     #[test]
@@ -2907,6 +3143,14 @@ mod tests {
         plaintext
     }
 
+    /// The three experiment lines `cancel-then-verify` prints before its verdict.
+    fn cancel_probe_lines(first_status: u32, arm_sequence: u32, rearm_sequence: u32) -> String {
+        format!(
+            "first arm status {first_status:#04x}\narm sequence {arm_sequence}\nre-arm sequence \
+             {rearm_sequence}\n"
+        )
+    }
+
     fn verify_output(
         word: u32,
         value: Option<&[u8; 20]>,
@@ -2939,8 +3183,12 @@ mod tests {
         assert_eq!(err, "");
         assert_eq!(
             out,
-            verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52),
-            "the verdict, value and lengths are printed exactly as verify prints them"
+            format!(
+                "{}{}",
+                cancel_probe_lines(0x00, 1, 1),
+                verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
+            ),
+            "the experiment lines, then the verdict, value and lengths"
         );
         assert_eq!(
             sent_commands(&usb),
@@ -3017,8 +3265,8 @@ mod tests {
 
         assert_eq!(
             sent_command(&usb, cmd::MATCH).expect("0x73 was sent").len(),
-            172,
-            "the match is the same 112-plaintext frame verify sends"
+            188,
+            "the match is the same 128-plaintext frame verify sends"
         );
     }
 
@@ -3038,7 +3286,12 @@ mod tests {
         assert_eq!(err, "");
         assert_eq!(
             out,
-            verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
+            format!(
+                "{}{}",
+                cancel_probe_lines(0x85, 1, 1),
+                verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
+            ),
+            "the first arm's 0x85 is printed, and the default re-arms at the same sequence"
         );
         assert_eq!(
             sent_commands(&usb),
@@ -3065,6 +3318,41 @@ mod tests {
     }
 
     #[test]
+    fn cancel_then_verify_retry_next_re_arms_at_n_plus_one() {
+        let mut usb = FakeUsb::with_sensor();
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) =
+            run_with(&["cancel-then-verify", "--retry-next"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(err, "");
+        assert_eq!(
+            out,
+            format!(
+                "{}{}",
+                cancel_probe_lines(0x00, 1, 2),
+                verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
+            ),
+            "the older reading keeps the counter and re-arms at N+1"
+        );
+        assert_eq!(
+            sent_commands(&usb),
+            [
+                cmd::CHALLENGE,
+                cmd::CHALLENGE_RESPONSE,
+                cmd::OPEN_SESSION,
+                cmd::ARM_CAPTURE,
+                cmd::CANCEL_CAPTURE,
+                cmd::ARM_CAPTURE,
+                cmd::MATCH,
+                cmd::CANCEL_CAPTURE,
+                cmd::CLOSE_SESSION,
+            ]
+        );
+    }
+
+    #[test]
     fn cancel_then_verify_reports_a_no_match_with_its_own_exit_code() {
         let mut usb = FakeUsb::with_sensor();
         usb.match_plaintext = Some(match_plaintext(0, Some(&MATCH_VALUE)));
@@ -3076,7 +3364,11 @@ mod tests {
         assert_eq!(err, "");
         assert_eq!(
             out,
-            verify_output(VERDICT_NO_MATCH, Some(&MATCH_VALUE), 108, 52)
+            format!(
+                "{}{}",
+                cancel_probe_lines(0x00, 1, 1),
+                verify_output(VERDICT_NO_MATCH, Some(&MATCH_VALUE), 108, 52)
+            )
         );
         assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
         assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some());
@@ -3091,7 +3383,11 @@ mod tests {
         let (code, out, err) = run_with(&["cancel-then-verify"], &mut usb, &shutdown);
 
         assert_eq!(code, EXIT_FINGER_TIMEOUT);
-        assert_eq!(out, "");
+        assert_eq!(
+            out,
+            cancel_probe_lines(0x00, 1, 1),
+            "the experiment lines are printed before the finger wait"
+        );
         assert!(err.contains("finger timeout"), "{err}");
         assert_eq!(
             sent_commands(&usb),
@@ -3118,7 +3414,10 @@ mod tests {
         let (code, out, err) = run_with(&["cancel-then-verify"], &mut usb, &shutdown);
 
         assert_eq!(code, EXIT_TRANSPORT);
-        assert_eq!(out, "");
+        assert_eq!(
+            out, "first arm status 0x00\narm sequence 1\n",
+            "the first arm's status and sequence are reported before the cancel fails"
+        );
         assert!(err.contains("mid-session cancel failed"), "{err}");
         assert!(err.contains("disconnected"), "{err}");
         assert!(
@@ -3176,7 +3475,11 @@ mod tests {
         let (code, out, err) = run_with(&["cancel-then-verify"], &mut usb, &flag);
 
         assert_eq!(code, 130);
-        assert_eq!(out, "");
+        assert_eq!(
+            out,
+            cancel_probe_lines(0x00, 1, 1),
+            "the experiment lines are printed before the interrupted finger wait"
+        );
         assert!(err.contains("interrupted by signal 2"), "{err}");
         let sent = sent_commands(&usb);
         assert_eq!(
@@ -3244,10 +3547,10 @@ mod tests {
         assert_eq!(le32(&match_frame, 16), TEST_HANDLE);
         assert_eq!(
             le32(&match_frame, 40),
-            68,
-            "the firmware-shaped 68-byte TLV"
+            88,
+            "five entries plus the completed (3, 20, template_id)"
         );
-        assert_eq!(match_frame.len(), 172, "112 plaintext bytes plus padding");
+        assert_eq!(match_frame.len(), 188, "128 plaintext bytes plus padding");
     }
 
     #[test]
