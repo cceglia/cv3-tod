@@ -6,7 +6,7 @@ any protocol work exists.
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
 - [ ] `cvctl devices` prints the sensor's vendor and product, bus and port when it is present
 - [ ] It refuses with a distinct "busy" message, without disturbing anything, when another process
@@ -17,3 +17,14 @@ any protocol work exists.
 - [ ] An announced non-zero reply body is always read before the next command, and a zero-length
       announcement performs no read — both covered by tests
 - [ ] No code path resets the USB device or writes the port's `disable` knob
+
+## Comments
+
+Implemented in 5624528; review fixes in 810eacb, 45669c3, 04b9e66, 458d7e2. Offline validation
+passes: `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo fmt --all -- --check`, `./scripts/check-core.sh`.
+
+Hardware acceptance is still open, so the boxes stay unticked: print the sensor when present, refuse
+when `fprintd` holds interface 0, exit non-zero when absent, and release the claim on a signal. Run
+as root: `sudo ./target/debug/cvctl devices` (present, absent, and with `fprintd` holding the
+device), then interrupt a long run and rerun `devices`.

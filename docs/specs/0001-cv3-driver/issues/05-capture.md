@@ -5,7 +5,7 @@ read — the one primitive that verification and enrolment both stand on.
 
 **Blocked by:** 03 (secure session), 04 (offline harness)
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
 - [ ] `cvctl capture` arms a capture, waits for the finger event, and reports the sample hash the
       sensor returns
@@ -16,3 +16,13 @@ read — the one primitive that verification and enrolment both stand on.
 - [ ] A transport error at any step is reported without panicking and without leaving the session open
 - [ ] The arm-wait-report flow is covered by scripted-transport tests before it is first run on
       hardware
+
+## Comments
+
+Implemented in 0823682; review fixes in 810eacb, 45669c3, 04b9e66, 458d7e2. Scripted tests cover
+arm, finger, hash, `0x85`, a hash-less reply, the finger timeout, transport failures and
+cancellation, and assert the `0x68`/`0x04` teardown.
+
+Hardware: `sudo ./target/debug/cvctl capture` (touch → sample hash; no touch → exit 8; leave a
+capture armed → exit 7). The `0x66`/`0x68`/`0x04` frames were checked against the audited reference,
+not against the sensor.
