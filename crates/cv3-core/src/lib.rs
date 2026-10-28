@@ -24,6 +24,7 @@ pub mod enrol;
 pub mod event;
 pub mod frame;
 pub mod handshake;
+pub mod inventory;
 pub mod operation;
 pub mod proto;
 pub mod session;
@@ -44,6 +45,10 @@ pub use enrol::{
 };
 pub use event::{Action, Event, TransportError};
 pub use handshake::{Handshake, HandshakeError};
+pub use inventory::{
+    INVENTORY_PLAINTEXT_LEN, INVENTORY_TLV_LEN, Inventory, InventoryError, InventoryReply,
+    TLV_ALIGNMENT, TLV_HEADER_LEN, TlvEntry, TlvScan, inventory_tlv, scan_tlv,
+};
 pub use operation::Operation;
 pub use session::{
     CloseError, CloseSession, OpenError, OpenSession, SequenceRule, Session, SessionKey, Teardown,

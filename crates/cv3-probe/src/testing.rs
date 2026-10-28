@@ -111,6 +111,17 @@ pub struct FakeUsb {
     pub match_command_error: Option<UsbError>,
     /// The decrypted TLV of every `0x73` request the scripted sensor received, in order.
     pub match_tlvs: Rc<RefCell<Vec<Vec<u8>>>>,
+    /// Status the scripted sensor answers the wrapped `0x2f` inventory query with.
+    pub inventory_status: u32,
+    /// If set, the decrypted plaintext of the `0x2f` reply; by default 88 zero bytes.
+    pub inventory_plaintext: Option<Vec<u8>>,
+    /// If set, the exact raw reply body the `0x2f` query answers with, for bodyless and
+    /// malformed-reply cases that `wrapped_body` cannot express.
+    pub inventory_body: Option<Vec<u8>>,
+    /// If set, the scripted sensor fails the wrapped `0x2f` query in the transport.
+    pub inventory_command_error: Option<UsbError>,
+    /// The decrypted TLV of every `0x2f` request the scripted sensor received, in order.
+    pub inventory_tlvs: Rc<RefCell<Vec<Vec<u8>>>>,
     /// What the finger wait delivers. `None` is a genuine `0x03` finger event.
     pub finger_event: Option<Result<Vec<u8>, UsbError>>,
     /// Per-wait finger results consumed in order before falling back to `finger_event`, so a test
@@ -172,6 +183,11 @@ impl Default for FakeUsb {
             match_plaintext: None,
             match_command_error: None,
             match_tlvs: Rc::new(RefCell::new(Vec::new())),
+            inventory_status: 0,
+            inventory_plaintext: None,
+            inventory_body: None,
+            inventory_command_error: None,
+            inventory_tlvs: Rc::new(RefCell::new(Vec::new())),
             finger_event: None,
             finger_events: Vec::new(),
             timestamp_before_announcement: false,
@@ -269,6 +285,11 @@ impl UsbBackend for FakeUsb {
             match_plaintext: self.match_plaintext.clone(),
             match_command_error: self.match_command_error.clone(),
             match_tlvs: Rc::clone(&self.match_tlvs),
+            inventory_status: self.inventory_status,
+            inventory_plaintext: self.inventory_plaintext.clone(),
+            inventory_body: self.inventory_body.clone(),
+            inventory_command_error: self.inventory_command_error.clone(),
+            inventory_tlvs: Rc::clone(&self.inventory_tlvs),
             accepted_updates: 0,
             finger_event: self.finger_event.clone(),
             finger_events: self.finger_events.clone(),
@@ -408,6 +429,12 @@ pub struct HandshakeSensor {
     pub match_command_error: Option<UsbError>,
     /// The decrypted TLV of each `0x73` request, recorded for the probe's tests.
     pub match_tlvs: Rc<RefCell<Vec<Vec<u8>>>>,
+    pub inventory_status: u32,
+    pub inventory_plaintext: Option<Vec<u8>>,
+    pub inventory_body: Option<Vec<u8>>,
+    pub inventory_command_error: Option<UsbError>,
+    /// The decrypted TLV of each `0x2f` request, recorded for the probe's tests.
+    pub inventory_tlvs: Rc<RefCell<Vec<Vec<u8>>>>,
     pub accepted_updates: usize,
     pub finger_event: Option<Result<Vec<u8>, UsbError>>,
     pub finger_events: Vec<Result<Vec<u8>, UsbError>>,
@@ -453,6 +480,14 @@ impl HandshakeSensor {
     /// The TLV length is in the frame header at `PARAM_LEN_OFFSET`; the ciphertext follows the
     /// 44-byte header. Best effort: a malformed request records nothing rather than panicking.
     fn remember_match_tlv(&self, frame: &[u8]) {
+        self.remember_wrapped_tlv(frame, &self.match_tlvs);
+    }
+
+    fn remember_inventory_tlv(&self, frame: &[u8]) {
+        self.remember_wrapped_tlv(frame, &self.inventory_tlvs);
+    }
+
+    fn remember_wrapped_tlv(&self, frame: &[u8], sink: &Rc<RefCell<Vec<Vec<u8>>>>) {
         let Some(key) = self.session_key else {
             return;
         };
@@ -471,9 +506,7 @@ impl HandshakeSensor {
             return;
         };
         if tlv_len <= plaintext.len() {
-            self.match_tlvs
-                .borrow_mut()
-                .push(plaintext[..tlv_len].to_vec());
+            sink.borrow_mut().push(plaintext[..tlv_len].to_vec());
         }
     }
 
@@ -633,6 +666,27 @@ impl HandshakeSensor {
             },
             cmd::ARM_CAPTURE => self.arm_reply(),
             cmd::MATCH => self.match_reply(),
+            cmd::INVENTORY => {
+                if let Some(body) = &self.inventory_body {
+                    return Reply {
+                        status: 0,
+                        body: body.clone(),
+                    };
+                }
+                let plaintext = self
+                    .inventory_plaintext
+                    .clone()
+                    .unwrap_or_else(|| vec![0u8; 88]);
+                Reply {
+                    status: 0,
+                    body: self.wrapped_body(
+                        cmd::INVENTORY,
+                        attr::INVENTORY,
+                        self.inventory_status,
+                        &plaintext,
+                    ),
+                }
+            }
             cmd::CANCEL_CAPTURE => Reply {
                 status: 0,
                 body: Vec::new(),
@@ -703,6 +757,12 @@ impl UsbIo for HandshakeSensor {
                     return Err(error.clone());
                 }
                 self.remember_match_tlv(frame);
+            }
+            cmd::INVENTORY => {
+                if let Some(error) = &self.inventory_command_error {
+                    return Err(error.clone());
+                }
+                self.remember_inventory_tlv(frame);
             }
             cmd::CANCEL_CAPTURE => {
                 if let Some(error) = &self.cancel_command_error {

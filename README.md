@@ -18,8 +18,9 @@ this is a probe, not a login driver.
 | `handshake` | Runs `0x23`/`0x24`, derives the session key and releases the handle. |
 | `open` / `close` | Opens the wrapped `0x02` session and releases it with plain `0x04`. |
 | `capture` | Arms `0x66`, waits for the finger, reads the sample hash and tears the session down. |
-| `enroll` | Discards, starts, captures, submits, commits and prints the template id it now holds. |
-| `enroll-then-verify` | Enrols and commits, then takes one confirmation touch and matches it in the **same session**. It is the ticket-09 measurement tool: it reports whether a match immediately after a commit works and what value comes back, and it is **not** a binding check. |
+| `inventory` | Sends the wrapped `0x2F` inventory query and dumps its reply: the raw and plaintext lengths, the plaintext in 16-byte rows and a best-effort TLV scan. It is the ticket-16 measurement tool and does not yet decode the reply. |
+| `enroll` | Discards, starts, captures, submits, commits and prints the template id it now holds. `--commit-sample-hash` forces the last sample hash into the commit. |
+| `enroll-then-verify` | Enrols and commits, then takes one confirmation touch and matches it in the **same session**. It is the ticket-09 measurement tool: it reports whether a match immediately after a commit works and what value comes back, and it is **not** a binding check. `--commit-sample-hash` forces the last sample hash into the commit and the confirmation match. |
 | `verify` | Captures and matches `0x73`, printing the raw verdict word, the 20-byte value and the reply lengths. |
 | `cancel-then-verify` | Cancels a capture mid-session and verifies in the same session; it is the run that can settle the wrap-sequence question when the first arm answers `0x85`, and the current reading is unmeasured. |
 | `handshake`/`open`/`close --record` | Writes a wire-only transcript; `cvctl replay <file>` reproduces it without hardware. |
@@ -96,6 +97,17 @@ immediately after a commit are accepted and what value that reply carries. It de
 not compare the value with the enrolment id — ticket 10 owns binding — so a match here proves only
 that the sensor matched some enrolled template.
 
+`cvctl inventory` is ticket 16's first step: it reports the two lengths, the decrypted plaintext
+and a best-effort TLV scan of the `0x2F` reply, without assuming the reply lists stored templates.
+Whether the command reports anything about stored templates at all is still unestablished. It is a
+measurement tool, not shipping behaviour.
+
+`--commit-sample-hash` on `enroll` and `enroll-then-verify` commits with the last submitted sample
+hash even when the sensor's `0x6C` reply carried an enrolment id, and labels the source as forced.
+Ticket 06 has not established which id the sensor wants in the `0x6E` commit, so this is a
+measurement variant, not shipping behaviour; without the flag the commit uses the sensor's
+enrolment id as before. Both tools exist to settle tickets 06, 09 and 16.
+
 `cvctl cancel-then-verify` owns one session and runs the sequence that can settle the wrap-sequence
 question: it arms a capture, cancels it with the mid-session `0x68` before any finger, then runs a
 full verification in the same session and prints its verdict the way `verify` does. An arm that
@@ -106,8 +118,8 @@ disagree about; the current reading is still unmeasured, and the run settles it 
 `handshake --show-key` adds the derived session key to the ordinary report. Without the flag only
 its short fingerprint is printed, because the key is freshly generated for the run and sensitive.
 
-`--hex` on `handshake`, `open`, `close`, `capture`, `enroll`, `enroll-then-verify`, `verify` and
-`cancel-then-verify`
+`--hex` on `handshake`, `open`, `close`, `capture`, `inventory`, `enroll`, `enroll-then-verify`,
+`verify` and `cancel-then-verify`
 writes every host frame and every device reply body to **stderr** as lowercase hex, prefixed `> `
 and `< ` (`< empty` for a reply with no body, `< finger` for the finger event). The host timestamp
 request the sensor can raise on interrupt type 5 is answered in the USB transport; it has no bulk

@@ -17,6 +17,7 @@ use cv3_core::capture::{
 use cv3_core::crypto::BLOCK_LEN;
 use cv3_core::enrol::{Enrol, EnrolError, EnrolledTemplate, MAX_ACCEPTED_SAMPLES, TemplateSource};
 use cv3_core::handshake::{Handshake, HandshakeError};
+use cv3_core::inventory::{Inventory, InventoryError, InventoryReply, scan_tlv};
 use cv3_core::session::{
     CloseError, CloseSession, OpenError, OpenSession, Session, Teardown, TeardownError,
 };
@@ -56,8 +57,9 @@ const USAGE: &str = "usage: cvctl devices
        cvctl open [--bad-sequence] [--hex] [--record <file>]
        cvctl close [--hex] [--record <file>]
        cvctl capture [--hex]
-       cvctl enroll [--hex]
-       cvctl enroll-then-verify [--hex]
+       cvctl inventory [--hex]
+       cvctl enroll [--commit-sample-hash] [--hex]
+       cvctl enroll-then-verify [--commit-sample-hash] [--hex]
        cvctl verify [--template <40 hex>] [--hex]
        cvctl cancel-then-verify [--retry-next] [--hex]
        cvctl replay <file>";
@@ -82,11 +84,16 @@ enum Command<'a> {
     Capture {
         hex: bool,
     },
+    Inventory {
+        hex: bool,
+    },
     Enroll {
         hex: bool,
+        commit_sample_hash: bool,
     },
     EnrollThenVerify {
         hex: bool,
+        commit_sample_hash: bool,
     },
     Verify {
         hex: bool,
@@ -109,6 +116,7 @@ struct Flags<'a> {
     record: Option<&'a str>,
     template: Option<[u8; cv3_core::verify::MATCH_VALUE_LEN]>,
     retry_next: bool,
+    commit_sample_hash: bool,
 }
 
 /// Which optional flags a subcommand accepts. Every one defaults to refused, so a flag on the
@@ -120,6 +128,7 @@ struct Accepted {
     record: bool,
     template: bool,
     retry_next: bool,
+    commit_sample_hash: bool,
 }
 
 /// Parses the command line by hand: no dependency, and every unknown or repeated flag is a usage
@@ -175,13 +184,35 @@ fn parse(args: &[String]) -> Option<Command<'_>> {
             let flags = parse_flags(rest, Accepted::default())?;
             Some(Command::Capture { hex: flags.hex })
         }
-        "enroll" => {
+        "inventory" => {
             let flags = parse_flags(rest, Accepted::default())?;
-            Some(Command::Enroll { hex: flags.hex })
+            Some(Command::Inventory { hex: flags.hex })
+        }
+        "enroll" => {
+            let flags = parse_flags(
+                rest,
+                Accepted {
+                    commit_sample_hash: true,
+                    ..Accepted::default()
+                },
+            )?;
+            Some(Command::Enroll {
+                hex: flags.hex,
+                commit_sample_hash: flags.commit_sample_hash,
+            })
         }
         "enroll-then-verify" => {
-            let flags = parse_flags(rest, Accepted::default())?;
-            Some(Command::EnrollThenVerify { hex: flags.hex })
+            let flags = parse_flags(
+                rest,
+                Accepted {
+                    commit_sample_hash: true,
+                    ..Accepted::default()
+                },
+            )?;
+            Some(Command::EnrollThenVerify {
+                hex: flags.hex,
+                commit_sample_hash: flags.commit_sample_hash,
+            })
         }
         "verify" => {
             let flags = parse_flags(
@@ -225,6 +256,7 @@ fn parse_flags<'a>(args: &'a [String], accepted: Accepted) -> Option<Flags<'a>> 
         record: None,
         template: None,
         retry_next: false,
+        commit_sample_hash: false,
     };
     let mut index = 0;
     while index < args.len() {
@@ -232,6 +264,9 @@ fn parse_flags<'a>(args: &'a [String], accepted: Accepted) -> Option<Flags<'a>> 
             "--show-key" if accepted.show_key && !flags.show_key => flags.show_key = true,
             "--bad-sequence" if accepted.bad_sequence && !flags.bad_sequence => {
                 flags.bad_sequence = true;
+            }
+            "--commit-sample-hash" if accepted.commit_sample_hash && !flags.commit_sample_hash => {
+                flags.commit_sample_hash = true;
             }
             "--hex" if !flags.hex => flags.hex = true,
             "--record" if accepted.record && flags.record.is_none() => {
@@ -290,10 +325,15 @@ pub fn run(
         }) => open(backend, shutdown, bad_sequence, hex, record, out, err),
         Some(Command::Close { hex, record }) => close(backend, shutdown, hex, record, out, err),
         Some(Command::Capture { hex }) => capture(backend, shutdown, hex, out, err),
-        Some(Command::Enroll { hex }) => enroll(backend, shutdown, hex, out, err),
-        Some(Command::EnrollThenVerify { hex }) => {
-            enroll_then_verify(backend, shutdown, hex, out, err)
-        }
+        Some(Command::Inventory { hex }) => inventory(backend, shutdown, hex, out, err),
+        Some(Command::Enroll {
+            hex,
+            commit_sample_hash,
+        }) => enroll(backend, shutdown, hex, commit_sample_hash, out, err),
+        Some(Command::EnrollThenVerify {
+            hex,
+            commit_sample_hash,
+        }) => enroll_then_verify(backend, shutdown, hex, commit_sample_hash, out, err),
         Some(Command::Verify { hex, template }) => {
             verify(backend, shutdown, hex, template, out, err)
         }
@@ -749,6 +789,173 @@ fn capture(
     signalled_exit(shutdown, err, code)
 }
 
+/// Where an inventory run stopped.
+enum InventoryFailure {
+    Handshake(HandshakeError),
+    Open(OpenError),
+    Inventory(InventoryError),
+}
+
+/// The reply an inventory run reports, after its session has been torn down.
+struct InventoryDump {
+    reply_len: usize,
+    plaintext: Vec<u8>,
+}
+
+/// Opens the secure session, sends the wrapped `0x2F` query, tears the session down and returns
+/// the reply lengths and plaintext.
+///
+/// An inventory failure has already torn the session down; a successful query is torn down here
+/// because the probe keeps no session between invocations.
+fn inventory_over(
+    transport: &mut dyn Transport,
+    secrets: RunSecrets,
+    open_iv: [u8; BLOCK_LEN],
+    inventory_iv: [u8; BLOCK_LEN],
+) -> Result<(InventoryDump, Result<(), TeardownError>), InventoryFailure> {
+    let run = handshake_over(transport, secrets, true).map_err(InventoryFailure::Handshake)?;
+    let mut open = OpenSession::new(run.session, open_iv);
+    let session = drive(&mut open, transport).map_err(InventoryFailure::Open)?;
+
+    let mut inventory = Inventory::new(session, inventory_iv);
+    match drive(&mut inventory, transport) {
+        Ok(InventoryReply {
+            reply_len,
+            plaintext,
+            session,
+        }) => {
+            let mut teardown = Teardown::new(session.handle);
+            drop(session);
+            Ok((
+                InventoryDump {
+                    reply_len,
+                    plaintext,
+                },
+                drive(&mut teardown, transport),
+            ))
+        }
+        Err(error) => Err(InventoryFailure::Inventory(error)),
+    }
+}
+
+/// Prints both lengths, the plaintext in 16-byte rows and a best-effort TLV scan of it.
+///
+/// Nothing here decodes what the entries mean: whether `0x2F` reports stored templates at all is
+/// ticket 16's question, and this command only shows what the sensor sent.
+fn print_inventory_dump(dump: &InventoryDump, out: &mut dyn Write) {
+    let _ = writeln!(out, "reply length {}", dump.reply_len);
+    let _ = writeln!(out, "plaintext length {}", dump.plaintext.len());
+    let _ = writeln!(out, "plaintext:");
+    for (row, chunk) in dump.plaintext.chunks(16).enumerate() {
+        let _ = write!(out, "{:04x}:", row * 16);
+        for byte in chunk {
+            let _ = write!(out, " {byte:02x}");
+        }
+        let _ = writeln!(out);
+    }
+
+    let scan = scan_tlv(&dump.plaintext);
+    if scan.entries.is_empty() {
+        let _ = writeln!(out, "tlv: no entries");
+    } else {
+        let _ = writeln!(out, "tlv:");
+        for entry in &scan.entries {
+            let _ = write!(
+                out,
+                "+{:04x} tag {} length {}",
+                entry.offset, entry.tag, entry.declared_len
+            );
+            if entry.value.is_empty() {
+                let _ = write!(out, " value -");
+            } else {
+                let _ = write!(out, " value {}", hex(entry.value));
+            }
+            if entry.is_truncated() {
+                let _ = write!(
+                    out,
+                    " (truncated: {} of {} bytes present)",
+                    entry.value.len(),
+                    entry.declared_len
+                );
+            }
+            let _ = writeln!(out);
+        }
+    }
+    if scan.trailing > 0 {
+        let _ = writeln!(out, "trailing {} bytes", scan.trailing);
+    }
+}
+
+/// Runs the ticket-16 measurement: handshake, open, inventory query, dump, teardown.
+fn inventory(
+    backend: &mut dyn UsbBackend,
+    shutdown: &dyn Shutdown,
+    dump_hex: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let open_iv = match random_iv() {
+        Ok(iv) => iv,
+        Err(error) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            return EXIT_OTHER;
+        }
+    };
+    let inventory_iv = match random_iv() {
+        Ok(iv) => iv,
+        Err(error) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            return EXIT_OTHER;
+        }
+    };
+    let mut channel = match open_for_command(backend, shutdown, err) {
+        Ok(channel) => channel,
+        Err(error) => {
+            report(&error, err);
+            return error.exit_code();
+        }
+    };
+    let secrets = match RunSecrets::generate() {
+        Ok(secrets) => secrets,
+        Err(error) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            return EXIT_OTHER;
+        }
+    };
+
+    let (outcome, _) = with_transport(
+        &mut channel,
+        "inventory",
+        None,
+        dump_hex,
+        err,
+        |transport| inventory_over(transport, secrets, open_iv, inventory_iv),
+    );
+
+    let code = match outcome {
+        Ok((dump, teardown)) => {
+            print_inventory_dump(&dump, out);
+            if let Err(error) = teardown {
+                let _ = writeln!(err, "cvctl: {error}");
+            }
+            EXIT_OK
+        }
+        Err(InventoryFailure::Handshake(error)) => {
+            let _ = writeln!(err, "cvctl: handshake failed: {error}");
+            handshake_error_code(&error)
+        }
+        Err(InventoryFailure::Open(error)) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            open_error_code(&error)
+        }
+        Err(InventoryFailure::Inventory(error)) => {
+            let _ = writeln!(err, "cvctl: inventory failed: {error}");
+            inventory_error_code(&error)
+        }
+    };
+    signalled_exit(shutdown, err, code)
+}
+
 /// Where an enrolment run stopped.
 enum EnrolFailure {
     Handshake(HandshakeError),
@@ -773,9 +980,13 @@ fn enrol_session(
     transport: &mut dyn Transport,
     session: Session,
     base_iv: [u8; BLOCK_LEN],
+    commit_sample_hash: bool,
     progress_out: &mut dyn Write,
 ) -> Result<EnrolledTemplate, EnrolError> {
     let mut enrol = Enrol::new(session, base_iv);
+    if commit_sample_hash {
+        enrol = enrol.with_commit_sample_hash();
+    }
     let mut action = enrol.start();
     let mut shown_accepted = 0usize;
     let mut shown_rejected = 0usize;
@@ -811,13 +1022,20 @@ fn enrol_over(
     secrets: RunSecrets,
     open_iv: [u8; BLOCK_LEN],
     base_iv: [u8; BLOCK_LEN],
+    commit_sample_hash: bool,
     progress_out: &mut dyn Write,
 ) -> Result<(EnrolReport, Result<(), TeardownError>), EnrolFailure> {
     let run = handshake_over(transport, secrets, true).map_err(EnrolFailure::Handshake)?;
     let mut open = OpenSession::new(run.session, open_iv);
     let session = drive(&mut open, transport).map_err(EnrolFailure::Open)?;
 
-    match enrol_session(transport, session, base_iv, progress_out) {
+    match enrol_session(
+        transport,
+        session,
+        base_iv,
+        commit_sample_hash,
+        progress_out,
+    ) {
         Ok(EnrolledTemplate {
             template_id,
             source,
@@ -844,6 +1062,7 @@ fn enroll(
     backend: &mut dyn UsbBackend,
     shutdown: &dyn Shutdown,
     dump_hex: bool,
+    commit_sample_hash: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
@@ -877,16 +1096,18 @@ fn enroll(
     };
 
     let (outcome, _) = with_transport(&mut channel, "enroll", None, dump_hex, err, |transport| {
-        enrol_over(transport, secrets, open_iv, base_iv, out)
+        enrol_over(
+            transport,
+            secrets,
+            open_iv,
+            base_iv,
+            commit_sample_hash,
+            out,
+        )
     });
     let code = match outcome {
         Ok((report, teardown)) => {
-            let _ = writeln!(
-                out,
-                "template id {} ({})",
-                hex(&report.template_id),
-                report.source
-            );
+            print_template(out, &report.template_id, report.source);
             if let Err(error) = teardown {
                 let _ = writeln!(err, "cvctl: {error}");
             }
@@ -918,6 +1139,19 @@ enum EnrollThenVerifyFailure {
     Verify(VerifyError),
 }
 
+/// The IVs and commit variant one enrol-then-verify run uses.
+///
+/// One IV per wrapped request, because CBC needs a distinct IV for every frame, plus the
+/// `--commit-sample-hash` measurement flag.
+#[derive(Clone, Copy)]
+struct EnrollThenVerifyOptions {
+    open_iv: [u8; BLOCK_LEN],
+    enrol_iv: [u8; BLOCK_LEN],
+    capture_iv: [u8; BLOCK_LEN],
+    match_iv: [u8; BLOCK_LEN],
+    commit_sample_hash: bool,
+}
+
 /// Opens **one** session, enrols and commits in it, then takes the confirmation touch and matches
 /// it in that same session.
 ///
@@ -929,12 +1163,16 @@ enum EnrollThenVerifyFailure {
 fn enroll_then_verify_over(
     transport: &mut dyn Transport,
     secrets: RunSecrets,
-    open_iv: [u8; BLOCK_LEN],
-    enrol_iv: [u8; BLOCK_LEN],
-    capture_iv: [u8; BLOCK_LEN],
-    match_iv: [u8; BLOCK_LEN],
+    options: EnrollThenVerifyOptions,
     out: &mut dyn Write,
 ) -> Result<(Verdict, Result<(), TeardownError>), EnrollThenVerifyFailure> {
+    let EnrollThenVerifyOptions {
+        open_iv,
+        enrol_iv,
+        capture_iv,
+        match_iv,
+        commit_sample_hash,
+    } = options;
     let run =
         handshake_over(transport, secrets, true).map_err(EnrollThenVerifyFailure::Handshake)?;
     let mut open = OpenSession::new(run.session, open_iv);
@@ -945,8 +1183,9 @@ fn enroll_then_verify_over(
         source,
         session,
         ..
-    } = enrol_session(transport, session, enrol_iv, out).map_err(EnrollThenVerifyFailure::Enrol)?;
-    let _ = writeln!(out, "template id {} ({})", hex(&template_id), source);
+    } = enrol_session(transport, session, enrol_iv, commit_sample_hash, out)
+        .map_err(EnrollThenVerifyFailure::Enrol)?;
+    print_template(out, &template_id, source);
     let _ = writeln!(out, "match template id {}", hex(&template_id));
 
     let mut verify = Verify::new(session, capture_iv, match_iv).with_template_id(Some(template_id));
@@ -965,6 +1204,7 @@ fn enroll_then_verify(
     backend: &mut dyn UsbBackend,
     shutdown: &dyn Shutdown,
     dump_hex: bool,
+    commit_sample_hash: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
@@ -979,6 +1219,13 @@ fn enroll_then_verify(
         };
     }
     let [open_iv, enrol_iv, capture_iv, match_iv] = ivs;
+    let options = EnrollThenVerifyOptions {
+        open_iv,
+        enrol_iv,
+        capture_iv,
+        match_iv,
+        commit_sample_hash,
+    };
 
     let mut channel = match open_for_command(backend, shutdown, err) {
         Ok(channel) => channel,
@@ -1001,11 +1248,7 @@ fn enroll_then_verify(
         None,
         dump_hex,
         err,
-        |transport| {
-            enroll_then_verify_over(
-                transport, secrets, open_iv, enrol_iv, capture_iv, match_iv, out,
-            )
-        },
+        |transport| enroll_then_verify_over(transport, secrets, options, out),
     );
 
     let code = match outcome {
@@ -1095,6 +1338,21 @@ fn print_verdict(verdict: &Verdict, out: &mut dyn Write) {
     let _ = writeln!(out, "plaintext length {}", verdict.plaintext_len);
 }
 
+/// Prints the committed template id and its source.
+///
+/// When `--commit-sample-hash` overrode an enrolment id the sensor sent, an explicit line says so:
+/// the point of the flag is to make that measurement visible in the output.
+fn print_template(
+    out: &mut dyn Write,
+    template_id: &[u8; SAMPLE_HASH_LEN],
+    source: TemplateSource,
+) {
+    if source == TemplateSource::ForcedSampleHash {
+        let _ = writeln!(out, "--commit-sample-hash forced the sample hash");
+    }
+    let _ = writeln!(out, "template id {} ({source})", hex(template_id));
+}
+
 /// Maps the `0x23` / `0x24` handshake failure onto the probe's documented exit codes.
 ///
 /// The handshake runs before every session command, so a transport failure there is still a
@@ -1159,6 +1417,20 @@ fn verify_error_code(error: &VerifyError) -> u8 {
             if *status == status::CAPTURE_PENDING =>
         {
             EXIT_CAPTURE_PENDING
+        }
+        _ => EXIT_OTHER,
+    }
+}
+
+/// Maps an inventory failure onto the probe's documented exit codes.
+fn inventory_error_code(error: &InventoryError) -> u8 {
+    match error {
+        InventoryError::WrongSequence => EXIT_SEQUENCE,
+        InventoryError::Transport(_) => EXIT_TRANSPORT,
+        InventoryError::SensorStatus { status, .. }
+            if *status == cv3_core::proto::status::BAD_SEQUENCE =>
+        {
+            EXIT_SEQUENCE
         }
         _ => EXIT_OTHER,
     }
@@ -1814,7 +2086,7 @@ mod tests {
         let mut usb = FakeUsb::with_sensor();
         let shutdown = SignalFlag::new();
 
-        let (code, out, err) = run_with(&["inventory"], &mut usb, &shutdown);
+        let (code, out, err) = run_with(&["list"], &mut usb, &shutdown);
 
         assert_eq!(code, 1);
         assert_eq!(out, "");
@@ -1865,7 +2137,9 @@ mod tests {
             vec!["open", "--hex"],
             vec!["close", "--hex"],
             vec!["capture", "--hex"],
+            vec!["inventory", "--hex"],
             vec!["enroll", "--hex"],
+            vec!["enroll-then-verify", "--hex"],
             vec!["verify", "--hex"],
             vec!["cancel-then-verify", "--hex"],
         ] {
@@ -2711,6 +2985,230 @@ mod tests {
         assert!(err.contains("0x0f"), "{err}");
         assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
         assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some());
+    }
+
+    #[test]
+    fn inventory_prints_both_lengths_the_plaintext_and_a_tlv_dump() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.inventory_plaintext = Some(vec![
+            0, 0, 0, 0, 4, 0, 0, 0, 0x11, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["inventory"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(err, "");
+        assert_eq!(
+            out,
+            "reply length 76\n\
+             plaintext length 20\n\
+             plaintext:\n\
+             0000: 00 00 00 00 04 00 00 00 11 00 00 00 02 00 00 00\n\
+             0010: 00 00 00 00\n\
+             tlv:\n\
+             +0000 tag 0 length 4 value 11000000\n\
+             +000c tag 2 length 0 value -\n"
+        );
+        assert_eq!(
+            sent_commands(&usb),
+            [
+                cmd::CHALLENGE,
+                cmd::CHALLENGE_RESPONSE,
+                cmd::OPEN_SESSION,
+                cmd::INVENTORY,
+                cmd::CANCEL_CAPTURE,
+                cmd::CLOSE_SESSION,
+            ],
+            "the query runs in its own session and tears it down"
+        );
+
+        let frame = sent_command(&usb, cmd::INVENTORY).expect("0x2f was sent");
+        assert_eq!(
+            frame.len(),
+            140,
+            "44-byte header plus six ciphertext blocks"
+        );
+        assert_eq!(frame[10], attr::INVENTORY);
+        assert_eq!(frame[11], 0x02, "the query is wrapped");
+        assert_eq!(le32(&frame, 16), TEST_HANDLE);
+        assert_eq!(le32(&frame, 40), 56, "the 56-byte TLV block");
+
+        let tlvs = usb.inventory_tlvs.borrow();
+        assert_eq!(tlvs.len(), 1, "one 0x2f request");
+        assert_eq!(tlvs[0].len(), 56);
+        assert_eq!(&tlvs[0][0..4], &0u32.to_le_bytes());
+        assert_eq!(&tlvs[0][4..8], &4u32.to_le_bytes());
+        assert_eq!(&tlvs[0][8..12], &TEST_HANDLE.to_le_bytes());
+        assert_eq!(&tlvs[0][20..24], &0x48u32.to_le_bytes());
+        assert_eq!(&tlvs[0][32..36], &0x53e2u32.to_le_bytes());
+        assert_eq!(&tlvs[0][44..48], &0u32.to_le_bytes());
+        assert_eq!(&tlvs[0][48..52], &2u32.to_le_bytes());
+        assert_eq!(&tlvs[0][52..56], &0u32.to_le_bytes());
+    }
+
+    #[test]
+    fn inventory_failures_are_distinct_and_tear_down() {
+        type Configure = fn(&mut FakeUsb);
+        let cases: [(&str, Configure, u8, &str); 5] = [
+            (
+                "a short plaintext",
+                |usb| usb.inventory_plaintext = Some(vec![1, 2, 3, 4]),
+                EXIT_OTHER,
+                "too short",
+            ),
+            (
+                "a bodyless reply",
+                |usb| usb.inventory_body = Some(Vec::new()),
+                EXIT_OTHER,
+                "without a body",
+            ),
+            (
+                "a sensor status",
+                |usb| {
+                    usb.inventory_status = 0x0e;
+                    usb.inventory_plaintext = Some(vec![0u8; 32]);
+                },
+                EXIT_OTHER,
+                "0x0e",
+            ),
+            (
+                "a sequence rejection",
+                |usb| usb.inventory_status = 0x0f,
+                EXIT_SEQUENCE,
+                "0x0f",
+            ),
+            (
+                "a transport failure",
+                |usb| usb.inventory_command_error = Some(UsbError::Timeout),
+                EXIT_TRANSPORT,
+                "transport failed",
+            ),
+        ];
+
+        for (name, configure, expected_code, needle) in cases {
+            let mut usb = FakeUsb::with_sensor();
+            configure(&mut usb);
+            let shutdown = SignalFlag::new();
+
+            let (code, out, err) = run_with(&["inventory"], &mut usb, &shutdown);
+
+            assert_eq!(code, expected_code, "{name}: {err}");
+            assert_eq!(out, "", "{name}: no dump is printed");
+            assert!(err.contains(needle), "{name}: {err}");
+            assert!(err.contains("inventory failed"), "{name}: {err}");
+            assert!(
+                sent_command(&usb, cmd::CANCEL_CAPTURE).is_some(),
+                "{name}: the failure tears the session down"
+            );
+            assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn inventory_prints_a_truncated_entry() {
+        let mut usb = FakeUsb::with_sensor();
+        let mut plaintext = vec![0u8; 13];
+        plaintext[4..8].copy_from_slice(&20u32.to_le_bytes());
+        plaintext[8..13].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee]);
+        usb.inventory_plaintext = Some(plaintext);
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["inventory"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(err, "");
+        assert!(
+            out.contains(
+                "+0000 tag 0 length 20 value aabbccddee (truncated: 5 of 20 bytes present)"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn enroll_commit_sample_hash_forces_the_last_sample_hash() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.completion_after = Some(2);
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["enroll", "--commit-sample-hash"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(err, "");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "sample 1 accepted (1/12)",
+                "sample 2 accepted (2/12)",
+                "--commit-sample-hash forced the sample hash",
+                &format!(
+                    "template id {} (last sample hash, forced by --commit-sample-hash)",
+                    hex(&SAMPLE_HASH)
+                ),
+            ],
+            "the flag overrides the sensor's enrolment id and says so"
+        );
+        assert!(
+            !out.contains(&hex(&ENROLMENT_ID)),
+            "the enrolment id is not committed: {out}"
+        );
+        assert!(sent_command(&usb, cmd::COMMIT_ENROLMENT).is_some());
+    }
+
+    #[test]
+    fn enroll_then_verify_commit_sample_hash_matches_with_the_sample_hash() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.completion_after = Some(2);
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(
+            &["enroll-then-verify", "--commit-sample-hash"],
+            &mut usb,
+            &shutdown,
+        );
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(err, "");
+        assert!(
+            out.contains("--commit-sample-hash forced the sample hash"),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "template id {} (last sample hash, forced by --commit-sample-hash)",
+                hex(&SAMPLE_HASH)
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("match template id {}", hex(&SAMPLE_HASH))),
+            "the confirmation match names the forced id: {out}"
+        );
+        assert!(
+            out.contains(&verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)),
+            "{out}"
+        );
+
+        let tlvs = usb.match_tlvs.borrow();
+        assert_eq!(tlvs.len(), 1, "one 0x73 request");
+        assert_eq!(&tlvs[0][68..88], &SAMPLE_HASH);
+    }
+
+    #[test]
+    fn commit_sample_hash_is_accepted_only_by_the_enrol_commands() {
+        let shutdown = SignalFlag::new();
+        for command in ["capture", "inventory", "verify"] {
+            let mut usb = FakeUsb::with_sensor();
+            let (code, out, err) =
+                run_with(&[command, "--commit-sample-hash"], &mut usb, &shutdown);
+
+            assert_eq!(code, EXIT_OTHER, "{command}");
+            assert_eq!(out, "", "{command}");
+            assert_eq!(err, format!("{USAGE}\n"), "{command}");
+            assert!(usb.calls().is_empty(), "{command} touches nothing");
+        }
     }
 
     #[test]

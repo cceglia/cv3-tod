@@ -16,7 +16,10 @@
 //! 20-byte value other than the sample hash has completed the enrolment and names the template
 //! the sensor stored (the **enrolment id**). Without that signal the operation commits at twelve
 //! accepted samples and uses the last sample hash as the template id, recording which of the two
-//! it is in [`TemplateSource`].
+//! it is in [`TemplateSource`]. A caller testing the other answer can call
+//! [`Enrol::with_commit_sample_hash`], which commits the last sample hash even when an enrolment
+//! id arrived and records [`TemplateSource::ForcedSampleHash`]. That is the probe's
+//! `--commit-sample-hash` measurement for ticket 06, not shipping behaviour.
 //!
 //! ## Composition and progress
 //!
@@ -128,6 +131,10 @@ pub enum TemplateSource {
     EnrolmentId,
     /// The sensor never completed; the last accepted sample hash was used as the template id.
     SampleHash,
+    /// The caller forced the last accepted sample hash even though the sensor reported an
+    /// enrolment id. This is the probe's `--commit-sample-hash` measurement, not shipping
+    /// behaviour: ticket 06 has not established which id the sensor wants.
+    ForcedSampleHash,
 }
 
 impl fmt::Display for TemplateSource {
@@ -135,6 +142,9 @@ impl fmt::Display for TemplateSource {
         match self {
             Self::EnrolmentId => f.write_str("sensor enrolment id"),
             Self::SampleHash => f.write_str("last sample hash"),
+            Self::ForcedSampleHash => {
+                f.write_str("last sample hash, forced by --commit-sample-hash")
+            }
         }
     }
 }
@@ -381,6 +391,7 @@ pub struct Enrol {
     state: EnrolState,
     progress: EnrolProgress,
     last_sample_hash: Option<[u8; SAMPLE_HASH_LEN]>,
+    commit_sample_hash: bool,
 }
 
 impl Enrol {
@@ -395,7 +406,19 @@ impl Enrol {
             state: EnrolState::NotStarted,
             progress: EnrolProgress::default(),
             last_sample_hash: None,
+            commit_sample_hash: false,
         }
+    }
+
+    /// Commits with the last submitted sample hash even when the sensor reports an enrolment id.
+    ///
+    /// This is the probe's `--commit-sample-hash` measurement tool for ticket 06: this project has
+    /// not established which id the sensor wants in `0x6E`, so this variant lets a hardware run
+    /// test the other answer. A commit it makes for this reason records
+    /// [`TemplateSource::ForcedSampleHash`]. It is not shipping behaviour.
+    pub fn with_commit_sample_hash(mut self) -> Self {
+        self.commit_sample_hash = true;
+        self
     }
 
     /// The accepted-sample, attempt and rescan counts, updated after every relevant reply.
@@ -585,6 +608,9 @@ impl Enrol {
             let mut template_id = [0u8; TEMPLATE_ID_LEN];
             template_id.copy_from_slice(value);
             if template_id != sample_hash {
+                if self.commit_sample_hash {
+                    return self.begin_commit(sample_hash, TemplateSource::ForcedSampleHash);
+                }
                 return self.begin_commit(template_id, TemplateSource::EnrolmentId);
             }
         }

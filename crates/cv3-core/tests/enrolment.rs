@@ -360,6 +360,46 @@ fn assert_wrapped(frame: &[u8], command: u16, attribute: u8, tlv: &[u8], plainte
 }
 
 #[test]
+fn forcing_the_sample_hash_commits_it_even_when_an_enrolment_id_arrives() {
+    let mut transport = ScriptedTransport::default();
+    let session = opened_session(&mut transport);
+    let expected_commit = session
+        .wrap(
+            cmd::COMMIT_ENROLMENT,
+            attr::SESSION,
+            &commit_tlv(HANDLE, &SAMPLE_HASH),
+            COMMIT_PLAINTEXT_LEN,
+            &enrol_iv(&base_iv(), 5),
+            6,
+        )
+        .expect("commit frame");
+
+    push_discard_reply(&mut transport, &session);
+    push_start_reply(&mut transport);
+    push_arm(&mut transport, &session);
+    push_accepted_update(&mut transport, &session);
+    push_arm(&mut transport, &session);
+    push_completion(&mut transport, &session);
+    push_commit_reply(&mut transport, &session, 0);
+
+    let mut enrol = Enrol::new(session, base_iv()).with_commit_sample_hash();
+    let (outcome, _) = drive_with_progress(&mut enrol, &mut transport);
+    let template = outcome.expect("the enrolment completes");
+    transport.assert_exhausted();
+
+    assert_eq!(
+        template.template_id, SAMPLE_HASH,
+        "the flag overrides the enrolment id the sensor sent"
+    );
+    assert_eq!(template.source, TemplateSource::ForcedSampleHash);
+    assert_eq!(
+        transport.sent().last(),
+        Some(&expected_commit),
+        "the commit names the last sample hash"
+    );
+}
+
+#[test]
 fn the_tlv_builders_match_the_documented_wire_offsets() {
     let discard = discard_tlv(HANDLE);
     assert_eq!(discard.len(), DISCARD_TLV_LEN);
