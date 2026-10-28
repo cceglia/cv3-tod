@@ -18,6 +18,14 @@ pub const SHUTDOWN_SIGNALS: [i32; 3] = [
 pub trait Shutdown {
     /// The first shutdown signal received, if any.
     fn signalled(&self) -> Option<i32>;
+
+    /// A handle the command transport can poll while it waits for the finger.
+    ///
+    /// The transport polls this only on the finger wait: no command transfer is ever cancelled.
+    /// Implementations that are only asked for the signal number can leave this as `None`.
+    fn cancellation(&self) -> Option<SignalFlag> {
+        None
+    }
 }
 
 /// A watched signal, stored as `0` for "none" so the handler needs no lock.
@@ -48,6 +56,10 @@ impl SignalFlag {
 impl Shutdown for SignalFlag {
     fn signalled(&self) -> Option<i32> {
         self.get()
+    }
+
+    fn cancellation(&self) -> Option<SignalFlag> {
+        Some(self.clone())
     }
 }
 
@@ -88,6 +100,10 @@ impl SignalWatch {
 impl Shutdown for SignalWatch {
     fn signalled(&self) -> Option<i32> {
         self.flag.get()
+    }
+
+    fn cancellation(&self) -> Option<SignalFlag> {
+        Some(self.flag.clone())
     }
 }
 

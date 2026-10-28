@@ -10,8 +10,11 @@
 
 use std::io::Write;
 
-use cv3_core::capture::{Capture, CaptureError, CapturedSample, SAMPLE_HASH_LEN};
-use cv3_core::crypto::HostKey;
+use cv3_core::cancel::{CancelCapture, CancelError};
+use cv3_core::capture::{
+    ArmCapture, ArmOutcome, Capture, CaptureError, CapturedSample, SAMPLE_HASH_LEN,
+};
+use cv3_core::crypto::{BLOCK_LEN, HostKey};
 use cv3_core::enrol::{Enrol, EnrolError, EnrolledTemplate, MAX_ACCEPTED_SAMPLES, TemplateSource};
 use cv3_core::handshake::{Handshake, HandshakeError};
 use cv3_core::session::{
@@ -52,6 +55,7 @@ const USAGE: &str = "usage: cvctl devices
        cvctl capture
        cvctl enroll
        cvctl verify [--record <file>]
+       cvctl cancel-then-verify
        cvctl replay <file>";
 
 /// One parsed invocation.
@@ -73,6 +77,7 @@ enum Command<'a> {
     Verify {
         record: Option<&'a str>,
     },
+    CancelThenVerify,
     Replay {
         file: &'a str,
     },
@@ -119,6 +124,7 @@ fn parse(args: &[String]) -> Option<Command<'_>> {
                 record: flags.record,
             })
         }
+        "cancel-then-verify" if rest.is_empty() => Some(Command::CancelThenVerify),
         "replay" => match rest {
             [file] => Some(Command::Replay { file }),
             _ => None,
@@ -179,6 +185,7 @@ pub fn run(
         Some(Command::Capture) => capture(backend, shutdown, out, err),
         Some(Command::Enroll) => enroll(backend, shutdown, out, err),
         Some(Command::Verify { record }) => verify(backend, shutdown, record, out, err),
+        Some(Command::CancelThenVerify) => cancel_then_verify(backend, shutdown, out, err),
         Some(Command::Replay { file }) => replay(file, out, err),
         None => {
             let _ = writeln!(err, "{USAGE}");
@@ -196,7 +203,7 @@ fn devices(
     match probe(backend, shutdown) {
         Ok(outcome) => {
             let _ = writeln!(out, "{}", outcome.sensor.location());
-            EXIT_OK
+            signalled_exit(shutdown, err, EXIT_OK)
         }
         Err(error) => {
             report(&error, err);
@@ -349,6 +356,21 @@ fn finish_recording(error: Option<std::io::Error>, err: &mut dyn Write, code: u8
     }
 }
 
+/// After an operation has returned, a shutdown signal decides the exit status.
+///
+/// The core has already torn the session down by the time this runs: a cancelled capture sends the
+/// sessionless `0x68` and then the `0x04` close. Mapping the run onto the shell's `128 + signal`
+/// is therefore the last thing the probe does, never a substitute for the teardown.
+fn signalled_exit(shutdown: &dyn Shutdown, err: &mut dyn Write, code: u8) -> u8 {
+    match shutdown.signalled() {
+        Some(signal) => {
+            let _ = writeln!(err, "cvctl: interrupted by signal {signal}");
+            u8::try_from(128 + signal).unwrap_or(code)
+        }
+        None => code,
+    }
+}
+
 /// Runs one `0x23` / `0x24` handshake and prints what it learned.
 fn handshake(
     backend: &mut dyn UsbBackend,
@@ -397,6 +419,7 @@ fn handshake(
             EXIT_OTHER
         }
     };
+    let code = signalled_exit(shutdown, err, code);
     finish_recording(record_error, err, code)
 }
 
@@ -457,6 +480,7 @@ fn open(
             }
         }
     };
+    let code = signalled_exit(shutdown, err, code);
     finish_recording(record_error, err, code)
 }
 
@@ -502,6 +526,7 @@ fn close(
             EXIT_OTHER
         }
     };
+    let code = signalled_exit(shutdown, err, code);
     finish_recording(record_error, err, code)
 }
 
@@ -544,7 +569,7 @@ fn capture(
     let mut exchange = channel.exchange();
     let outcome = capture_over(&mut exchange, secrets, open_iv, capture_iv);
 
-    match outcome {
+    let code = match outcome {
         Ok((sample_hash, teardown)) => {
             let _ = writeln!(out, "sample hash {}", hex(&sample_hash));
             if let Err(error) = teardown {
@@ -573,7 +598,8 @@ fn capture(
             let _ = writeln!(err, "cvctl: capture failed: {error}");
             code
         }
-    }
+    };
+    signalled_exit(shutdown, err, code)
 }
 
 /// Where an enrolment run stopped.
@@ -691,7 +717,7 @@ fn enroll(
     };
 
     let mut exchange = channel.exchange();
-    match enrol_over(&mut exchange, secrets, open_iv, base_iv, out) {
+    let code = match enrol_over(&mut exchange, secrets, open_iv, base_iv, out) {
         Ok((report, teardown)) => {
             let _ = writeln!(
                 out,
@@ -725,7 +751,8 @@ fn enroll(
             let _ = writeln!(err, "cvctl: enrolment failed: {error}");
             code
         }
-    }
+    };
+    signalled_exit(shutdown, err, code)
 }
 
 /// Where a verification run stopped.
@@ -781,22 +808,28 @@ fn print_verdict(verdict: &Verdict, out: &mut dyn Write) {
     let _ = writeln!(out, "plaintext length {}", verdict.plaintext_len);
 }
 
+/// Maps a capture failure onto the probe's documented exit codes.
+fn capture_error_code(error: &CaptureError) -> u8 {
+    use cv3_core::proto::status;
+
+    match error {
+        CaptureError::AlreadyPending => EXIT_CAPTURE_PENDING,
+        CaptureError::FingerTimeout => EXIT_FINGER_TIMEOUT,
+        CaptureError::Transport(_) => EXIT_TRANSPORT,
+        CaptureError::SensorStatus(code) if *code == status::BAD_SEQUENCE => EXIT_SEQUENCE,
+        CaptureError::SensorStatus(code) if *code == status::CAPTURE_PENDING => {
+            EXIT_CAPTURE_PENDING
+        }
+        _ => EXIT_OTHER,
+    }
+}
+
 /// Maps a verification failure onto the probe's documented exit codes.
 fn verify_error_code(error: &VerifyError) -> u8 {
     use cv3_core::proto::status;
 
     match error {
-        VerifyError::Capture(CaptureError::AlreadyPending) => EXIT_CAPTURE_PENDING,
-        VerifyError::Capture(CaptureError::FingerTimeout) => EXIT_FINGER_TIMEOUT,
-        VerifyError::Capture(CaptureError::Transport(_)) => EXIT_TRANSPORT,
-        VerifyError::Capture(CaptureError::SensorStatus(code)) if *code == status::BAD_SEQUENCE => {
-            EXIT_SEQUENCE
-        }
-        VerifyError::Capture(CaptureError::SensorStatus(code))
-            if *code == status::CAPTURE_PENDING =>
-        {
-            EXIT_CAPTURE_PENDING
-        }
+        VerifyError::Capture(error) => capture_error_code(error),
         VerifyError::Match(MatchError::WrongSequence) => EXIT_SEQUENCE,
         VerifyError::Match(MatchError::Transport(_)) => EXIT_TRANSPORT,
         VerifyError::Match(MatchError::SensorStatus(code)) if *code == status::BAD_SEQUENCE => {
@@ -896,7 +929,155 @@ fn verify(
             verify_error_code(&error)
         }
     };
+    let code = signalled_exit(shutdown, err, code);
     finish_recording(record_error, err, code)
+}
+
+/// Where a cancel-then-verify run stopped.
+enum CancelThenVerifyFailure {
+    Handshake(HandshakeError),
+    Open(OpenError),
+    /// The first, arm-only capture failed; its own teardown has run.
+    Capture(CaptureError),
+    /// The mid-session cancel failed; it ran the teardown before reporting.
+    Cancel(CancelError),
+    /// The verification failed; its capture or match teardown has run.
+    Verify(VerifyError),
+}
+
+/// Opens **one** session, arms a capture, cancels it before any finger, then verifies in it.
+///
+/// The wire order is `0x02`, `0x66`, the mid-session `0x68`, `0x66`, the finger event and `0x73`.
+/// The mid-session cancel is plain and leaves the wrap sequence where the first arm reply put it,
+/// which is what makes this run the experiment for the capture-pending rule as well: the second
+/// arm carries the reference reading's number. The caller tears the one session down afterwards.
+fn cancel_then_verify_over(
+    transport: &mut dyn Transport,
+    secrets: RunSecrets,
+    open_iv: [u8; BLOCK_LEN],
+    arm_iv: [u8; BLOCK_LEN],
+    capture_iv: [u8; BLOCK_LEN],
+    match_iv: [u8; BLOCK_LEN],
+) -> Result<(Verdict, Result<(), TeardownError>), CancelThenVerifyFailure> {
+    let run =
+        handshake_over(transport, secrets, true).map_err(CancelThenVerifyFailure::Handshake)?;
+    let mut open = OpenSession::new(run.session, open_iv);
+    let session = drive(&mut open, transport).map_err(CancelThenVerifyFailure::Open)?;
+
+    // Arm only: consume the 0x66 reply and keep the session, without waiting for a finger. A
+    // 0x85 reply is an outcome, not a failure: the stale capture is cancelled next, and the
+    // re-arm inside the verification then carries the sequence the two readings disagree about.
+    let mut arm = ArmCapture::new(session, arm_iv);
+    let session = match drive(&mut arm, transport).map_err(CancelThenVerifyFailure::Capture)? {
+        ArmOutcome::Armed(CapturedSample { session, .. }) => session,
+        ArmOutcome::AlreadyPending(session) => session,
+    };
+
+    // Clear the armed capture with the session-scoped cancel, which leaves the session open.
+    let mut cancel = CancelCapture::new(session);
+    let session = drive(&mut cancel, transport).map_err(CancelThenVerifyFailure::Cancel)?;
+
+    let mut verify = Verify::new(session, capture_iv, match_iv);
+    match drive(&mut verify, transport) {
+        Ok(Verification { verdict, session }) => {
+            let mut teardown = Teardown::new(session.handle);
+            drop(session);
+            Ok((verdict, drive(&mut teardown, transport)))
+        }
+        Err(error) => Err(CancelThenVerifyFailure::Verify(error)),
+    }
+}
+
+/// Runs the one-session experiment `cancel-then-verify` exists for and prints the verify detail.
+fn cancel_then_verify(
+    backend: &mut dyn UsbBackend,
+    shutdown: &dyn Shutdown,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let mut ivs = [[0u8; BLOCK_LEN]; 4];
+    for slot in &mut ivs {
+        *slot = match random_iv() {
+            Ok(iv) => iv,
+            Err(error) => {
+                let _ = writeln!(err, "cvctl: {error}");
+                return EXIT_OTHER;
+            }
+        };
+    }
+    let [open_iv, arm_iv, capture_iv, match_iv] = ivs;
+
+    let mut channel = match open_for_command(backend, shutdown) {
+        Ok(channel) => channel,
+        Err(error) => {
+            report(&error, err);
+            return error.exit_code();
+        }
+    };
+    let secrets = match RunSecrets::generate() {
+        Ok(secrets) => secrets,
+        Err(error) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            return EXIT_OTHER;
+        }
+    };
+
+    let mut exchange = channel.exchange();
+    let outcome = cancel_then_verify_over(
+        &mut exchange,
+        secrets,
+        open_iv,
+        arm_iv,
+        capture_iv,
+        match_iv,
+    );
+
+    let code = match outcome {
+        Ok((verdict, teardown)) => {
+            print_verdict(&verdict, out);
+            if let Err(error) = teardown {
+                let _ = writeln!(err, "cvctl: {error}");
+            }
+            if verdict.matched {
+                EXIT_OK
+            } else {
+                EXIT_NO_MATCH
+            }
+        }
+        Err(CancelThenVerifyFailure::Handshake(error)) => {
+            let _ = writeln!(err, "cvctl: handshake failed: {error}");
+            EXIT_OTHER
+        }
+        Err(CancelThenVerifyFailure::Open(error)) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            if matches!(error, OpenError::WrongSequence) {
+                EXIT_SEQUENCE
+            } else {
+                EXIT_OTHER
+            }
+        }
+        Err(CancelThenVerifyFailure::Capture(error)) => {
+            let _ = writeln!(err, "cvctl: the first capture failed: {error}");
+            capture_error_code(&error)
+        }
+        Err(CancelThenVerifyFailure::Cancel(error)) => {
+            let _ = writeln!(err, "cvctl: the mid-session cancel failed: {error}");
+            match &error {
+                CancelError::Transport(_) => EXIT_TRANSPORT,
+                CancelError::SensorStatus(code)
+                    if *code == cv3_core::proto::status::BAD_SEQUENCE =>
+                {
+                    EXIT_SEQUENCE
+                }
+                _ => EXIT_OTHER,
+            }
+        }
+        Err(CancelThenVerifyFailure::Verify(error)) => {
+            let _ = writeln!(err, "cvctl: verification failed: {error}");
+            verify_error_code(&error)
+        }
+    };
+    signalled_exit(shutdown, err, code)
 }
 
 /// What a replay run produced.
@@ -2145,6 +2326,282 @@ mod tests {
             None => "value absent".to_owned(),
         };
         format!("{verdict}\n{value}\nreply length {reply}\nplaintext length {plaintext}\n")
+    }
+
+    #[test]
+    fn cancel_then_verify_owns_one_session_and_prints_the_verdict() {
+        let mut usb = FakeUsb::with_sensor();
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["cancel-then-verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(err, "");
+        assert_eq!(
+            out,
+            verify_output("match", Some(&MATCH_VALUE), 108, 52),
+            "the verdict, value and lengths are printed exactly as verify prints them"
+        );
+        assert_eq!(
+            sent_commands(&usb),
+            [
+                cmd::CHALLENGE,
+                cmd::CHALLENGE_RESPONSE,
+                cmd::OPEN_SESSION,
+                cmd::ARM_CAPTURE,
+                cmd::CANCEL_CAPTURE,
+                cmd::ARM_CAPTURE,
+                cmd::MATCH,
+                cmd::CANCEL_CAPTURE,
+                cmd::CLOSE_SESSION,
+            ],
+            "one 0x02, then arm, mid-cancel, re-arm, match, teardown"
+        );
+        assert_eq!(
+            sent_commands(&usb)
+                .iter()
+                .filter(|command| **command == cmd::OPEN_SESSION)
+                .count(),
+            1,
+            "the whole run owns one session"
+        );
+        assert_eq!(
+            sent_commands(&usb)
+                .iter()
+                .filter(|command| **command == cmd::CLOSE_SESSION)
+                .count(),
+            1
+        );
+        assert_eq!(
+            usb.calls()
+                .iter()
+                .filter(|call| **call == "open-command")
+                .count(),
+            1,
+            "the command channel is opened once"
+        );
+
+        let cancels: Vec<Vec<u8>> = usb
+            .sent
+            .borrow()
+            .iter()
+            .filter(|frame| command(frame) == cmd::CANCEL_CAPTURE)
+            .cloned()
+            .collect();
+        assert_eq!(
+            cancels.len(),
+            2,
+            "the mid-session cancel and the teardown one"
+        );
+
+        let mid = &cancels[0];
+        assert_eq!(mid.len(), 56);
+        assert_eq!(&mid[8..10], &[0x68, 0x00], "0x68");
+        assert_eq!(mid[10], attr::CANCEL_SESSION, "mid-session attribute 0x40");
+        assert_eq!(mid[11], 0x00, "the mid-session cancel is plain");
+        assert_eq!(le32(mid, 16), TEST_HANDLE, "header handle is the session");
+        assert_eq!(le32(mid, 40), 12, "declared parameter length");
+        assert_eq!(
+            &mid[44..],
+            &[0, 0, 0, 0, 4, 0, 0, 0, 0x44, 0x33, 0x22, 0x11],
+            "TLV (0,4,handle)"
+        );
+
+        let sessionless = &cancels[1];
+        assert_eq!(sessionless[10], attr::CANCEL_SESSIONLESS);
+        assert_eq!(
+            le32(sessionless, 16),
+            0,
+            "the teardown cancel is sessionless"
+        );
+
+        assert_eq!(
+            sent_command(&usb, cmd::MATCH).expect("0x73 was sent").len(),
+            172,
+            "the match is the same 112-plaintext frame verify sends"
+        );
+    }
+
+    #[test]
+    fn cancel_then_verify_survives_a_pending_first_arm_and_still_verifies() {
+        // The first arm answers 0x85: a capture was already armed. The run consumes that reply,
+        // cancels the stale capture at mid-session, and re-arms inside the same session. This is
+        // the reference's capture-pending retry path, and the re-arm's sequence is the one the
+        // two readings disagree about.
+        let mut usb = FakeUsb::with_sensor();
+        usb.arm_statuses = vec![0x85];
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["cancel-then-verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(err, "");
+        assert_eq!(out, verify_output("match", Some(&MATCH_VALUE), 108, 52));
+        assert_eq!(
+            sent_commands(&usb),
+            [
+                cmd::CHALLENGE,
+                cmd::CHALLENGE_RESPONSE,
+                cmd::OPEN_SESSION,
+                cmd::ARM_CAPTURE,
+                cmd::CANCEL_CAPTURE,
+                cmd::ARM_CAPTURE,
+                cmd::MATCH,
+                cmd::CANCEL_CAPTURE,
+                cmd::CLOSE_SESSION,
+            ],
+            "the pending first arm does not tear the session down"
+        );
+        assert_eq!(
+            sent_commands(&usb)
+                .iter()
+                .filter(|command| **command == cmd::OPEN_SESSION)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn cancel_then_verify_reports_a_no_match_with_its_own_exit_code() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.match_plaintext = Some(match_plaintext(0, Some(&MATCH_VALUE)));
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["cancel-then-verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_NO_MATCH);
+        assert_eq!(err, "");
+        assert_eq!(out, verify_output("no match", Some(&MATCH_VALUE), 108, 52));
+        assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
+        assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some());
+    }
+
+    #[test]
+    fn cancel_then_verify_tears_down_when_the_finger_never_arrives() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.finger_event = Some(Err(UsbError::Timeout));
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["cancel-then-verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_FINGER_TIMEOUT);
+        assert_eq!(out, "");
+        assert!(err.contains("finger timeout"), "{err}");
+        assert_eq!(
+            sent_commands(&usb),
+            [
+                cmd::CHALLENGE,
+                cmd::CHALLENGE_RESPONSE,
+                cmd::OPEN_SESSION,
+                cmd::ARM_CAPTURE,
+                cmd::CANCEL_CAPTURE,
+                cmd::ARM_CAPTURE,
+                cmd::CANCEL_CAPTURE,
+                cmd::CLOSE_SESSION,
+            ],
+            "the failed verification tears the one session down"
+        );
+    }
+
+    #[test]
+    fn cancel_then_verify_tears_down_when_the_mid_session_cancel_fails() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.cancel_command_error = Some(UsbError::Disconnected);
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["cancel-then-verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_TRANSPORT);
+        assert_eq!(out, "");
+        assert!(err.contains("mid-session cancel failed"), "{err}");
+        assert!(err.contains("disconnected"), "{err}");
+        assert!(
+            sent_command(&usb, cmd::CLOSE_SESSION).is_some(),
+            "the handle is released even when the cancel fails"
+        );
+    }
+
+    #[test]
+    fn a_signal_during_the_finger_wait_tears_capture_down_and_exits_128_plus_the_signal() {
+        let flag = SignalFlag::new();
+        let mut usb = FakeUsb::with_sensor();
+        usb.signal_during_finger = Some(flag.clone());
+
+        let (code, out, err) = run_with(&["capture"], &mut usb, &flag);
+
+        assert_eq!(code, 130, "SIGINT follows the shell convention");
+        assert_eq!(out, "");
+        assert!(err.contains("capture cancelled"), "{err}");
+        assert!(err.contains("interrupted by signal 2"), "{err}");
+        let sent = sent_commands(&usb);
+        assert_eq!(
+            &sent[sent.len() - 2..],
+            &[cmd::CANCEL_CAPTURE, cmd::CLOSE_SESSION],
+            "the core cancels the capture and closes the handle before the signal status"
+        );
+        assert_eq!(sent.iter().filter(|c| **c == cmd::CLOSE_SESSION).count(), 1);
+    }
+
+    #[test]
+    fn a_signal_during_verify_tears_down_and_exits_128_plus_the_signal() {
+        let flag = SignalFlag::new();
+        let mut usb = FakeUsb::with_sensor();
+        usb.signal_during_finger = Some(flag.clone());
+
+        let (code, out, err) = run_with(&["verify"], &mut usb, &flag);
+
+        assert_eq!(code, 130);
+        assert_eq!(out, "");
+        assert!(err.contains("verification failed"), "{err}");
+        assert!(err.contains("interrupted by signal 2"), "{err}");
+        let sent = sent_commands(&usb);
+        assert_eq!(
+            &sent[sent.len() - 2..],
+            &[cmd::CANCEL_CAPTURE, cmd::CLOSE_SESSION]
+        );
+    }
+
+    #[test]
+    fn a_signal_during_cancel_then_verify_tears_down_and_exits_128_plus_the_signal() {
+        let flag = SignalFlag::new();
+        let mut usb = FakeUsb::with_sensor();
+        usb.signal_during_finger = Some(flag.clone());
+
+        let (code, out, err) = run_with(&["cancel-then-verify"], &mut usb, &flag);
+
+        assert_eq!(code, 130);
+        assert_eq!(out, "");
+        assert!(err.contains("interrupted by signal 2"), "{err}");
+        let sent = sent_commands(&usb);
+        assert_eq!(
+            &sent[sent.len() - 2..],
+            &[cmd::CANCEL_CAPTURE, cmd::CLOSE_SESSION],
+            "the second capture was cancelled and the one session closed"
+        );
+    }
+
+    #[test]
+    fn a_signal_during_a_command_transfer_is_not_a_cancelled_transfer() {
+        let flag = SignalFlag::new();
+        let mut usb = FakeUsb::with_sensor();
+        usb.signal_during_command = Some(flag.clone());
+
+        // The signal is raised while the 0x24 response is in flight. The handshake still finishes
+        // and releases the handle: only the exit status remembers the interruption.
+        let (code, out, err) = run_with(&["handshake"], &mut usb, &flag);
+
+        assert_eq!(code, 130);
+        assert_eq!(err, "cvctl: interrupted by signal 2\n");
+        assert!(
+            out.contains(&format!("handle {TEST_HANDLE:#010x}")),
+            "{out}"
+        );
+        assert!(out.contains("client nonce 20 bytes"), "{out}");
+        assert_eq!(
+            sent_commands(&usb),
+            [cmd::CHALLENGE, cmd::CHALLENGE_RESPONSE, cmd::CLOSE_SESSION,],
+            "the command after the signal was still sent: the transfer was never cancelled"
+        );
     }
 
     #[test]

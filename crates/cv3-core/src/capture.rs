@@ -16,7 +16,12 @@
 //! capture keeps the session open so the caller can submit the sample or match it; every failure
 //! runs [`crate::session::Teardown`] (cancel, then close) before finishing, so no handle is left
 //! dangling. A `0x85` reply means a capture is already armed; it is its own outcome, never a
-//! capture, and this operation does not silently cancel and retry (ticket 08 owns that).
+//! capture, and this operation does not silently cancel and retry.
+//!
+//! [`ArmCapture`] is the same arm-and-reply step without the finger wait: it returns the sample
+//! hash and the still-open session, or [`ArmOutcome::AlreadyPending`] with the session still open
+//! when the sensor answered `0x85`. That is the first half of `cvctl cancel-then-verify`, where the
+//! armed capture is then cancelled with the mid-session `0x68` and a fresh arm is sent.
 
 use std::fmt;
 
@@ -154,10 +159,191 @@ impl std::error::Error for CaptureError {}
 
 type CaptureOutcome = Result<CapturedSample, CaptureError>;
 
+/// What an arm-only capture produced.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ArmOutcome {
+    /// The sensor armed the capture; the sample hash is known and no finger has been read yet.
+    Armed(CapturedSample),
+    /// The sensor answered `0x85`: a capture was already armed. The reply has been consumed and
+    /// the session is still open, so the caller can cancel the stale capture and arm again.
+    AlreadyPending(Session),
+}
+
+type ArmResult = Result<ArmOutcome, CaptureError>;
+
+#[derive(Debug)]
+enum ArmState {
+    NotStarted,
+    WaitingArm,
+    /// The original error is held until the best-effort teardown has run.
+    TearingDown {
+        original: CaptureError,
+        teardown: Teardown,
+    },
+    Done,
+}
+
+/// The wrapped `0x66` arm and its reply, **without** the finger wait.
+///
+/// [`Capture`] composes one of these and then waits for the finger. `cvctl cancel-then-verify`
+/// uses it directly to arm, cancel and re-arm in one session. A `0x85` reply is
+/// [`ArmOutcome::AlreadyPending`]: it is consumed through the one sequence predicate and the
+/// session comes back still open, which is what the reference's cancel-and-retry path needs.
+/// Every other failure runs the sessionless cancel and close before the error is returned.
+#[derive(Debug)]
+pub struct ArmCapture {
+    session: Option<Session>,
+    handle: u32,
+    iv: [u8; crypto::BLOCK_LEN],
+    state: ArmState,
+}
+
+impl ArmCapture {
+    /// Builds the arm for a live session. The caller supplies a fresh IV (the probe draws it from
+    /// the operating system, while enrolment derives one per frame from its base IV).
+    pub fn new(session: Session, iv: [u8; crypto::BLOCK_LEN]) -> Self {
+        Self {
+            handle: session.handle,
+            session: Some(session),
+            iv,
+            state: ArmState::NotStarted,
+        }
+    }
+
+    fn finish(&mut self, outcome: ArmResult) -> Action<ArmResult> {
+        self.state = ArmState::Done;
+        Action::Finish(outcome)
+    }
+
+    /// Drops the session and starts the cancel-then-close teardown, preserving `error`.
+    fn begin_teardown(&mut self, error: CaptureError) -> Action<ArmResult> {
+        self.session = None;
+        let mut teardown = Teardown::new(self.handle);
+        match teardown.start() {
+            Action::Send(frame) => {
+                self.state = ArmState::TearingDown {
+                    original: error,
+                    teardown,
+                };
+                Action::Send(frame)
+            }
+            // A zero handle has nothing to tear down; any other action cannot come from Teardown.
+            _ => self.finish(Err(error)),
+        }
+    }
+
+    fn arm_frame(&self, session: &Session) -> Result<Vec<u8>, WrapError> {
+        session.wrap(
+            cmd::ARM_CAPTURE,
+            attr::CAPTURE,
+            &capture_tlv(session.handle),
+            CAPTURE_PLAINTEXT_LEN,
+            &self.iv,
+            session.next_sequence(),
+        )
+    }
+
+    fn on_reply(&mut self, status: u32, body: Vec<u8>) -> Action<ArmResult> {
+        // The one sequence predicate applies to this reply before it is interpreted; a body
+        // advances the counter unless the sensor said 0x0F, which includes a 0x85 reply under the
+        // shipped reading.
+        let has_body = !body.is_empty();
+        if let Some(session) = self.session.as_mut() {
+            session.note_wrapped_reply(has_body, status);
+        }
+
+        if status == proto::status::CAPTURE_PENDING {
+            return match self.session.take() {
+                Some(session) => self.finish(Ok(ArmOutcome::AlreadyPending(session))),
+                None => self.finish(Err(CaptureError::AlreadyFinished)),
+            };
+        }
+        if status != proto::status::OK {
+            return self.begin_teardown(CaptureError::SensorStatus(status));
+        }
+        if body.is_empty() {
+            return self.begin_teardown(CaptureError::MissingReply);
+        }
+
+        let Some(session) = self.session.as_ref() else {
+            return self.finish(Err(CaptureError::AlreadyFinished));
+        };
+        let reply = match session.key().unwrap(&body) {
+            Ok(reply) => reply,
+            Err(error) => return self.begin_teardown(CaptureError::MalformedReply(error)),
+        };
+        let Some(value) = find_tlv_value(&reply.plaintext, SAMPLE_HASH_LEN) else {
+            return self.begin_teardown(CaptureError::NoSampleHash);
+        };
+        let mut sample_hash = [0u8; SAMPLE_HASH_LEN];
+        sample_hash.copy_from_slice(value);
+
+        match self.session.take() {
+            Some(session) => self.finish(Ok(ArmOutcome::Armed(CapturedSample {
+                sample_hash,
+                session,
+            }))),
+            None => self.finish(Err(CaptureError::AlreadyFinished)),
+        }
+    }
+}
+
+impl Operation for ArmCapture {
+    type Output = ArmResult;
+
+    fn start(&mut self) -> Action<ArmResult> {
+        if !matches!(self.state, ArmState::NotStarted) {
+            return self.finish(Err(CaptureError::AlreadyFinished));
+        }
+        let built = match self.session.as_ref() {
+            Some(session) => self.arm_frame(session),
+            None => return self.finish(Err(CaptureError::AlreadyFinished)),
+        };
+        match built {
+            Ok(frame) => {
+                self.state = ArmState::WaitingArm;
+                Action::Send(frame)
+            }
+            Err(error) => self.begin_teardown(CaptureError::Build(error)),
+        }
+    }
+
+    fn step(&mut self, event: Event) -> Action<ArmResult> {
+        match std::mem::replace(&mut self.state, ArmState::Done) {
+            ArmState::NotStarted => self.finish(Err(CaptureError::UnexpectedEvent)),
+            ArmState::WaitingArm => match event {
+                Event::Reply { status, body } => self.on_reply(status, body),
+                Event::ReplyWithoutBody => {
+                    if let Some(session) = self.session.as_mut() {
+                        session.note_wrapped_reply(false, 0);
+                    }
+                    self.begin_teardown(CaptureError::MissingReply)
+                }
+                Event::Transport(error) => self.begin_teardown(CaptureError::Transport(error)),
+                Event::Cancelled => self.begin_teardown(CaptureError::Cancelled),
+                Event::Finger => self.begin_teardown(CaptureError::UnexpectedEvent),
+            },
+            ArmState::TearingDown {
+                original,
+                mut teardown,
+            } => match teardown.step(event) {
+                Action::Send(frame) => {
+                    self.state = ArmState::TearingDown { original, teardown };
+                    Action::Send(frame)
+                }
+                // Teardown never waits; anything but another send is its end.
+                _ => self.finish(Err(original)),
+            },
+            ArmState::Done => self.finish(Err(CaptureError::AlreadyFinished)),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum CaptureState {
     NotStarted,
-    WaitingArm,
+    /// The arm owns the session until it reports the sample.
+    Arming(ArmCapture),
     WaitingFinger {
         sample_hash: [u8; SAMPLE_HASH_LEN],
     },
@@ -169,11 +355,12 @@ enum CaptureState {
     Done,
 }
 
-/// The wrapped `0x66` arm, the reply, and the finger wait.
+/// One whole capture: the [`ArmCapture`] and then the finger wait.
 ///
 /// The operation owns the [`Session`] it was built with and returns it unchanged on success. On
 /// every failure it drops the key material and runs [`Teardown`] (sessionless `0x68`, then `0x04`)
-/// before finishing with the original error; a teardown failure never replaces that error.
+/// before finishing with the original error; a teardown failure never replaces that error. An
+/// [`ArmCapture`] failure has already torn the session down, so it is passed through unchanged.
 pub struct Capture {
     session: Option<Session>,
     handle: u32,
@@ -215,50 +402,41 @@ impl Capture {
         }
     }
 
-    fn arm_frame(&self, session: &Session) -> Result<Vec<u8>, WrapError> {
-        session.wrap(
-            cmd::ARM_CAPTURE,
-            attr::CAPTURE,
-            &capture_tlv(session.handle),
-            CAPTURE_PLAINTEXT_LEN,
-            &self.iv,
-            session.next_sequence(),
-        )
+    fn advance_arm(
+        &mut self,
+        action: Action<ArmResult>,
+        arm: ArmCapture,
+    ) -> Action<CaptureOutcome> {
+        match action {
+            Action::Send(frame) => {
+                self.state = CaptureState::Arming(arm);
+                Action::Send(frame)
+            }
+            Action::Finish(result) => self.on_armed(result),
+            // The arm never waits; anything else is a host-side bug, reported not panicked.
+            Action::WaitFinger => self.finish(Err(CaptureError::UnexpectedEvent)),
+        }
     }
 
-    fn on_arm_reply(&mut self, status: u32, body: Vec<u8>) -> Action<CaptureOutcome> {
-        // The one sequence predicate applies to this reply before it is interpreted; a body
-        // advances the counter unless the sensor said 0x0F, which includes a 0x85 reply.
-        let has_body = !body.is_empty();
-        if let Some(session) = self.session.as_mut() {
-            session.note_wrapped_reply(has_body, status);
+    fn on_armed(&mut self, result: ArmResult) -> Action<CaptureOutcome> {
+        match result {
+            Ok(ArmOutcome::Armed(CapturedSample {
+                sample_hash,
+                session,
+            })) => {
+                self.session = Some(session);
+                self.state = CaptureState::WaitingFinger { sample_hash };
+                Action::WaitFinger
+            }
+            Ok(ArmOutcome::AlreadyPending(session)) => {
+                self.handle = session.handle;
+                drop(session);
+                self.begin_teardown(CaptureError::AlreadyPending)
+            }
+            // The arm already ran its own teardown; repeating it would send a second
+            // cancel-and-close pair for a handle that is already gone.
+            Err(error) => self.finish(Err(error)),
         }
-
-        if status == proto::status::CAPTURE_PENDING {
-            return self.begin_teardown(CaptureError::AlreadyPending);
-        }
-        if status != proto::status::OK {
-            return self.begin_teardown(CaptureError::SensorStatus(status));
-        }
-        if body.is_empty() {
-            return self.begin_teardown(CaptureError::MissingReply);
-        }
-
-        let Some(session) = self.session.as_ref() else {
-            return self.finish(Err(CaptureError::AlreadyFinished));
-        };
-        let reply = match session.key().unwrap(&body) {
-            Ok(reply) => reply,
-            Err(error) => return self.begin_teardown(CaptureError::MalformedReply(error)),
-        };
-        let Some(value) = find_tlv_value(&reply.plaintext, SAMPLE_HASH_LEN) else {
-            return self.begin_teardown(CaptureError::NoSampleHash);
-        };
-        let mut sample_hash = [0u8; SAMPLE_HASH_LEN];
-        sample_hash.copy_from_slice(value);
-
-        self.state = CaptureState::WaitingFinger { sample_hash };
-        Action::WaitFinger
     }
 }
 
@@ -269,33 +447,23 @@ impl Operation for Capture {
         if !matches!(self.state, CaptureState::NotStarted) {
             return self.finish(Err(CaptureError::AlreadyFinished));
         }
-        let built = match self.session.as_ref() {
-            Some(session) => self.arm_frame(session),
-            None => return self.finish(Err(CaptureError::AlreadyFinished)),
+        let Some(session) = self.session.take() else {
+            return self.finish(Err(CaptureError::AlreadyFinished));
         };
-        match built {
-            Ok(frame) => {
-                self.state = CaptureState::WaitingArm;
-                Action::Send(frame)
-            }
-            Err(error) => self.begin_teardown(CaptureError::Build(error)),
-        }
+        let mut arm = ArmCapture::new(session, self.iv);
+        self.advance_arm(arm.start(), arm)
     }
 
     fn step(&mut self, event: Event) -> Action<CaptureOutcome> {
         match std::mem::replace(&mut self.state, CaptureState::Done) {
             CaptureState::NotStarted => self.finish(Err(CaptureError::UnexpectedEvent)),
-            CaptureState::WaitingArm => match event {
-                Event::Reply { status, body } => self.on_arm_reply(status, body),
-                Event::ReplyWithoutBody => {
-                    if let Some(session) = self.session.as_mut() {
-                        session.note_wrapped_reply(false, 0);
-                    }
-                    self.begin_teardown(CaptureError::MissingReply)
+            CaptureState::Arming(mut arm) => match arm.step(event) {
+                Action::Send(frame) => {
+                    self.state = CaptureState::Arming(arm);
+                    Action::Send(frame)
                 }
-                Event::Transport(error) => self.begin_teardown(CaptureError::Transport(error)),
-                Event::Cancelled => self.begin_teardown(CaptureError::Cancelled),
-                Event::Finger => self.begin_teardown(CaptureError::UnexpectedEvent),
+                Action::Finish(result) => self.on_armed(result),
+                Action::WaitFinger => self.finish(Err(CaptureError::UnexpectedEvent)),
             },
             CaptureState::WaitingFinger { sample_hash } => match event {
                 Event::Finger => match self.session.take() {

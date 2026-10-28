@@ -13,7 +13,7 @@ use cv3_core::proto::{PRODUCT_ID, VENDOR_ID};
 
 use crate::exchange::{Exchange, UsbIo};
 use crate::layout::{EndpointLayout, InterfaceDescriptor, LayoutError, SENSOR_INTERFACE, validate};
-use crate::signals::Shutdown;
+use crate::signals::{Shutdown, SignalFlag};
 pub use crate::usb::UsbError;
 
 /// A device the OS reported, before it is opened.
@@ -63,7 +63,14 @@ pub trait UsbBackend {
 
     /// Opens the sensor and claims interface 0 for command transfers, returning the transport the
     /// core drives. Backends that cannot carry commands leave this unimplemented.
-    fn open_command(&mut self, _sensor: &FoundSensor) -> Result<Box<dyn UsbIo>, UsbError> {
+    ///
+    /// `cancellation` is the handle the transport polls during the finger wait, so a signal can
+    /// abort that one transfer without touching a command transfer.
+    fn open_command(
+        &mut self,
+        _sensor: &FoundSensor,
+        _cancellation: Option<SignalFlag>,
+    ) -> Result<Box<dyn UsbIo>, UsbError> {
         Err(UsbError::Other(
             "this USB backend has no command transport".to_owned(),
         ))
@@ -222,7 +229,8 @@ pub fn probe(
 ///
 /// This is the probe's entry point for every command subcommand. Unlike [`probe`], which releases
 /// the interface after checking the descriptor, the returned [`CommandSession`] owns the claim
-/// until it is dropped, so one session can carry a whole operation.
+/// until it is dropped, so one session can carry a whole operation. The shutdown handle is
+/// threaded into the transport so the finger wait can be cancelled without touching a command.
 pub fn open_for_command(
     backend: &mut dyn UsbBackend,
     shutdown: &dyn Shutdown,
@@ -236,7 +244,7 @@ pub fn open_for_command(
 
     interrupted(shutdown)?;
     let io = backend
-        .open_command(&sensor)
+        .open_command(&sensor, shutdown.cancellation())
         .map_err(|error| stage_error(Stage::Opening, error))?;
 
     Ok(CommandSession { io })

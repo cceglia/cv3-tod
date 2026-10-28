@@ -175,6 +175,26 @@ pub fn build_cancel_capture(handle: u32) -> Vec<u8> {
     )
 }
 
+/// Builds the mid-session cancel-capture frame.
+///
+/// `cmd 0x68`, attr `0x40`, plain encoding, the **live session handle in the header**, and the
+/// same 12-byte `[u32 0, u32 4, u32 handle]` parameter block as the close. It is the cancel the
+/// reference sends when a capture is already armed but the session is still usable; unlike the
+/// sessionless cancel a teardown sends, this frame leaves the session open. Being plain, it does
+/// not advance the wrap sequence.
+pub fn build_cancel_capture_mid(handle: u32) -> Vec<u8> {
+    let mut param = [0u8; 12];
+    put32(&mut param, 0, 0);
+    put32(&mut param, 4, 4);
+    put32(&mut param, 8, handle);
+    build_plain(
+        crate::proto::cmd::CANCEL_CAPTURE,
+        crate::proto::attr::CANCEL_SESSION,
+        handle,
+        &param,
+    )
+}
+
 /// Builds a wrapped frame from already-encrypted parameters.
 ///
 /// `declared_len` is the length of the leading parameter block that the MAC covers, not the
@@ -340,6 +360,27 @@ mod tests {
         assert_eq!(frame[10], 0x44, "sessionless attribute");
         assert_eq!(frame[11], Encoding::Plain as u8, "plain encoding");
         assert_eq!(le32(&frame, 16), 0, "header handle is zero");
+        assert_eq!(le32(&frame, PARAM_LEN_OFFSET), 12, "declared length");
+        assert_eq!(le32(&frame, HEADER_LEN), 0, "tag");
+        assert_eq!(le32(&frame, HEADER_LEN + 4), 4, "value length");
+        assert_eq!(le32(&frame, HEADER_LEN + 8), 0x1122_3344, "handle");
+    }
+
+    #[test]
+    fn the_mid_session_cancel_frame_is_plain_and_carries_the_live_handle() {
+        let frame = build_cancel_capture_mid(0x1122_3344);
+
+        assert_eq!(frame.len(), 56);
+        assert_eq!(le32(&frame, 0), 1, "magic");
+        assert_eq!(le32(&frame, 4), 56, "total length");
+        assert_eq!(&frame[8..10], &[0x68, 0x00], "cancel-capture command");
+        assert_eq!(frame[10], 0x40, "session-scoped attribute");
+        assert_eq!(frame[11], Encoding::Plain as u8, "plain encoding");
+        assert_eq!(
+            le32(&frame, 16),
+            0x1122_3344,
+            "header handle is the session"
+        );
         assert_eq!(le32(&frame, PARAM_LEN_OFFSET), 12, "declared length");
         assert_eq!(le32(&frame, HEADER_LEN), 0, "tag");
         assert_eq!(le32(&frame, HEADER_LEN + 4), 4, "value length");

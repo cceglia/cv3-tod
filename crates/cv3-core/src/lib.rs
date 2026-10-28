@@ -17,6 +17,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cancel;
 pub mod capture;
 pub mod crypto;
 pub mod enrol;
@@ -30,9 +31,10 @@ pub mod transcript;
 pub mod transport;
 pub mod verify;
 
+pub use cancel::{CancelCapture, CancelError};
 pub use capture::{
-    CAPTURE_PLAINTEXT_LEN, CAPTURE_TLV_LEN, Capture, CaptureError, CapturedSample, SAMPLE_HASH_LEN,
-    capture_tlv, find_tlv_value,
+    ArmCapture, ArmOutcome, CAPTURE_PLAINTEXT_LEN, CAPTURE_TLV_LEN, Capture, CaptureError,
+    CapturedSample, SAMPLE_HASH_LEN, capture_tlv, find_tlv_value,
 };
 pub use enrol::{
     COMMIT_PLAINTEXT_LEN, COMMIT_TLV_LEN, DISCARD_PLAINTEXT_LEN, DISCARD_TLV_LEN, Enrol,
@@ -44,8 +46,8 @@ pub use event::{Action, Event, TransportError};
 pub use handshake::{Handshake, HandshakeError};
 pub use operation::Operation;
 pub use session::{
-    CloseError, CloseSession, OpenError, OpenSession, Session, SessionKey, Teardown, TeardownError,
-    UnwrapError, WrapError,
+    CloseError, CloseSession, OpenError, OpenSession, SequenceRule, Session, SessionKey, Teardown,
+    TeardownError, UnwrapError, WrapError,
 };
 pub use transcript::{
     Divergence, FrameKey, RecordingTransport, ReplayTransport, SessionMaterial, Transcript,

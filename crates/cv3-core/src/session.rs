@@ -157,6 +157,7 @@ pub struct Session {
     pub host_nonce_len: usize,
     key: SessionKey,
     next_sequence: u32,
+    sequence_rule: SequenceRule,
 }
 
 impl Session {
@@ -177,7 +178,18 @@ impl Session {
             host_nonce_len,
             key,
             next_sequence,
+            sequence_rule: SequenceRule::SHIPPED,
         }
+    }
+
+    /// Replaces the wrap-sequence reading.
+    ///
+    /// Test support: the scripted-transport scenarios reproduce the reference's capture-pending
+    /// retry under both readings without a second copy of the rule. The shipping code never calls
+    /// this; the shipped reading is [`SequenceRule::SHIPPED`].
+    pub fn with_sequence_rule(mut self, rule: SequenceRule) -> Self {
+        self.sequence_rule = rule;
+        self
     }
 
     /// The derived session key.
@@ -250,7 +262,7 @@ impl Session {
     ///
     /// Every wrapped command routes its reply through here, so the rule has exactly one home.
     pub(crate) fn note_wrapped_reply(&mut self, has_body: bool, status: u32) {
-        if advances_sequence(has_body, status) {
+        if advances_sequence(self.sequence_rule, has_body, status) {
             self.next_sequence = self.next_sequence.wrapping_add(1);
         }
     }
@@ -264,23 +276,61 @@ impl PartialEq for Session {
             && self.host_nonce_len == other.host_nonce_len
             && self.key.0 == other.key.0
             && self.next_sequence == other.next_sequence
+            && self.sequence_rule == other.sequence_rule
     }
 }
 
 impl Eq for Session {}
 
+/// Which reading of the wrap-sequence rule the session applies.
+///
+/// The audited reference implementation (`bump_seq`) advances the counter whenever a wrapped
+/// command's reply carries a body and the status is not `0x0F`, so a `0x85` "capture pending"
+/// reply advances too. The alternative reading treats `0x85` as a refusal that leaves the counter
+/// where it was. The two disagree only on that one reply.
+///
+/// **The hardware measurement is still pending.** Neither reading has been observed on this
+/// sensor by this project; `cvctl cancel-then-verify` is the run that settles it. Until then the
+/// driver ships [`SequenceRule::SHIPPED`], and switching the shipped reading is a one-line change
+/// to that constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SequenceRule {
+    /// A body-bearing reply advances unless the status is `0x0F`; `0x85` advances.
+    #[default]
+    Reference,
+    /// A `0x85` "capture pending" reply keeps the sequence; every other body-bearing reply
+    /// advances unless the status is `0x0F`.
+    CapturePendingKeepsSequence,
+}
+
+impl SequenceRule {
+    /// The reading this driver ships.
+    ///
+    /// This is the one line to change if `cvctl cancel-then-verify` shows the sensor keeping its
+    /// counter across a `0x85` reply. The measurement has not been made yet.
+    pub const SHIPPED: Self = Self::Reference;
+}
+
 /// Whether a wrapped command's reply advances the wrap sequence.
 ///
 /// The audited reference's `bump_seq` advances when the sensor returned a body and the status was
 /// not `0x0F`: a `0x85` "capture pending" reply therefore advances. The alternative reading of the
-/// same exchange treats a capture-pending reply as a refusal that leaves the sequence alone. The
-/// two readings disagree only on that case; ticket 08 settles it against hardware by changing this
-/// predicate and running the probe.
+/// same exchange treats a capture-pending reply as a refusal that leaves the sequence alone.
+///
+/// **The hardware measurement is still pending.** This project has not observed either reading on
+/// the sensor; the reference notes are the only source. `cvctl cancel-then-verify` is the run that
+/// settles it, and switching the shipped reading is the one-line change to [`SequenceRule::SHIPPED`].
 ///
 /// This is the only copy of the rule. Wrapped operations call it through
 /// [`Session::note_wrapped_reply`], never inline.
-fn advances_sequence(has_body: bool, status: u32) -> bool {
-    has_body && status != proto::status::BAD_SEQUENCE
+fn advances_sequence(rule: SequenceRule, has_body: bool, status: u32) -> bool {
+    if !has_body || status == proto::status::BAD_SEQUENCE {
+        return false;
+    }
+    match rule {
+        SequenceRule::Reference => true,
+        SequenceRule::CapturePendingKeepsSequence => status != proto::status::CAPTURE_PENDING,
+    }
 }
 
 /// Why a wrapped command could not be built. All variants are host-side programming errors: the
@@ -1122,25 +1172,61 @@ mod tests {
         );
     }
 
-    fn assert_sequence(starts_at: u32, has_body: bool, status: u32, expected: u32) {
-        let mut session = session_at(starts_at);
+    fn assert_sequence(
+        rule: SequenceRule,
+        starts_at: u32,
+        has_body: bool,
+        status: u32,
+        expected: u32,
+    ) {
+        let mut session = session_at(starts_at).with_sequence_rule(rule);
         session.note_wrapped_reply(has_body, status);
         assert_eq!(session.next_sequence(), expected);
     }
 
     #[test]
+    fn the_shipped_rule_is_the_reference_reading() {
+        assert_eq!(SequenceRule::SHIPPED, SequenceRule::Reference);
+        assert_eq!(SequenceRule::default(), SequenceRule::Reference);
+    }
+
+    #[test]
     fn a_body_advances_the_wrap_sequence_unless_the_status_is_bad_sequence() {
-        assert_sequence(0, true, proto::status::OK, 1);
-        assert_sequence(7, true, proto::status::BAD_SEQUENCE, 7);
+        for rule in [
+            SequenceRule::Reference,
+            SequenceRule::CapturePendingKeepsSequence,
+        ] {
+            assert_sequence(rule, 0, true, proto::status::OK, 1);
+            assert_sequence(rule, 7, true, proto::status::BAD_SEQUENCE, 7);
+            assert_sequence(rule, 3, true, 0x0c, 4);
+        }
         // The audited `bump_seq` reading: capture pending still advanced the sensor's counter.
-        assert_sequence(3, true, proto::status::CAPTURE_PENDING, 4);
-        assert_sequence(3, true, 0x0c, 4);
+        assert_sequence(
+            SequenceRule::Reference,
+            3,
+            true,
+            proto::status::CAPTURE_PENDING,
+            4,
+        );
+        // The alternative reading: a pending capture is a refusal and keeps the counter.
+        assert_sequence(
+            SequenceRule::CapturePendingKeepsSequence,
+            3,
+            true,
+            proto::status::CAPTURE_PENDING,
+            3,
+        );
     }
 
     #[test]
     fn a_reply_without_a_body_never_advances_the_sequence() {
-        assert_sequence(5, false, proto::status::OK, 5);
-        assert_sequence(5, false, 0x85, 5);
+        for rule in [
+            SequenceRule::Reference,
+            SequenceRule::CapturePendingKeepsSequence,
+        ] {
+            assert_sequence(rule, 5, false, proto::status::OK, 5);
+            assert_sequence(rule, 5, false, 0x85, 5);
+        }
     }
 
     #[test]

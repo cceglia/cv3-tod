@@ -9,8 +9,14 @@
 //! The finger wait is the exception: it is cancelled on timeout and its cancelled completion is
 //! reaped, so the interrupt endpoint is left with nothing pending. That is why [`NusbIo`] never
 //! marks itself poisoned on a finger timeout and still releases the interface normally.
+//!
+//! The finger wait is also the only transfer that watches for a shutdown request. When the probe
+//! is asked to stop, the wait is polled in short slices ([`CANCEL_POLL_MS`]); a raised flag
+//! cancels the transfer, reaps the cancelled completion and reports [`UsbError::Cancelled`], which
+//! the core turns into its own cancellation event and teardown. No command transfer takes this
+//! path: `out`, `read_interrupt` and `read_bulk` never look at the cancellation handle.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cv3_core::proto::{endpoint, timeout};
 use nusb::MaybeFuture;
@@ -20,7 +26,11 @@ use nusb::transfer::{Bulk, In, Interrupt, Out, TransferError};
 use crate::discovery::{FoundSensor, SensorDevice, UsbBackend};
 use crate::exchange::UsbIo;
 use crate::layout::{EndpointDescriptor, InterfaceDescriptor, TransferType};
+use crate::signals::SignalFlag;
 use crate::usb::UsbError;
+
+/// The longest a finger wait blocks before it checks for a shutdown request.
+pub const CANCEL_POLL_MS: u64 = 100;
 
 /// The sensor's USB backend.
 pub struct NusbBackend;
@@ -72,11 +82,15 @@ impl UsbBackend for NusbBackend {
         }))
     }
 
-    fn open_command(&mut self, sensor: &FoundSensor) -> Result<Box<dyn UsbIo>, UsbError> {
+    fn open_command(
+        &mut self,
+        sensor: &FoundSensor,
+        cancellation: Option<SignalFlag>,
+    ) -> Result<Box<dyn UsbIo>, UsbError> {
         let info = Self::matching_device(sensor)?;
         let device = info.open().wait().map_err(map_error)?;
         let interface = device.claim_interface(0).wait().map_err(map_error)?;
-        Ok(Box::new(NusbIo::new(interface)))
+        Ok(Box::new(NusbIo::new(interface, cancellation)))
     }
 }
 
@@ -142,13 +156,16 @@ impl SensorDevice for NusbDevice {
 pub struct NusbIo {
     interface: Option<nusb::Interface>,
     poisoned: bool,
+    /// Polled only by the finger wait, never by a command transfer.
+    cancellation: Option<SignalFlag>,
 }
 
 impl NusbIo {
-    pub fn new(interface: nusb::Interface) -> Self {
+    pub fn new(interface: nusb::Interface, cancellation: Option<SignalFlag>) -> Self {
         Self {
             interface: Some(interface),
             poisoned: false,
+            cancellation,
         }
     }
 
@@ -241,26 +258,81 @@ impl UsbIo for NusbIo {
             .map_err(map_error)?;
         let request = pipe.max_packet_size().max(1);
         pipe.submit(nusb::transfer::Buffer::new(request));
-        match pipe.wait_next_complete(wait) {
-            Some(completion) => {
-                completion.status.map_err(map_transfer)?;
-                Ok(completion.buffer[..completion.actual_len].to_vec())
-            }
-            None => {
-                // The finger wait is the only cancellable transfer. Cancel it and reap the
-                // cancelled completion, so nothing is left pending and the interface stays
-                // healthy; unlike a timed-out command, this never poisons the device.
-                pipe.cancel_all();
-                let deadline =
-                    std::time::Instant::now() + Duration::from_millis(timeout::TEARDOWN_MS as u64);
-                while pipe.pending() > 0 {
-                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    if remaining.is_zero() || pipe.wait_next_complete(remaining).is_none() {
-                        break;
-                    }
-                }
-                Err(UsbError::Timeout)
-            }
+        let mut transfer = InterruptTransfer { pipe };
+        wait_for_finger(&mut transfer, wait, self.cancellation.as_ref())
+    }
+}
+
+/// One submitted transfer that can be waited on in slices and cancelled.
+///
+/// This is the internal seam the polling logic is tested through: the real implementation wraps an
+/// nusb interrupt endpoint, the tests wrap a fake that raises a signal and hands back completions.
+trait PendingTransfer {
+    /// Waits at most `wait` for the next completion.
+    fn wait(&mut self, wait: Duration) -> Option<Result<Vec<u8>, UsbError>>;
+    /// Cancels every pending transfer; their completions still arrive and must be reaped.
+    fn cancel_all(&mut self);
+    /// How many transfers are still pending.
+    fn pending(&self) -> usize;
+}
+
+struct InterruptTransfer {
+    pipe: nusb::Endpoint<Interrupt, In>,
+}
+
+impl PendingTransfer for InterruptTransfer {
+    fn wait(&mut self, wait: Duration) -> Option<Result<Vec<u8>, UsbError>> {
+        self.pipe.wait_next_complete(wait).map(|completion| {
+            completion.status.map_err(map_transfer)?;
+            Ok(completion.buffer[..completion.actual_len].to_vec())
+        })
+    }
+
+    fn cancel_all(&mut self) {
+        self.pipe.cancel_all();
+    }
+
+    fn pending(&self) -> usize {
+        self.pipe.pending()
+    }
+}
+
+/// Waits for the finger event in short slices, cancelling and reaping when asked to stop.
+///
+/// The transfer is left running between slices: no cancellation happens until the flag is raised
+/// or the timeout expires. On either ending the cancelled completion is reaped, as the timeout path
+/// has always done, so the interface stays usable.
+fn wait_for_finger<T: PendingTransfer>(
+    transfer: &mut T,
+    wait: Duration,
+    cancellation: Option<&SignalFlag>,
+) -> Result<Vec<u8>, UsbError> {
+    let deadline = Instant::now() + wait;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let slice = remaining.min(Duration::from_millis(CANCEL_POLL_MS));
+        if let Some(result) = transfer.wait(slice) {
+            return result;
+        }
+        if cancellation.is_some_and(|flag| flag.get().is_some()) {
+            cancel_and_reap(transfer);
+            return Err(UsbError::Cancelled);
+        }
+        if remaining.is_zero() {
+            cancel_and_reap(transfer);
+            return Err(UsbError::Timeout);
+        }
+    }
+}
+
+/// Cancels the transfer and drains its cancelled completion, bounded by the teardown timeout.
+fn cancel_and_reap<T: PendingTransfer>(transfer: &mut T) {
+    transfer.cancel_all();
+    let deadline = Instant::now() + Duration::from_millis(timeout::TEARDOWN_MS as u64);
+    while transfer.pending() > 0 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || transfer.wait(remaining).is_none() {
+            break;
         }
     }
 }
@@ -298,6 +370,7 @@ fn map_transfer_type(transfer: NusbTransferType) -> TransferType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     #[test]
     fn transfer_failures_keep_their_distinct_meanings() {
@@ -319,5 +392,144 @@ mod tests {
             map_transfer_type(NusbTransferType::Interrupt),
             TransferType::Interrupt
         );
+    }
+
+    /// A submitted transfer whose completions are scripted, so the polling logic runs with no USB.
+    struct FakeTransfer {
+        completions: VecDeque<Option<Result<Vec<u8>, UsbError>>>,
+        pending: usize,
+        cancel_calls: usize,
+        waits: Vec<Duration>,
+        /// Raise `flag` on the 1-based wait number, as a signal arriving mid-wait would.
+        raise_on_wait: Option<(usize, SignalFlag)>,
+        /// The completion `cancel_all` makes available to be reaped.
+        cancelled: Option<Result<Vec<u8>, UsbError>>,
+    }
+
+    impl FakeTransfer {
+        fn empty(pending: usize) -> Self {
+            Self {
+                completions: VecDeque::new(),
+                pending,
+                cancel_calls: 0,
+                waits: Vec::new(),
+                raise_on_wait: None,
+                cancelled: None,
+            }
+        }
+
+        fn completing(result: Result<Vec<u8>, UsbError>) -> Self {
+            let mut transfer = Self::empty(1);
+            transfer.completions.push_back(Some(result));
+            transfer
+        }
+    }
+
+    impl PendingTransfer for FakeTransfer {
+        fn wait(&mut self, wait: Duration) -> Option<Result<Vec<u8>, UsbError>> {
+            self.waits.push(wait);
+            if let Some((at, flag)) = &self.raise_on_wait
+                && self.waits.len() == *at
+            {
+                flag.raise(signal_hook::consts::signal::SIGINT);
+            }
+            if let Some(next) = self.completions.pop_front() {
+                return next;
+            }
+            if let Some(completion) = self.cancelled.take() {
+                self.pending = 0;
+                return Some(completion);
+            }
+            None
+        }
+
+        fn cancel_all(&mut self) {
+            self.cancel_calls += 1;
+            if self.pending > 0 {
+                // A cancelled transfer still reports a completion; the wait must reap it.
+                self.cancelled = Some(Err(UsbError::Timeout));
+            }
+        }
+
+        fn pending(&self) -> usize {
+            self.pending
+        }
+    }
+
+    #[test]
+    fn a_finger_completion_is_returned_without_cancelling_anything() {
+        let mut transfer = FakeTransfer::completing(Ok(vec![0x03, 0, 0, 0]));
+
+        assert_eq!(
+            wait_for_finger(&mut transfer, Duration::from_millis(30_000), None),
+            Ok(vec![0x03, 0, 0, 0])
+        );
+        assert_eq!(transfer.cancel_calls, 0);
+        assert_eq!(
+            transfer.waits,
+            [Duration::from_millis(CANCEL_POLL_MS)],
+            "the wait blocks in short slices, not for the whole timeout"
+        );
+    }
+
+    #[test]
+    fn a_completion_after_one_empty_slice_is_not_cancelled() {
+        let mut transfer = FakeTransfer::empty(1);
+        transfer.completions.push_back(None);
+        transfer
+            .completions
+            .push_back(Some(Ok(vec![0x03, 0, 0, 0])));
+
+        assert_eq!(
+            wait_for_finger(&mut transfer, Duration::from_millis(30_000), None),
+            Ok(vec![0x03, 0, 0, 0])
+        );
+        assert_eq!(transfer.cancel_calls, 0, "no flag, no cancellation");
+        assert_eq!(transfer.waits.len(), 2);
+    }
+
+    #[test]
+    fn a_signal_before_the_wait_cancels_the_transfer_and_reaps_it() {
+        let flag = SignalFlag::new();
+        flag.raise(signal_hook::consts::signal::SIGINT);
+        let mut transfer = FakeTransfer::empty(1);
+
+        assert_eq!(
+            wait_for_finger(&mut transfer, Duration::from_millis(30_000), Some(&flag)),
+            Err(UsbError::Cancelled)
+        );
+        assert_eq!(transfer.cancel_calls, 1, "the transfer is cancelled once");
+        assert_eq!(transfer.pending(), 0, "the cancelled completion was reaped");
+    }
+
+    #[test]
+    fn a_signal_during_a_slice_cancels_after_that_slice_and_not_before() {
+        let flag = SignalFlag::new();
+        let mut transfer = FakeTransfer::empty(1);
+        transfer.raise_on_wait = Some((1, flag.clone()));
+
+        assert_eq!(
+            wait_for_finger(&mut transfer, Duration::from_millis(30_000), Some(&flag)),
+            Err(UsbError::Cancelled)
+        );
+        assert_eq!(
+            transfer.waits[0],
+            Duration::from_millis(CANCEL_POLL_MS),
+            "the flag is polled at the slice boundary, not before the transfer"
+        );
+        assert_eq!(transfer.cancel_calls, 1);
+        assert_eq!(transfer.pending(), 0);
+    }
+
+    #[test]
+    fn no_completion_and_no_signal_is_a_timeout_that_still_reaps() {
+        let mut transfer = FakeTransfer::empty(1);
+
+        assert_eq!(
+            wait_for_finger(&mut transfer, Duration::from_millis(1), None),
+            Err(UsbError::Timeout)
+        );
+        assert_eq!(transfer.cancel_calls, 1);
+        assert_eq!(transfer.pending(), 0, "the cancelled completion was reaped");
     }
 }

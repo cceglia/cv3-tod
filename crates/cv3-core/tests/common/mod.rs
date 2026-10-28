@@ -137,6 +137,11 @@ pub fn capture_tlv(handle: u32) -> [u8; 36] {
 
 /// The exact wrapped `0x66` frame a capture must send for `session`.
 pub fn arm_frame(session: &Session, iv: &[u8; 16]) -> Vec<u8> {
+    arm_frame_at(session, iv, session.next_sequence())
+}
+
+/// The exact wrapped `0x66` frame for `session` at an explicit wrap sequence.
+pub fn arm_frame_at(session: &Session, iv: &[u8; 16], sequence: u32) -> Vec<u8> {
     session
         .wrap(
             cmd::ARM_CAPTURE,
@@ -144,7 +149,7 @@ pub fn arm_frame(session: &Session, iv: &[u8; 16]) -> Vec<u8> {
             &capture_tlv(session.handle),
             80,
             iv,
-            session.next_sequence(),
+            sequence,
         )
         .expect("the capture constants build a frame")
 }

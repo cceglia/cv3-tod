@@ -11,7 +11,7 @@ use cv3_core::proto::{attr, cmd, interrupt};
 use crate::discovery::{FoundSensor, SensorDevice, UsbBackend, UsbError};
 use crate::exchange::{ANNOUNCEMENT_LEN, Reply, UsbIo};
 use crate::layout::{EndpointDescriptor, InterfaceDescriptor, TransferType};
-use crate::signals::SignalFlag;
+use crate::signals::{Shutdown, SignalFlag};
 
 /// The sensor the ticket's hardware reports: bus 3, port 8.
 pub fn sensor() -> FoundSensor {
@@ -69,6 +69,8 @@ pub struct FakeUsb {
     pub close_body: Option<Vec<u8>>,
     /// Status the scripted sensor answers the wrapped `0x66` arm with.
     pub arm_status: u32,
+    /// Per-arm statuses consumed in order before falling back to `arm_status`.
+    pub arm_statuses: Vec<u32>,
     /// If set, the decrypted plaintext of the `0x66` reply; by default it carries `SAMPLE_HASH`.
     pub arm_plaintext: Option<Vec<u8>>,
     /// If set, the scripted sensor fails the wrapped `0x66` command in the transport.
@@ -104,6 +106,10 @@ pub struct FakeUsb {
     pub match_command_error: Option<UsbError>,
     /// What the finger wait delivers. `None` is a genuine `0x03` finger event.
     pub finger_event: Option<Result<Vec<u8>, UsbError>>,
+    /// Raised when the scripted sensor sends the `0x24` response, as a signal mid-command would be.
+    pub signal_during_command: Option<SignalFlag>,
+    /// Raised when the finger wait starts, as a signal mid-wait would be.
+    pub signal_during_finger: Option<SignalFlag>,
     pub sent: Rc<RefCell<Vec<Vec<u8>>>>,
     log: Rc<RefCell<Vec<&'static str>>>,
 }
@@ -128,6 +134,7 @@ impl Default for FakeUsb {
             close_command_error: None,
             close_body: None,
             arm_status: 0,
+            arm_statuses: Vec::new(),
             arm_plaintext: None,
             arm_command_error: None,
             cancel_command_error: None,
@@ -145,6 +152,8 @@ impl Default for FakeUsb {
             match_plaintext: None,
             match_command_error: None,
             finger_event: None,
+            signal_during_command: None,
+            signal_during_finger: None,
             sent: Rc::new(RefCell::new(Vec::new())),
             log: Rc::new(RefCell::new(Vec::new())),
         }
@@ -195,7 +204,11 @@ impl UsbBackend for FakeUsb {
         }))
     }
 
-    fn open_command(&mut self, _sensor: &FoundSensor) -> Result<Box<dyn UsbIo>, UsbError> {
+    fn open_command(
+        &mut self,
+        _sensor: &FoundSensor,
+        cancellation: Option<SignalFlag>,
+    ) -> Result<Box<dyn UsbIo>, UsbError> {
         self.record("open-command");
         if let Some(error) = &self.open_error {
             return Err(error.clone());
@@ -210,6 +223,7 @@ impl UsbBackend for FakeUsb {
             close_command_error: self.close_command_error.clone(),
             close_body: self.close_body.clone(),
             arm_status: self.arm_status,
+            arm_statuses: self.arm_statuses.clone(),
             arm_plaintext: self.arm_plaintext.clone(),
             arm_command_error: self.arm_command_error.clone(),
             cancel_command_error: self.cancel_command_error.clone(),
@@ -228,6 +242,9 @@ impl UsbBackend for FakeUsb {
             match_command_error: self.match_command_error.clone(),
             accepted_updates: 0,
             finger_event: self.finger_event.clone(),
+            signal_during_command: self.signal_during_command.clone(),
+            signal_during_finger: self.signal_during_finger.clone(),
+            cancellation,
             session_key: None,
             pending: None,
         }))
@@ -335,6 +352,7 @@ pub struct HandshakeSensor {
     pub close_command_error: Option<UsbError>,
     pub close_body: Option<Vec<u8>>,
     pub arm_status: u32,
+    pub arm_statuses: Vec<u32>,
     pub arm_plaintext: Option<Vec<u8>>,
     pub arm_command_error: Option<UsbError>,
     pub cancel_command_error: Option<UsbError>,
@@ -353,6 +371,10 @@ pub struct HandshakeSensor {
     pub match_command_error: Option<UsbError>,
     pub accepted_updates: usize,
     pub finger_event: Option<Result<Vec<u8>, UsbError>>,
+    pub signal_during_command: Option<SignalFlag>,
+    pub signal_during_finger: Option<SignalFlag>,
+    /// The handle the CLI threaded in; a raised flag makes the finger wait report cancellation.
+    pub cancellation: Option<SignalFlag>,
     pub session_key: Option<[u8; 16]>,
     pending: Option<Reply>,
 }
@@ -401,7 +423,12 @@ impl HandshakeSensor {
         body
     }
 
-    fn arm_reply(&self) -> Reply {
+    fn arm_reply(&mut self) -> Reply {
+        let command_status = if self.arm_statuses.is_empty() {
+            self.arm_status
+        } else {
+            self.arm_statuses.remove(0)
+        };
         let plaintext = self.arm_plaintext.clone().unwrap_or_else(|| {
             let mut plaintext = vec![0u8; 28];
             plaintext[4..8].copy_from_slice(&20u32.to_le_bytes());
@@ -410,7 +437,7 @@ impl HandshakeSensor {
         });
         Reply {
             status: 0,
-            body: self.wrapped_body(cmd::ARM_CAPTURE, attr::CAPTURE, self.arm_status, &plaintext),
+            body: self.wrapped_body(cmd::ARM_CAPTURE, attr::CAPTURE, command_status, &plaintext),
         }
     }
 
@@ -547,7 +574,12 @@ impl UsbIo for HandshakeSensor {
             frame.get(9).copied().unwrap_or(0),
         ]);
         match command {
-            cmd::CHALLENGE_RESPONSE => self.derive_session_key(frame),
+            cmd::CHALLENGE_RESPONSE => {
+                self.derive_session_key(frame);
+                if let Some(flag) = &self.signal_during_command {
+                    flag.raise(signal_hook::consts::signal::SIGINT);
+                }
+            }
             cmd::OPEN_SESSION => {
                 if let Some(error) = &self.open_command_error {
                     return Err(error.clone());
@@ -607,6 +639,18 @@ impl UsbIo for HandshakeSensor {
     }
 
     fn read_finger(&mut self, _timeout: Duration) -> Result<Vec<u8>, UsbError> {
+        if let Some(flag) = &self.signal_during_finger {
+            flag.raise(signal_hook::consts::signal::SIGINT);
+        }
+        if self
+            .cancellation
+            .as_ref()
+            .and_then(Shutdown::signalled)
+            .is_some()
+        {
+            // The real transport polls the same handle in slices and returns Cancelled.
+            return Err(UsbError::Cancelled);
+        }
         match self.finger_event.clone() {
             Some(result) => result,
             None => Ok(interrupt::FINGER.to_le_bytes().to_vec()),

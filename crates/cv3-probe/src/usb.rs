@@ -11,6 +11,10 @@ pub enum UsbError {
     Disconnected,
     Timeout,
     Stall,
+    /// The finger wait was abandoned because the process was asked to stop.
+    ///
+    /// Only the finger wait can produce this: a command transfer is never cancelled.
+    Cancelled,
     Other(String),
 }
 
@@ -23,6 +27,7 @@ impl fmt::Display for UsbError {
             Self::Disconnected => f.write_str("device disconnected"),
             Self::Timeout => f.write_str("transfer timed out"),
             Self::Stall => f.write_str("endpoint stalled"),
+            Self::Cancelled => f.write_str("finger wait cancelled by a shutdown signal"),
             Self::Other(message) => f.write_str(message),
         }
     }

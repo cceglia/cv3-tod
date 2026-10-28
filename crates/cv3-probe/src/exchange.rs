@@ -39,8 +39,8 @@ pub trait UsbIo {
     /// Reads one event from the interrupt endpoint, waiting at most `timeout`.
     ///
     /// This is the finger wait, and the only transfer the protocol allows to be cancelled: an
-    /// implementation cancels it on timeout and reaps the cancelled completion, so the interface
-    /// stays usable. A command transfer must never take this path.
+    /// implementation cancels it on timeout or on a shutdown request, and reaps the cancelled
+    /// completion, so the interface stays usable. A command transfer must never take this path.
     fn read_finger(&mut self, timeout: Duration) -> Result<Vec<u8>, UsbError>;
 }
 

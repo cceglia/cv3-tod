@@ -60,6 +60,24 @@ exiting. `verify` prints `match` or `no match`, the 20-byte value (or `value abs
 length and the decrypted plaintext length, then runs the same teardown. The value's meaning is not
 established, and `verify` does not yet compare it with anything: ticket 10 owns id binding.
 
+`cvctl cancel-then-verify` owns one session and runs the sequence that settles the wrap-sequence
+question: it arms a capture, cancels it with the mid-session `0x68` before any finger, then runs a
+full verification in the same session and prints its verdict the way `verify` does. An arm that
+answers `0x85` is consumed, cancelled and re-armed, which is the case the two readings of the rule
+disagree about. See `docs/protocol-notes.md`.
+
+A catchable signal (`SIGINT`, `SIGTERM`, `SIGHUP`) during the finger wait cancels that transfer,
+tears the session down (`0x68`, then `0x04`) and exits `128 + signal`; command transfers are never
+cancelled. `docs/recovery.md` is the operator's ladder for a sensor that an external kill did wedge.
+
+## Documentation
+
+| Path | What it is |
+|---|---|
+| `docs/protocol-notes.md` | Protocol facts: what was measured, what is only read from the reference, and the wrap-sequence question. |
+| `docs/recovery.md` | The recovery ladder for a wedged sensor, and what the driver does on failure. |
+| `GLOSSARY.md` | The project's vocabulary. Read it before naming anything. |
+
 ## Licence
 
 MIT. See `NOTICE` for attribution: the protocol was reverse-engineered by others, and their
