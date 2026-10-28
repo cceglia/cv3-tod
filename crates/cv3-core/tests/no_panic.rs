@@ -14,6 +14,7 @@ fn exercise(bytes: &[u8]) {
     let _ = frame::validate(bytes);
     let key = SessionKey::from_bytes([0x5a; 16]);
     let _ = key.unwrap(bytes);
+    let _ = cv3_core::capture::find_tlv_value(bytes, 20);
     let _ = Transcript::from_bytes(bytes);
 }
 

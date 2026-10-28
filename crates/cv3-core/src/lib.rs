@@ -17,6 +17,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod capture;
 pub mod crypto;
 pub mod event;
 pub mod frame;
@@ -27,11 +28,16 @@ pub mod session;
 pub mod transcript;
 pub mod transport;
 
+pub use capture::{
+    CAPTURE_PLAINTEXT_LEN, CAPTURE_TLV_LEN, Capture, CaptureError, CapturedSample, SAMPLE_HASH_LEN,
+    capture_tlv, find_tlv_value,
+};
 pub use event::{Action, Event, TransportError};
 pub use handshake::{Handshake, HandshakeError};
 pub use operation::Operation;
 pub use session::{
-    CloseError, CloseSession, OpenError, OpenSession, Session, SessionKey, UnwrapError, WrapError,
+    CloseError, CloseSession, OpenError, OpenSession, Session, SessionKey, Teardown, TeardownError,
+    UnwrapError, WrapError,
 };
 pub use transcript::{
     Divergence, FrameKey, RecordingTransport, ReplayTransport, Transcript, TranscriptError,

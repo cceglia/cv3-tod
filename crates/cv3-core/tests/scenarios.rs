@@ -1,18 +1,22 @@
 //! End-to-end core scenarios driven through the scripted transport.
 //!
 //! These tests assert the exact frames an operation asks to send and the outcome it reports. They
-//! cover the operations that exist: the handshake, open and close. The biometric scenarios in the
-//! SPEC's testing decisions belong to the tickets that build those operations.
+//! cover the operations that exist: the handshake, open, close and capture. The remaining biometric
+//! scenarios in the SPEC's testing decisions belong to the tickets that build those operations.
 
 mod common;
 
 use common::{
-    HANDLE, challenge_frame, challenge_reply, client_nonce, fixed_iv, host_key, host_nonce,
-    open_reply, response_frame, response_reply,
+    HANDLE, SAMPLE_HASH, arm_frame, capture_reply, challenge_frame, challenge_reply, client_nonce,
+    fixed_iv, host_key, host_nonce, open_reply, opened_session, response_frame, response_reply,
+    sample_hash_plaintext,
 };
-use cv3_core::frame;
+use cv3_core::capture::{Capture, CaptureError};
+use cv3_core::frame::{self, FrameError};
 use cv3_core::proto::{attr, cmd};
-use cv3_core::session::{CloseSession, OPEN_PLAINTEXT_LEN, OPEN_TLV, OpenError, OpenSession};
+use cv3_core::session::{
+    CloseSession, OPEN_PLAINTEXT_LEN, OPEN_TLV, OpenError, OpenSession, Teardown, UnwrapError,
+};
 use cv3_core::transport::{ScriptedOutcome, ScriptedTransport, run};
 use cv3_core::{Event, Handshake, HandshakeError, TransportError};
 
@@ -341,4 +345,286 @@ fn a_finger_event_is_never_confused_with_a_command_reply() {
         Err(HandshakeError::UnexpectedEvent)
     );
     transport.assert_sent(&[challenge_frame()]);
+}
+
+/// The two replies a failed capture's best-effort teardown consumes.
+fn teardown_replies() -> [ScriptedOutcome; 2] {
+    [
+        ScriptedOutcome::ReplyWithoutBody,
+        ScriptedOutcome::ReplyWithoutBody,
+    ]
+}
+
+#[test]
+fn a_capture_arms_at_the_next_sequence_waits_and_returns_the_sample_hash() {
+    let mut transport = ScriptedTransport::default();
+    let session = opened_session(&mut transport);
+    assert_eq!(transport.sent().len(), 3, "handshake and open only");
+    let expected_arm = arm_frame(&session, &fixed_iv());
+
+    transport.push(ScriptedOutcome::Reply {
+        status: 0,
+        body: capture_reply(&session, 0, &sample_hash_plaintext()),
+    });
+    transport.push(ScriptedOutcome::Finger);
+    let mut capture = Capture::new(session, fixed_iv());
+
+    let captured = run(&mut capture, &mut transport).expect("the finger was read");
+    assert_eq!(captured.sample_hash, SAMPLE_HASH);
+    assert_eq!(captured.session.handle, HANDLE);
+    assert_eq!(
+        captured.session.next_sequence(),
+        2,
+        "0x02 consumed zero and the 0x66 reply consumed one"
+    );
+
+    transport.push(ScriptedOutcome::ReplyWithoutBody);
+    transport.push(ScriptedOutcome::ReplyWithoutBody);
+    let handle = captured.session.handle;
+    drop(captured.session);
+    let mut teardown = Teardown::new(handle);
+    assert_eq!(run(&mut teardown, &mut transport), Ok(()));
+
+    let sent = transport.sent();
+    assert_eq!(sent.len(), 6);
+    assert_eq!(sent[3], expected_arm, "0x66 at the session's next sequence");
+    assert_eq!(sent[4], frame::build_cancel_capture(HANDLE));
+    assert_eq!(sent[5], frame::build_close_handle(HANDLE));
+    transport.assert_exhausted();
+}
+
+#[test]
+fn a_capture_pending_reply_is_its_own_outcome_and_tears_down() {
+    let mut transport = ScriptedTransport::default();
+    let session = opened_session(&mut transport);
+    let expected_arm = arm_frame(&session, &fixed_iv());
+
+    transport.push(ScriptedOutcome::Reply {
+        status: 0x85,
+        body: capture_reply(&session, 0x85, &[0u8; 28]),
+    });
+    transport.push(teardown_replies()[0].clone());
+    transport.push(teardown_replies()[1].clone());
+    let mut capture = Capture::new(session, fixed_iv());
+
+    assert_eq!(
+        run(&mut capture, &mut transport),
+        Err(CaptureError::AlreadyPending)
+    );
+
+    let sent = transport.sent();
+    assert_eq!(sent.len(), 6);
+    assert_eq!(sent[3], expected_arm);
+    assert_eq!(sent[4], frame::build_cancel_capture(HANDLE));
+    assert_eq!(sent[5], frame::build_close_handle(HANDLE));
+    transport.assert_exhausted();
+}
+
+#[test]
+fn a_zero_status_reply_without_a_sample_hash_is_its_own_outcome() {
+    let mut transport = ScriptedTransport::default();
+    let session = opened_session(&mut transport);
+
+    transport.push(ScriptedOutcome::Reply {
+        status: 0,
+        body: capture_reply(&session, 0, &[0u8; 28]),
+    });
+    transport.push(teardown_replies()[0].clone());
+    transport.push(teardown_replies()[1].clone());
+    let mut capture = Capture::new(session, fixed_iv());
+
+    assert_eq!(
+        run(&mut capture, &mut transport),
+        Err(CaptureError::NoSampleHash)
+    );
+    let sent = transport.sent();
+    assert_eq!(sent[4], frame::build_cancel_capture(HANDLE));
+    assert_eq!(sent[5], frame::build_close_handle(HANDLE));
+    transport.assert_exhausted();
+}
+
+#[test]
+fn a_finger_timeout_is_distinct_and_tears_down() {
+    let mut transport = ScriptedTransport::default();
+    let session = opened_session(&mut transport);
+
+    transport.push(ScriptedOutcome::Reply {
+        status: 0,
+        body: capture_reply(&session, 0, &sample_hash_plaintext()),
+    });
+    transport.push(ScriptedOutcome::Transport(TransportError::Timeout));
+    transport.push(teardown_replies()[0].clone());
+    transport.push(teardown_replies()[1].clone());
+    let mut capture = Capture::new(session, fixed_iv());
+
+    assert_eq!(
+        run(&mut capture, &mut transport),
+        Err(CaptureError::FingerTimeout)
+    );
+    let sent = transport.sent();
+    assert_eq!(sent[4], frame::build_cancel_capture(HANDLE));
+    assert_eq!(sent[5], frame::build_close_handle(HANDLE));
+    transport.assert_exhausted();
+}
+
+#[test]
+fn a_transport_failure_at_the_arm_is_distinct_and_tears_down() {
+    let mut transport = ScriptedTransport::default();
+    let session = opened_session(&mut transport);
+
+    transport.push(ScriptedOutcome::Transport(TransportError::Disconnected));
+    transport.push(teardown_replies()[0].clone());
+    transport.push(teardown_replies()[1].clone());
+    let mut capture = Capture::new(session, fixed_iv());
+
+    assert_eq!(
+        run(&mut capture, &mut transport),
+        Err(CaptureError::Transport(TransportError::Disconnected))
+    );
+    let sent = transport.sent();
+    assert_eq!(sent[4], frame::build_cancel_capture(HANDLE));
+    assert_eq!(sent[5], frame::build_close_handle(HANDLE));
+    transport.assert_exhausted();
+}
+
+#[test]
+fn a_transport_failure_reading_the_arm_reply_is_reported_and_tears_down() {
+    let mut transport = ScriptedTransport::default();
+    let session = opened_session(&mut transport);
+
+    transport.push(ScriptedOutcome::Transport(TransportError::Other(
+        "reply read failed".to_owned(),
+    )));
+    transport.push(teardown_replies()[0].clone());
+    transport.push(teardown_replies()[1].clone());
+    let mut capture = Capture::new(session, fixed_iv());
+
+    assert_eq!(
+        run(&mut capture, &mut transport),
+        Err(CaptureError::Transport(TransportError::Other(
+            "reply read failed".to_owned()
+        )))
+    );
+    let sent = transport.sent();
+    assert_eq!(sent[4], frame::build_cancel_capture(HANDLE));
+    assert_eq!(sent[5], frame::build_close_handle(HANDLE));
+    transport.assert_exhausted();
+}
+
+#[test]
+fn a_transport_failure_at_the_finger_wait_is_not_a_finger_timeout() {
+    let mut transport = ScriptedTransport::default();
+    let session = opened_session(&mut transport);
+
+    transport.push(ScriptedOutcome::Reply {
+        status: 0,
+        body: capture_reply(&session, 0, &sample_hash_plaintext()),
+    });
+    transport.push(ScriptedOutcome::Transport(TransportError::Disconnected));
+    transport.push(teardown_replies()[0].clone());
+    transport.push(teardown_replies()[1].clone());
+    let mut capture = Capture::new(session, fixed_iv());
+
+    assert_eq!(
+        run(&mut capture, &mut transport),
+        Err(CaptureError::Transport(TransportError::Disconnected))
+    );
+    transport.assert_exhausted();
+}
+
+#[test]
+fn a_cancelled_finger_wait_is_distinct_and_tears_down() {
+    let mut transport = ScriptedTransport::default();
+    let session = opened_session(&mut transport);
+
+    transport.push(ScriptedOutcome::Reply {
+        status: 0,
+        body: capture_reply(&session, 0, &sample_hash_plaintext()),
+    });
+    transport.push(ScriptedOutcome::Cancelled);
+    transport.push(teardown_replies()[0].clone());
+    transport.push(teardown_replies()[1].clone());
+    let mut capture = Capture::new(session, fixed_iv());
+
+    assert_eq!(
+        run(&mut capture, &mut transport),
+        Err(CaptureError::Cancelled)
+    );
+    transport.assert_exhausted();
+}
+
+#[test]
+fn a_short_arm_reply_is_malformed_and_does_not_panic() {
+    let mut transport = ScriptedTransport::default();
+    let session = opened_session(&mut transport);
+
+    transport.push(ScriptedOutcome::Reply {
+        status: 0,
+        body: vec![0u8; 10],
+    });
+    transport.push(teardown_replies()[0].clone());
+    transport.push(teardown_replies()[1].clone());
+    let mut capture = Capture::new(session, fixed_iv());
+
+    assert!(matches!(
+        run(&mut capture, &mut transport),
+        Err(CaptureError::MalformedReply(UnwrapError::Frame(
+            FrameError::Short { .. }
+        )))
+    ));
+    transport.assert_exhausted();
+}
+
+#[test]
+fn an_oversized_arm_reply_is_malformed_and_does_not_panic() {
+    let mut transport = ScriptedTransport::default();
+    let session = opened_session(&mut transport);
+
+    let oversized = frame::build_wrapped(
+        cmd::ARM_CAPTURE,
+        attr::CAPTURE,
+        HANDLE,
+        &fixed_iv(),
+        0,
+        &vec![0u8; 4_112],
+    );
+    transport.push(ScriptedOutcome::Reply {
+        status: 0,
+        body: oversized,
+    });
+    transport.push(teardown_replies()[0].clone());
+    transport.push(teardown_replies()[1].clone());
+    let mut capture = Capture::new(session, fixed_iv());
+
+    assert!(matches!(
+        run(&mut capture, &mut transport),
+        Err(CaptureError::MalformedReply(
+            UnwrapError::CiphertextTooLarge { .. }
+        ))
+    ));
+    transport.assert_exhausted();
+}
+
+#[test]
+fn a_reply_where_the_finger_was_expected_is_unexpected_and_tears_down() {
+    let mut transport = ScriptedTransport::default();
+    let session = opened_session(&mut transport);
+
+    transport.push(ScriptedOutcome::Reply {
+        status: 0,
+        body: capture_reply(&session, 0, &sample_hash_plaintext()),
+    });
+    transport.push(ScriptedOutcome::ReplyWithoutBody);
+    transport.push(teardown_replies()[0].clone());
+    transport.push(teardown_replies()[1].clone());
+    let mut capture = Capture::new(session, fixed_iv());
+
+    assert_eq!(
+        run(&mut capture, &mut transport),
+        Err(CaptureError::UnexpectedEvent)
+    );
+    let sent = transport.sent();
+    assert_eq!(sent[4], frame::build_cancel_capture(HANDLE));
+    assert_eq!(sent[5], frame::build_close_handle(HANDLE));
+    transport.assert_exhausted();
 }

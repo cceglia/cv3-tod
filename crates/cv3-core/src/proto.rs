@@ -87,6 +87,13 @@ pub mod endpoint {
     pub const INTERRUPT: u8 = 0x85;
 }
 
+/// Event values the sensor signals on the interrupt endpoint after a command announces a zero-length
+/// reply, as the finger wait does.
+pub mod interrupt {
+    /// The sensor read the finger that was armed.
+    pub const FINGER: u32 = 0x03;
+}
+
 /// Vendor and product of the only sensor this driver claims.
 pub const VENDOR_ID: u16 = 0x0a5c;
 pub const PRODUCT_ID: u16 = 0x5843;

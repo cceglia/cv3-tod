@@ -6,11 +6,13 @@
 //! the interrupt announcement's status word), an empty announcement becomes
 //! [`Event::ReplyWithoutBody`], and a USB failure becomes [`Event::Transport`].
 //!
-//! The finger wait is the one action the handshake never asks for. Capture will supply the real
-//! interrupt wait; until then a wait is answered with [`Event::Cancelled`], which makes the core
-//! tear down rather than hang. Command transfers are never cancelled.
+//! The finger wait reads the interrupt endpoint separately from a command's announcement: the
+//! event value `0x03` becomes [`Event::Finger`], any other value is a typed unexpected-event
+//! transport failure, and a timeout is [`Event::Transport`] carrying [`TransportError::Timeout`].
+//! That is the only transfer the probe cancels; a command transfer never is.
 
 use cv3_core::frame::Header;
+use cv3_core::proto::interrupt;
 use cv3_core::transport::Transport;
 use cv3_core::{Event, TransportError};
 
@@ -26,7 +28,13 @@ impl Transport for Exchange<'_> {
     }
 
     fn wait_finger(&mut self) -> Event {
-        Event::Cancelled
+        match Exchange::wait_finger(self) {
+            Ok(interrupt::FINGER) => Event::Finger,
+            Ok(other) => Event::Transport(TransportError::Other(format!(
+                "unexpected interrupt event {other:#04x} where a finger event was expected"
+            ))),
+            Err(error) => Event::Transport(transport_error(error)),
+        }
     }
 }
 
@@ -51,7 +59,8 @@ pub fn transport_error(error: ExchangeError) -> TransportError {
     match error {
         ExchangeError::Out(error)
         | ExchangeError::Interrupt(error)
-        | ExchangeError::Bulk(error) => map_usb(error),
+        | ExchangeError::Bulk(error)
+        | ExchangeError::Finger(error) => map_usb(error),
         other => TransportError::Other(other.to_string()),
     }
 }
@@ -81,6 +90,7 @@ mod tests {
     /// A transport that answers each command with the next scripted reply.
     struct ScriptedIo {
         replies: VecDeque<Result<Reply, ExchangeError>>,
+        finger: Option<Result<Vec<u8>, UsbError>>,
         current: Option<Reply>,
     }
 
@@ -88,8 +98,14 @@ mod tests {
         fn replies(replies: Vec<Result<Reply, ExchangeError>>) -> Self {
             Self {
                 replies: replies.into(),
+                finger: None,
                 current: None,
             }
+        }
+
+        fn with_finger(mut self, finger: Result<Vec<u8>, UsbError>) -> Self {
+            self.finger = Some(finger);
+            self
         }
     }
 
@@ -120,7 +136,11 @@ mod tests {
             Ok(self.current.as_ref().expect("out ran first").body.clone())
         }
 
-        fn cancel_finger_wait(&mut self) {}
+        fn read_finger(&mut self, _timeout: Duration) -> Result<Vec<u8>, UsbError> {
+            self.finger
+                .clone()
+                .unwrap_or_else(|| Ok(interrupt::FINGER.to_le_bytes().to_vec()))
+        }
     }
 
     /// Sends one frame, then reports the event it received.
@@ -141,6 +161,25 @@ mod tests {
     fn drive(io: &mut ScriptedIo) -> Event {
         let mut exchange = Exchange::new(io);
         run(&mut SingleStep, &mut exchange)
+    }
+
+    /// An operation whose only action is the finger wait; it reports the event it receives.
+    struct FingerWaitOnly;
+
+    impl Operation for FingerWaitOnly {
+        type Output = Event;
+
+        fn start(&mut self) -> Action<Event> {
+            Action::WaitFinger
+        }
+
+        fn step(&mut self, event: Event) -> Action<Event> {
+            Action::Finish(event)
+        }
+    }
+
+    fn drive_finger_wait(io: &mut ScriptedIo) -> Event {
+        run(&mut FingerWaitOnly, &mut Exchange::new(io))
     }
 
     fn body_with_status(status: u32) -> Vec<u8> {
@@ -222,14 +261,44 @@ mod tests {
     }
 
     #[test]
-    fn a_finger_wait_is_refused_until_capture_exists() {
+    fn a_finger_event_becomes_the_core_finger_event() {
         let mut io = ScriptedIo::replies(Vec::new());
-        let mut exchange = Exchange::new(&mut io);
+        assert_eq!(drive_finger_wait(&mut io), Event::Finger);
+    }
+
+    #[test]
+    fn another_interrupt_value_is_a_typed_unexpected_event() {
+        let mut io =
+            ScriptedIo::replies(Vec::new()).with_finger(Ok(0x07u32.to_le_bytes().to_vec()));
+
+        match drive_finger_wait(&mut io) {
+            Event::Transport(TransportError::Other(message)) => {
+                assert!(message.contains("0x07"), "{message}");
+                assert!(message.contains("finger"), "{message}");
+            }
+            other => panic!("expected a typed transport error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_finger_timeout_is_the_transport_timeout_event() {
+        let mut io = ScriptedIo::replies(Vec::new()).with_finger(Err(UsbError::Timeout));
 
         assert_eq!(
-            exchange.wait_finger(),
-            Event::Cancelled,
-            "an unexpected finger wait must tear down rather than hang"
+            drive_finger_wait(&mut io),
+            Event::Transport(TransportError::Timeout)
         );
+    }
+
+    #[test]
+    fn a_short_finger_event_is_reported_not_panicked() {
+        let mut io = ScriptedIo::replies(Vec::new()).with_finger(Ok(vec![0x03, 0x00]));
+
+        match drive_finger_wait(&mut io) {
+            Event::Transport(TransportError::Other(message)) => {
+                assert!(message.contains("finger event"), "{message}");
+            }
+            other => panic!("expected a typed transport error, got {other:?}"),
+        }
     }
 }

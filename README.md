@@ -36,6 +36,24 @@ cargo build --release
 The probe drives the sensor through the kernel's USB device nodes and therefore runs as root.
 `cv3-tod` additionally needs `libfprint-2-tod-dev`.
 
+## `cvctl` exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | success |
+| 1 | any error without a more specific code, including a usage line |
+| 2 | sensor `0a5c:5843` not found |
+| 3 | sensor busy: another process holds interface 0 |
+| 4 | permission denied opening the sensor |
+| 5 | the sensor rejected the wrap sequence (`0x0F`) |
+| 6 | a replay diverged from its transcript |
+| 7 | `capture` found a capture already armed (`0x85`); the session was torn down |
+| 8 | `capture` timed out waiting for the finger; the session was torn down |
+| 128 + signal | interrupted by a catchable signal (for example 130 for `SIGINT`) |
+
+`capture` prints the sample hash on success and always runs the cancel-then-close teardown before
+exiting.
+
 ## Licence
 
 MIT. See `NOTICE` for attribution: the protocol was reverse-engineered by others, and their

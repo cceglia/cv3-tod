@@ -4,8 +4,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
+use cv3_core::crypto;
 use cv3_core::frame;
-use cv3_core::proto::{attr, cmd};
+use cv3_core::proto::{attr, cmd, interrupt};
 
 use crate::discovery::{FoundSensor, SensorDevice, UsbBackend, UsbError};
 use crate::exchange::{ANNOUNCEMENT_LEN, Reply, UsbIo};
@@ -66,6 +67,16 @@ pub struct FakeUsb {
     pub close_command_error: Option<UsbError>,
     /// If set, the scripted sensor answers `0x04` with this body instead of no body.
     pub close_body: Option<Vec<u8>>,
+    /// Status the scripted sensor answers the wrapped `0x66` arm with.
+    pub arm_status: u32,
+    /// If set, the decrypted plaintext of the `0x66` reply; by default it carries `SAMPLE_HASH`.
+    pub arm_plaintext: Option<Vec<u8>>,
+    /// If set, the scripted sensor fails the wrapped `0x66` command in the transport.
+    pub arm_command_error: Option<UsbError>,
+    /// If set, the scripted sensor fails the sessionless `0x68` command in the transport.
+    pub cancel_command_error: Option<UsbError>,
+    /// What the finger wait delivers. `None` is a genuine `0x03` finger event.
+    pub finger_event: Option<Result<Vec<u8>, UsbError>>,
     pub sent: Rc<RefCell<Vec<Vec<u8>>>>,
     log: Rc<RefCell<Vec<&'static str>>>,
 }
@@ -89,6 +100,11 @@ impl Default for FakeUsb {
             open_command_error: None,
             close_command_error: None,
             close_body: None,
+            arm_status: 0,
+            arm_plaintext: None,
+            arm_command_error: None,
+            cancel_command_error: None,
+            finger_event: None,
             sent: Rc::new(RefCell::new(Vec::new())),
             log: Rc::new(RefCell::new(Vec::new())),
         }
@@ -153,6 +169,12 @@ impl UsbBackend for FakeUsb {
             open_command_error: self.open_command_error.clone(),
             close_command_error: self.close_command_error.clone(),
             close_body: self.close_body.clone(),
+            arm_status: self.arm_status,
+            arm_plaintext: self.arm_plaintext.clone(),
+            arm_command_error: self.arm_command_error.clone(),
+            cancel_command_error: self.cancel_command_error.clone(),
+            finger_event: self.finger_event.clone(),
+            session_key: None,
             pending: None,
         }))
     }
@@ -224,8 +246,19 @@ pub const DEVICE_PUBLIC: [u8; 64] = [
     0x2b, 0xce, 0x33, 0x57, 0x6b, 0x31, 0x5e, 0xce, 0xcb, 0xb6, 0x40, 0x68, 0x37, 0xbf, 0x51, 0xf5,
 ];
 
-/// A scripted sensor that answers the `0x23` / `0x24` / `0x02` / `0x04` frames, so the probe's
-/// whole handshake and secure-session lifecycle run offline. It records every frame it was sent.
+/// The 20-byte sample hash the scripted `0x66` reply carries.
+pub const SAMPLE_HASH: [u8; 20] = [
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+    0x20, 0x21, 0x22, 0x23,
+];
+
+/// A scripted sensor that answers the `0x23` / `0x24` / `0x02` / `0x66` / `0x68` / `0x04` frames,
+/// so the probe's whole handshake, secure-session and capture lifecycle run offline. It records
+/// every frame it was sent.
+///
+/// The device public key is the P-256 generator, so the device's private scalar is 1 and the fake
+/// can derive the session key from the host public key it receives: `ECDH(1, hostPub)` is
+/// `hostPub`, whose X coordinate is the first 32 bytes of the uncompressed point.
 pub struct HandshakeSensor {
     pub sent: Rc<RefCell<Vec<Vec<u8>>>>,
     pub challenge: Option<Vec<u8>>,
@@ -235,10 +268,59 @@ pub struct HandshakeSensor {
     pub open_command_error: Option<UsbError>,
     pub close_command_error: Option<UsbError>,
     pub close_body: Option<Vec<u8>>,
+    pub arm_status: u32,
+    pub arm_plaintext: Option<Vec<u8>>,
+    pub arm_command_error: Option<UsbError>,
+    pub cancel_command_error: Option<UsbError>,
+    pub finger_event: Option<Result<Vec<u8>, UsbError>>,
+    pub session_key: Option<[u8; 16]>,
     pending: Option<Reply>,
 }
 
 impl HandshakeSensor {
+    fn derive_session_key(&mut self, frame: &[u8]) {
+        if frame.len() < 44 + 84 {
+            return;
+        }
+        let host_nonce = &frame[44..64];
+        let host_public = &frame[64..128];
+        let mut shared = [0u8; 32];
+        shared.copy_from_slice(&host_public[..32]);
+        let master = crypto::sha1(&shared);
+        let mut input = [0u8; 60];
+        input[..20].copy_from_slice(&master);
+        input[20..40].copy_from_slice(&DEVICE_NONCE);
+        input[40..60].copy_from_slice(host_nonce);
+        let digest = crypto::sha1(&input);
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&digest[..16]);
+        self.session_key = Some(key);
+    }
+
+    fn arm_reply(&self) -> Reply {
+        let key = self
+            .session_key
+            .expect("the handshake derived a session key");
+        let plaintext = self.arm_plaintext.clone().unwrap_or_else(|| {
+            let mut plaintext = vec![0u8; 28];
+            plaintext[4..8].copy_from_slice(&20u32.to_le_bytes());
+            plaintext[8..].copy_from_slice(&SAMPLE_HASH);
+            plaintext
+        });
+        let iv = [0x5au8; 16];
+        let ciphertext = crypto::encrypt_cbc(&key, &iv, &plaintext);
+        let mut body = frame::build_wrapped(
+            cmd::ARM_CAPTURE,
+            attr::CAPTURE,
+            TEST_HANDLE,
+            &iv,
+            plaintext.len() as u32,
+            &ciphertext,
+        );
+        body[20..24].copy_from_slice(&self.arm_status.to_le_bytes());
+        Reply { status: 0, body }
+    }
+
     fn reply_to(&self, frame: &[u8]) -> Reply {
         let command = u16::from_le_bytes([
             frame.get(8).copied().unwrap_or(0),
@@ -281,6 +363,11 @@ impl HandshakeSensor {
                     &[],
                 ),
             },
+            cmd::ARM_CAPTURE => self.arm_reply(),
+            cmd::CANCEL_CAPTURE => Reply {
+                status: 0,
+                body: Vec::new(),
+            },
             cmd::CLOSE_SESSION => Reply {
                 status: 0,
                 body: self.close_body.clone().unwrap_or_default(),
@@ -301,8 +388,19 @@ impl UsbIo for HandshakeSensor {
             frame.get(9).copied().unwrap_or(0),
         ]);
         match command {
+            cmd::CHALLENGE_RESPONSE => self.derive_session_key(frame),
             cmd::OPEN_SESSION => {
                 if let Some(error) = &self.open_command_error {
+                    return Err(error.clone());
+                }
+            }
+            cmd::ARM_CAPTURE => {
+                if let Some(error) = &self.arm_command_error {
+                    return Err(error.clone());
+                }
+            }
+            cmd::CANCEL_CAPTURE => {
+                if let Some(error) = &self.cancel_command_error {
                     return Err(error.clone());
                 }
             }
@@ -329,5 +427,10 @@ impl UsbIo for HandshakeSensor {
         Ok(self.pending.as_ref().expect("out ran first").body.clone())
     }
 
-    fn cancel_finger_wait(&mut self) {}
+    fn read_finger(&mut self, _timeout: Duration) -> Result<Vec<u8>, UsbError> {
+        match self.finger_event.clone() {
+            Some(result) => result,
+            None => Ok(interrupt::FINGER.to_le_bytes().to_vec()),
+        }
+    }
 }

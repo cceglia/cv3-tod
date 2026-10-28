@@ -17,6 +17,8 @@ use crate::usb::UsbError;
 
 /// Bytes in the interrupt announcement.
 pub const ANNOUNCEMENT_LEN: usize = 8;
+/// Bytes in the finger event the interrupt endpoint delivers.
+pub const FINGER_EVENT_LEN: usize = 4;
 
 /// Largest body accepted. The audited implementation reads into an 8192-byte buffer; a length
 /// beyond it cannot be a genuine reply and is refused rather than trusted.
@@ -34,9 +36,12 @@ pub trait UsbIo {
     /// Reads up to `len` bytes of an announced reply body from bulk IN.
     fn read_bulk(&mut self, len: usize, timeout: Duration) -> Result<Vec<u8>, UsbError>;
 
-    /// Abandons an in-flight finger wait. Never called for a command transfer: cancelling one is
-    /// what deep-wedges this sensor.
-    fn cancel_finger_wait(&mut self);
+    /// Reads one event from the interrupt endpoint, waiting at most `timeout`.
+    ///
+    /// This is the finger wait, and the only transfer the protocol allows to be cancelled: an
+    /// implementation cancels it on timeout and reaps the cancelled completion, so the interface
+    /// stays usable. A command transfer must never take this path.
+    fn read_finger(&mut self, timeout: Duration) -> Result<Vec<u8>, UsbError>;
 }
 
 /// What the sensor announced and, if it announced one, the body that followed.
@@ -56,8 +61,12 @@ pub enum ExchangeError {
     Interrupt(UsbError),
     /// Reading the announced body failed.
     Bulk(UsbError),
+    /// Reading the finger event failed.
+    Finger(UsbError),
     /// The interrupt read returned fewer than [`ANNOUNCEMENT_LEN`] bytes.
     ShortAnnouncement { got: usize },
+    /// The finger event is shorter than [`FINGER_EVENT_LEN`].
+    ShortFingerEvent { got: usize },
     /// The announcement declared a body larger than [`MAX_REPLY_LEN`].
     ReplyTooLarge { announced: usize, max: usize },
     /// The body read did not deliver exactly the announced number of bytes.
@@ -70,9 +79,14 @@ impl std::fmt::Display for ExchangeError {
             Self::Out(error) => write!(f, "sending the command failed: {error}"),
             Self::Interrupt(error) => write!(f, "reading the reply announcement failed: {error}"),
             Self::Bulk(error) => write!(f, "reading the reply body failed: {error}"),
+            Self::Finger(error) => write!(f, "reading the finger event failed: {error}"),
             Self::ShortAnnouncement { got } => write!(
                 f,
                 "reply announcement is {got} bytes, expected {ANNOUNCEMENT_LEN}"
+            ),
+            Self::ShortFingerEvent { got } => write!(
+                f,
+                "finger event is {got} bytes, expected at least {FINGER_EVENT_LEN}"
             ),
             Self::ReplyTooLarge { announced, max } => {
                 write!(
@@ -144,6 +158,22 @@ impl<'a> Exchange<'a> {
 
         Ok(Reply { status, body })
     }
+
+    /// Waits for the finger event, the one transfer the protocol allows to be cancelled.
+    ///
+    /// Returns the event word from the first four bytes. The caller decides which values mean
+    /// something; `0x03` is the sensor's "finger read". A short read or a transport failure is a
+    /// typed error, never a panic.
+    pub fn wait_finger(&mut self) -> Result<u32, ExchangeError> {
+        let event = self
+            .io
+            .read_finger(Duration::from_millis(timeout::FINGER_MS as u64))
+            .map_err(ExchangeError::Finger)?;
+        if event.len() < FINGER_EVENT_LEN {
+            return Err(ExchangeError::ShortFingerEvent { got: event.len() });
+        }
+        Ok(le32(&event, 0))
+    }
 }
 
 fn le32(bytes: &[u8], offset: usize) -> u32 {
@@ -165,12 +195,13 @@ mod tests {
         Out(Vec<u8>),
         Interrupt(Duration),
         Bulk(usize, Duration),
-        Cancel,
+        Finger(Duration),
     }
 
     struct MockIo {
         interrupt: Result<Vec<u8>, UsbError>,
         bulk: Result<Vec<u8>, UsbError>,
+        finger: Result<Vec<u8>, UsbError>,
         out_error: Option<UsbError>,
         calls: RefCell<Vec<Call>>,
     }
@@ -183,6 +214,7 @@ mod tests {
             Self {
                 interrupt: Ok(announcement.to_vec()),
                 bulk: Ok(vec![0xAA; reply_len as usize]),
+                finger: Ok(0x03u32.to_le_bytes().to_vec()),
                 out_error: None,
                 calls: RefCell::new(Vec::new()),
             }
@@ -212,8 +244,9 @@ mod tests {
             self.bulk.clone()
         }
 
-        fn cancel_finger_wait(&mut self) {
-            self.calls.borrow_mut().push(Call::Cancel);
+        fn read_finger(&mut self, timeout: Duration) -> Result<Vec<u8>, UsbError> {
+            self.calls.borrow_mut().push(Call::Finger(timeout));
+            self.finger.clone()
         }
     }
 
@@ -372,15 +405,64 @@ mod tests {
     }
 
     #[test]
-    fn a_command_never_cancels_a_transfer() {
+    fn a_finger_wait_reads_the_interrupt_endpoint_with_the_finger_timeout() {
+        let mut io = MockIo::new(0, 0);
+        io.finger = Ok(0x03u32.to_le_bytes().to_vec());
+        let mut exchange = Exchange::new(&mut io);
+
+        assert_eq!(exchange.wait_finger(), Ok(0x03));
+        assert_eq!(
+            io.calls(),
+            [Call::Finger(Duration::from_millis(
+                timeout::FINGER_MS as u64
+            ))]
+        );
+    }
+
+    #[test]
+    fn a_short_finger_event_is_a_typed_error() {
+        let mut io = MockIo::new(0, 0);
+        io.finger = Ok(vec![0x03, 0x00, 0x00]);
+        let mut exchange = Exchange::new(&mut io);
+
+        assert_eq!(
+            exchange.wait_finger(),
+            Err(ExchangeError::ShortFingerEvent {
+                got: FINGER_EVENT_LEN - 1
+            })
+        );
+    }
+
+    #[test]
+    fn a_finger_timeout_is_typed_and_does_not_touch_the_command_path() {
+        let mut io = MockIo::new(0, 0);
+        io.finger = Err(UsbError::Timeout);
+        let mut exchange = Exchange::new(&mut io);
+
+        assert_eq!(
+            exchange.wait_finger(),
+            Err(ExchangeError::Finger(UsbError::Timeout))
+        );
+        assert_eq!(
+            io.calls(),
+            [Call::Finger(Duration::from_millis(
+                timeout::FINGER_MS as u64
+            ))]
+        );
+    }
+
+    #[test]
+    fn a_command_never_waits_for_a_finger_event() {
         let mut io = MockIo::new(0, 2);
         let mut exchange = Exchange::new(&mut io);
 
         exchange.command(&[0x23]).expect("reply completes");
 
         assert!(
-            !io.calls().contains(&Call::Cancel),
-            "only the finger wait may be cancelled"
+            !io.calls()
+                .iter()
+                .any(|call| matches!(call, Call::Finger(_))),
+            "only the finger wait may take the finger path"
         );
     }
 }

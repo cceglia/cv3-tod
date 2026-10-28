@@ -3,8 +3,12 @@
 //! Discovery and descriptor reading are ordinary blocking nusb calls. Command transfers are not:
 //! they are submitted and awaited with `wait_next_complete`, never with `transfer_blocking`, so a
 //! timeout leaves the transfer in flight instead of cancelling it. Cancelling a bulk command
-//! transfer is what deep-wedges this sensor, so a timed-out transport deliberately abandons the
+//! transfer is what deep-wedges this sensor, so a timed-out command deliberately abandons the
 //! transfer and the process's own teardown closes the device.
+//!
+//! The finger wait is the exception: it is cancelled on timeout and its cancelled completion is
+//! reaped, so the interrupt endpoint is left with nothing pending. That is why [`NusbIo`] never
+//! marks itself poisoned on a finger timeout and still releases the interface normally.
 
 use std::time::Duration;
 
@@ -230,9 +234,34 @@ impl UsbIo for NusbIo {
         }
     }
 
-    fn cancel_finger_wait(&mut self) {
-        // The finger wait, and its endpoint, belong to the capture ticket. Command transfers never
-        // come through here; making this a no-op keeps that distinction visible.
+    fn read_finger(&mut self, wait: Duration) -> Result<Vec<u8>, UsbError> {
+        let interface = self.interface()?.clone();
+        let mut pipe = interface
+            .endpoint::<Interrupt, In>(endpoint::INTERRUPT)
+            .map_err(map_error)?;
+        let request = pipe.max_packet_size().max(1);
+        pipe.submit(nusb::transfer::Buffer::new(request));
+        match pipe.wait_next_complete(wait) {
+            Some(completion) => {
+                completion.status.map_err(map_transfer)?;
+                Ok(completion.buffer[..completion.actual_len].to_vec())
+            }
+            None => {
+                // The finger wait is the only cancellable transfer. Cancel it and reap the
+                // cancelled completion, so nothing is left pending and the interface stays
+                // healthy; unlike a timed-out command, this never poisons the device.
+                pipe.cancel_all();
+                let deadline =
+                    std::time::Instant::now() + Duration::from_millis(timeout::TEARDOWN_MS as u64);
+                while pipe.pending() > 0 {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() || pipe.wait_next_complete(remaining).is_none() {
+                        break;
+                    }
+                }
+                Err(UsbError::Timeout)
+            }
+        }
     }
 }
 

@@ -10,8 +10,11 @@
 
 use std::io::Write;
 
+use cv3_core::capture::{Capture, CaptureError, CapturedSample, SAMPLE_HASH_LEN};
 use cv3_core::handshake::{Handshake, HandshakeError};
-use cv3_core::session::{CloseError, CloseSession, OpenError, OpenSession, Session};
+use cv3_core::session::{
+    CloseError, CloseSession, OpenError, OpenSession, Session, Teardown, TeardownError,
+};
 use cv3_core::transcript::{RecordingTransport, ReplayTransport, Transcript};
 use cv3_core::transport::{Transport, run as drive};
 
@@ -27,11 +30,17 @@ pub const EXIT_OTHER: u8 = 1;
 pub const EXIT_SEQUENCE: u8 = 5;
 /// A replay stopped matching its transcript; distinct from a replay that reproduced a failure.
 pub const EXIT_DIVERGED: u8 = 6;
+/// `capture` found a capture already armed on the sensor (`0x85`); distinct so a hardware run can
+/// tell it apart from a failed or timed-out one. The session is torn down either way.
+pub const EXIT_CAPTURE_PENDING: u8 = 7;
+/// `capture` waited for the finger and the wait timed out; distinct from a transport failure.
+pub const EXIT_FINGER_TIMEOUT: u8 = 8;
 
 const USAGE: &str = "usage: cvctl devices
        cvctl handshake [--show-key] [--record <file>]
        cvctl open [--bad-sequence] [--record <file>]
        cvctl close [--record <file>]
+       cvctl capture
        cvctl replay <file>";
 
 /// One parsed invocation.
@@ -48,6 +57,7 @@ enum Command<'a> {
     Close {
         record: Option<&'a str>,
     },
+    Capture,
     Replay {
         file: &'a str,
     },
@@ -86,6 +96,7 @@ fn parse(args: &[String]) -> Option<Command<'_>> {
                 record: flags.record,
             })
         }
+        "capture" if rest.is_empty() => Some(Command::Capture),
         "replay" => match rest {
             [file] => Some(Command::Replay { file }),
             _ => None,
@@ -143,6 +154,7 @@ pub fn run(
             record,
         }) => open(backend, shutdown, bad_sequence, record, out, err),
         Some(Command::Close { record }) => close(backend, shutdown, record, out, err),
+        Some(Command::Capture) => capture(backend, shutdown, out, err),
         Some(Command::Replay { file }) => replay(file, out, err),
         None => {
             let _ = writeln!(err, "{USAGE}");
@@ -234,6 +246,42 @@ fn close_over(transport: &mut dyn Transport, secrets: RunSecrets) -> Result<(), 
     let mut operation = CloseSession::new(run.session.handle);
     drop(run.session);
     drive(&mut operation, transport).map_err(CloseFailure::Close)
+}
+
+/// Where a capture run stopped.
+enum CaptureFailure {
+    Handshake(HandshakeError),
+    Open(OpenError),
+    Capture(CaptureError),
+}
+
+/// Opens the secure session, arms one capture, waits for the finger, then tears the session down.
+///
+/// A successful capture returns the sample hash and the teardown's own best-effort result; a
+/// failure is returned as it happened, because the capture operation already ran the teardown on
+/// every failure path.
+fn capture_over(
+    transport: &mut dyn Transport,
+    secrets: RunSecrets,
+    open_iv: [u8; cv3_core::crypto::BLOCK_LEN],
+    capture_iv: [u8; cv3_core::crypto::BLOCK_LEN],
+) -> Result<([u8; SAMPLE_HASH_LEN], Result<(), TeardownError>), CaptureFailure> {
+    let run = handshake_over(transport, secrets, true).map_err(CaptureFailure::Handshake)?;
+    let mut open = OpenSession::new(run.session, open_iv);
+    let session = drive(&mut open, transport).map_err(CaptureFailure::Open)?;
+
+    let mut capture = Capture::new(session, capture_iv);
+    match drive(&mut capture, transport) {
+        Ok(CapturedSample {
+            sample_hash,
+            session,
+        }) => {
+            let mut teardown = Teardown::new(session.handle);
+            drop(session);
+            Ok((sample_hash, drive(&mut teardown, transport)))
+        }
+        Err(error) => Err(CaptureFailure::Capture(error)),
+    }
 }
 
 /// Wraps the probe's exchange in a recording transport when `record` asks for one.
@@ -425,6 +473,77 @@ fn close(
     finish_recording(record_error, err, code)
 }
 
+/// Opens the session, arms one capture, waits for the finger, prints the hash, then tears down.
+fn capture(
+    backend: &mut dyn UsbBackend,
+    shutdown: &dyn Shutdown,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let open_iv = match random_iv() {
+        Ok(iv) => iv,
+        Err(error) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            return EXIT_OTHER;
+        }
+    };
+    let capture_iv = match random_iv() {
+        Ok(iv) => iv,
+        Err(error) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            return EXIT_OTHER;
+        }
+    };
+    let mut channel = match open_for_command(backend, shutdown) {
+        Ok(channel) => channel,
+        Err(error) => {
+            report(&error, err);
+            return error.exit_code();
+        }
+    };
+    let secrets = match RunSecrets::generate() {
+        Ok(secrets) => secrets,
+        Err(error) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            return EXIT_OTHER;
+        }
+    };
+
+    let mut exchange = channel.exchange();
+    let outcome = capture_over(&mut exchange, secrets, open_iv, capture_iv);
+
+    match outcome {
+        Ok((sample_hash, teardown)) => {
+            let _ = writeln!(out, "sample hash {}", hex(&sample_hash));
+            if let Err(error) = teardown {
+                let _ = writeln!(err, "cvctl: {error}");
+            }
+            EXIT_OK
+        }
+        Err(CaptureFailure::Handshake(error)) => {
+            let _ = writeln!(err, "cvctl: handshake failed: {error}");
+            EXIT_OTHER
+        }
+        Err(CaptureFailure::Open(error)) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            if matches!(error, OpenError::WrongSequence) {
+                EXIT_SEQUENCE
+            } else {
+                EXIT_OTHER
+            }
+        }
+        Err(CaptureFailure::Capture(error)) => {
+            let code = match error {
+                CaptureError::AlreadyPending => EXIT_CAPTURE_PENDING,
+                CaptureError::FingerTimeout => EXIT_FINGER_TIMEOUT,
+                _ => EXIT_OTHER,
+            };
+            let _ = writeln!(err, "cvctl: capture failed: {error}");
+            code
+        }
+    }
+}
+
 /// What a replay run produced.
 enum ReplayOutcome {
     Random(RandomError),
@@ -589,7 +708,7 @@ mod tests {
     use crate::discovery::UsbError;
     use crate::layout::{EndpointDescriptor, TransferType};
     use crate::signals::SignalFlag;
-    use crate::testing::{FakeUsb, TEST_HANDLE, sensor};
+    use crate::testing::{FakeUsb, SAMPLE_HASH, TEST_HANDLE, sensor};
 
     fn run_with(args: &[&str], usb: &mut FakeUsb, shutdown: &dyn Shutdown) -> (u8, String, String) {
         let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
@@ -1248,5 +1367,151 @@ mod tests {
         assert_eq!(code, 1);
         assert_eq!(out, "");
         assert!(err.contains("unknown command"), "{err}");
+    }
+
+    fn sent_commands(usb: &FakeUsb) -> Vec<u16> {
+        usb.sent
+            .borrow()
+            .iter()
+            .map(|frame| command(frame))
+            .collect()
+    }
+
+    fn le32(frame: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(
+            frame[offset..offset + 4]
+                .try_into()
+                .expect("four bytes for a word"),
+        )
+    }
+
+    #[test]
+    fn capture_prints_the_sample_hash_and_tears_the_session_down() {
+        let mut usb = FakeUsb::with_sensor();
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["capture"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(err, "");
+        assert_eq!(out, format!("sample hash {}\n", hex(&SAMPLE_HASH)));
+        assert_eq!(
+            sent_commands(&usb),
+            [
+                cmd::CHALLENGE,
+                cmd::CHALLENGE_RESPONSE,
+                cmd::OPEN_SESSION,
+                cmd::ARM_CAPTURE,
+                cmd::CANCEL_CAPTURE,
+                cmd::CLOSE_SESSION,
+            ],
+            "the arm is followed by the cancel-then-close teardown"
+        );
+
+        let arm = sent_command(&usb, cmd::ARM_CAPTURE).expect("0x66 was sent");
+        assert_eq!(arm[10], attr::CAPTURE);
+        assert_eq!(arm[11], 0x02, "the arm is wrapped");
+        assert_eq!(le32(&arm, 16), TEST_HANDLE);
+        assert_eq!(le32(&arm, 40), 36, "the 36-byte TLV block");
+        assert_eq!(arm.len(), 140, "80 plaintext bytes plus padding");
+
+        let cancel = sent_command(&usb, cmd::CANCEL_CAPTURE).expect("0x68 was sent");
+        assert_eq!(cancel.len(), 56);
+        assert_eq!(cancel[10], attr::CANCEL_SESSIONLESS);
+        assert_eq!(cancel[11], 0x00, "the cancel is plain");
+        assert_eq!(le32(&cancel, 16), 0, "sessionless header");
+        assert_eq!(le32(&cancel, 40), 12);
+        assert_eq!(
+            &cancel[44..],
+            &[0, 0, 0, 0, 4, 0, 0, 0, 0x44, 0x33, 0x22, 0x11]
+        );
+        assert_eq!(
+            sent_command(&usb, cmd::CLOSE_SESSION),
+            Some(frame::build_close_handle(TEST_HANDLE)),
+            "the handle is released after the cancel"
+        );
+    }
+
+    #[test]
+    fn capture_pending_is_its_own_exit_code_and_tears_down() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.arm_status = 0x85;
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["capture"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_CAPTURE_PENDING);
+        assert_ne!(code, EXIT_OTHER);
+        assert_eq!(out, "", "a pending capture is never reported as a hash");
+        assert!(err.contains("already armed"), "{err}");
+        assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
+        assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some());
+    }
+
+    #[test]
+    fn a_finger_timeout_is_its_own_exit_code_and_tears_down() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.finger_event = Some(Err(UsbError::Timeout));
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["capture"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_FINGER_TIMEOUT);
+        assert_ne!(code, EXIT_CAPTURE_PENDING);
+        assert_ne!(code, EXIT_OTHER);
+        assert_eq!(out, "");
+        assert!(err.contains("finger timeout"), "{err}");
+        assert_ne!(
+            err, "",
+            "a finger timeout is not confused with a transport failure"
+        );
+        assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
+        assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some());
+    }
+
+    #[test]
+    fn a_zero_status_reply_without_a_sample_hash_has_its_own_message() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.arm_plaintext = Some(vec![0u8; 28]);
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["capture"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OTHER);
+        assert_eq!(out, "");
+        assert!(err.contains("no 20-byte sample hash"), "{err}");
+        assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
+        assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some());
+    }
+
+    #[test]
+    fn a_sensor_status_error_is_reported_and_tears_down() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.arm_status = 0x0c;
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["capture"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OTHER);
+        assert_eq!(out, "");
+        assert!(err.contains("0x0c"), "{err}");
+        assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
+        assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some());
+    }
+
+    #[test]
+    fn a_transport_failure_at_the_arm_is_reported_and_tears_down() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.arm_command_error = Some(UsbError::Timeout);
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["capture"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OTHER);
+        assert_eq!(out, "");
+        assert!(err.contains("capture failed"), "{err}");
+        assert!(err.contains("timed out"), "{err}");
+        assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
+        assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some());
     }
 }

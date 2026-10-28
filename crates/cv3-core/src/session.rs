@@ -18,9 +18,10 @@
 //! wrapped command advances it according to `advances_sequence`, the single copy of the rule.
 //! Unwrapped commands (`0x23`, `0x24`, `0x04`, `0x8A`, `0x68`) never touch it.
 //!
-//! The module also owns the two session operations: [`OpenSession`] sends the wrapped `0x02`, and
-//! [`CloseSession`] releases the handle with the plain `0x04`. Both are driven through the same
-//! [`Operation`] seam as the handshake.
+//! The module also owns the session lifecycle operations: [`OpenSession`] sends the wrapped
+//! `0x02`, [`CloseSession`] releases the handle with the plain `0x04`, and [`Teardown`] cancels a
+//! possibly-armed capture with the sessionless `0x68` before closing. All are driven through the
+//! same [`Operation`] seam as the handshake.
 
 use std::fmt;
 
@@ -656,6 +657,124 @@ impl Operation for CloseSession {
     }
 }
 
+/// Why a teardown reported a problem.
+///
+/// Teardown is best effort: both frames are attempted whatever the first one answered, and the
+/// first problem is reported only after the close has had its turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TeardownError {
+    /// A teardown command or its reply could not be transferred.
+    Transport(TransportError),
+    /// The operation was cancelled; a command transfer never is, so this is unexpected.
+    Cancelled,
+    /// An event that cannot occur in this state arrived.
+    UnexpectedEvent,
+}
+
+impl fmt::Display for TeardownError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport(error) => {
+                write!(f, "session teardown failed in the transport: {error}")
+            }
+            Self::Cancelled => f.write_str("session teardown was cancelled"),
+            Self::UnexpectedEvent => f.write_str("unexpected event during session teardown"),
+        }
+    }
+}
+
+impl std::error::Error for TeardownError {}
+
+type TeardownOutcome = Result<(), TeardownError>;
+
+#[derive(Debug)]
+enum TeardownState {
+    NotStarted,
+    WaitingCancel,
+    WaitingClose,
+    Done,
+}
+
+/// Cancels a possibly-armed capture, then releases the session handle.
+///
+/// The cancel is the sessionless `0x68` (attr `0x44`, header handle zero), which clears a capture
+/// left armed by an interrupted run even when the session is no longer usable; the close is the
+/// plain `0x04` [`CloseSession`] sends. Any reply, with or without a body, counts as success for
+/// that step, and a failure in the cancel never stops the close: teardown is best effort.
+///
+/// A zero handle is the protocol's "no session" value, so it sends nothing. A finished teardown is
+/// idempotent: `start` and `step` keep returning `Ok(())` instead of panicking.
+#[derive(Debug)]
+pub struct Teardown {
+    handle: u32,
+    state: TeardownState,
+    problem: Option<TeardownError>,
+}
+
+impl Teardown {
+    /// Builds the teardown for a handle learned by the handshake.
+    pub fn new(handle: u32) -> Self {
+        Self {
+            handle,
+            state: TeardownState::NotStarted,
+            problem: None,
+        }
+    }
+
+    fn finish(&mut self, outcome: TeardownOutcome) -> Action<TeardownOutcome> {
+        self.state = TeardownState::Done;
+        Action::Finish(outcome)
+    }
+
+    /// Records the first non-reply event, which is the only way a teardown step can go wrong.
+    fn note(&mut self, event: Event) {
+        let problem = match event {
+            Event::Reply { .. } | Event::ReplyWithoutBody => return,
+            Event::Transport(error) => TeardownError::Transport(error),
+            Event::Cancelled => TeardownError::Cancelled,
+            Event::Finger => TeardownError::UnexpectedEvent,
+        };
+        if self.problem.is_none() {
+            self.problem = Some(problem);
+        }
+    }
+}
+
+impl Operation for Teardown {
+    type Output = TeardownOutcome;
+
+    fn start(&mut self) -> Action<TeardownOutcome> {
+        if !matches!(self.state, TeardownState::NotStarted) {
+            return self.finish(Ok(()));
+        }
+        if self.handle == 0 {
+            return self.finish(Ok(()));
+        }
+        self.state = TeardownState::WaitingCancel;
+        Action::Send(frame::build_cancel_capture(self.handle))
+    }
+
+    fn step(&mut self, event: Event) -> Action<TeardownOutcome> {
+        match std::mem::replace(&mut self.state, TeardownState::Done) {
+            TeardownState::WaitingCancel => {
+                self.note(event);
+                // Deliberately irrespective of the cancel's outcome: the close must still happen.
+                self.state = TeardownState::WaitingClose;
+                Action::Send(frame::build_close_handle(self.handle))
+            }
+            TeardownState::WaitingClose => {
+                self.note(event);
+                let outcome = match self.problem.take() {
+                    Some(problem) => Err(problem),
+                    None => Ok(()),
+                };
+                self.finish(outcome)
+            }
+            TeardownState::NotStarted | TeardownState::Done => self.finish(Ok(())),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1259,6 +1378,79 @@ mod tests {
             expect_finish(operation.step(Event::Cancelled)),
             Ok(()),
             "the finished close keeps reporting the handle as closed"
+        );
+    }
+
+    #[test]
+    fn teardown_cancels_the_capture_before_closing_the_handle() {
+        let mut operation = Teardown::new(HANDLE);
+
+        let cancel = expect_send(operation.start());
+        assert_eq!(cancel, frame::build_cancel_capture(HANDLE));
+        assert_eq!(cancel.len(), 56);
+        assert_eq!(&cancel[8..10], &[0x68, 0x00], "0x68");
+        assert_eq!(cancel[10], attr::CANCEL_SESSIONLESS);
+        assert_eq!(le32(&cancel, 16), 0, "sessionless header");
+        assert_eq!(le32(&cancel, frame::PARAM_LEN_OFFSET), 12);
+        assert_eq!(
+            le32(&cancel, HEADER_LEN + 8),
+            HANDLE,
+            "the handle is a parameter"
+        );
+
+        let close = expect_send(operation.step(Event::ReplyWithoutBody));
+        assert_eq!(close, frame::build_close_handle(HANDLE));
+
+        assert_eq!(
+            expect_finish(operation.step(Event::ReplyWithoutBody)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn teardown_is_best_effort_and_keeps_the_first_problem() {
+        let mut operation = Teardown::new(HANDLE);
+        let _ = operation.start();
+
+        let close = expect_send(operation.step(Event::Transport(TransportError::Disconnected)));
+        assert_eq!(
+            close,
+            frame::build_close_handle(HANDLE),
+            "a failed cancel still closes the handle"
+        );
+        assert_eq!(
+            expect_finish(operation.step(Event::Transport(TransportError::Timeout))),
+            Err(TeardownError::Transport(TransportError::Disconnected)),
+            "the first problem is the one reported"
+        );
+    }
+
+    #[test]
+    fn teardown_is_idempotent_and_a_zero_handle_sends_nothing() {
+        let mut finished = Teardown::new(HANDLE);
+        let _ = finished.start();
+        let _ = finished.step(Event::ReplyWithoutBody);
+        let _ = finished.step(Event::ReplyWithoutBody);
+        assert_eq!(expect_finish(finished.step(Event::Finger)), Ok(()));
+        assert_eq!(expect_finish(finished.start()), Ok(()));
+
+        let mut nothing = Teardown::new(0);
+        assert_eq!(expect_finish(nothing.start()), Ok(()));
+        assert_eq!(expect_finish(nothing.step(Event::Cancelled)), Ok(()));
+    }
+
+    #[test]
+    fn an_unexpected_event_during_teardown_still_closes_and_is_reported() {
+        let mut operation = Teardown::new(HANDLE);
+        let _ = operation.start();
+
+        assert_eq!(
+            expect_send(operation.step(Event::Finger)),
+            frame::build_close_handle(HANDLE)
+        );
+        assert_eq!(
+            expect_finish(operation.step(Event::ReplyWithoutBody)),
+            Err(TeardownError::UnexpectedEvent)
         );
     }
 }
