@@ -1,56 +1,32 @@
-//! Drives one core operation to completion over the command exchange.
+//! The probe's transport: one USB exchange, mapped onto the core's transport contract.
 //!
-//! The loop only maps transport facts to core events: a command's reply becomes
-//! [`Event::Reply`] with the status from the reply frame header (never the interrupt
-//! announcement's status word), an empty announcement becomes [`Event::ReplyWithoutBody`], and a
-//! USB failure becomes [`Event::Transport`]. Every `cvctl` subcommand uses this same loop.
+//! The driver loop itself lives in the core ([`cv3_core::transport::run`]); this module only turns
+//! [`Exchange`] over [`NusbIo`](crate::nusb_backend::NusbIo) into the events an operation consumes.
+//! A command's reply becomes [`Event::Reply`] with the status from the reply frame header (never
+//! the interrupt announcement's status word), an empty announcement becomes
+//! [`Event::ReplyWithoutBody`], and a USB failure becomes [`Event::Transport`].
 //!
-//! The finger wait is the one action the handshake never asks for. It is a separate trait so the
-//! capture ticket can supply the real interrupt wait without changing the loop's shape; until then
-//! [`NoFingerWait`] treats an unexpected wait as cancellation, which makes the core tear down.
+//! The finger wait is the one action the handshake never asks for. Capture will supply the real
+//! interrupt wait; until then a wait is answered with [`Event::Cancelled`], which makes the core
+//! tear down rather than hang. Command transfers are never cancelled.
 
 use cv3_core::frame::Header;
-use cv3_core::{Action, Event, Operation, TransportError};
+use cv3_core::transport::Transport;
+use cv3_core::{Event, TransportError};
 
 use crate::exchange::{Exchange, ExchangeError, Reply};
 use crate::usb::UsbError;
 
-/// Waits for the sensor's finger event and returns the core event that describes it.
-pub trait FingerWait {
-    fn wait(&mut self) -> Event;
-}
-
-/// The handshake never arms a capture, so it never waits for a finger.
-pub struct NoFingerWait;
-
-impl FingerWait for NoFingerWait {
-    fn wait(&mut self) -> Event {
-        Event::Cancelled
-    }
-}
-
-/// Runs `operation` until it finishes, performing each action on `exchange`.
-pub fn run<O: Operation>(
-    exchange: &mut Exchange<'_>,
-    operation: &mut O,
-    finger: &mut dyn FingerWait,
-) -> O::Output {
-    let mut action = operation.start();
-    loop {
-        match action {
-            Action::Send(frame) => {
-                let event = match exchange.command(&frame) {
-                    Ok(reply) => event_from_reply(reply),
-                    Err(error) => Event::Transport(transport_error(error)),
-                };
-                action = operation.step(event);
-            }
-            Action::WaitFinger => {
-                let event = finger.wait();
-                action = operation.step(event);
-            }
-            Action::Finish(result) => return result,
+impl Transport for Exchange<'_> {
+    fn command(&mut self, frame: &[u8]) -> Event {
+        match Exchange::command(self, frame) {
+            Ok(reply) => event_from_reply(reply),
+            Err(error) => Event::Transport(transport_error(error)),
         }
+    }
+
+    fn wait_finger(&mut self) -> Event {
+        Event::Cancelled
     }
 }
 
@@ -97,6 +73,8 @@ mod tests {
 
     use cv3_core::frame;
     use cv3_core::proto::{attr, cmd};
+    use cv3_core::transport::run;
+    use cv3_core::{Action, Operation};
 
     use crate::exchange::ANNOUNCEMENT_LEN;
 
@@ -148,12 +126,6 @@ mod tests {
     /// Sends one frame, then reports the event it received.
     struct SingleStep;
 
-    impl SingleStep {
-        fn new() -> Self {
-            Self
-        }
-    }
-
     impl Operation for SingleStep {
         type Output = Event;
 
@@ -164,6 +136,11 @@ mod tests {
         fn step(&mut self, event: Event) -> Action<Event> {
             Action::Finish(event)
         }
+    }
+
+    fn drive(io: &mut ScriptedIo) -> Event {
+        let mut exchange = Exchange::new(io);
+        run(&mut SingleStep, &mut exchange)
     }
 
     fn body_with_status(status: u32) -> Vec<u8> {
@@ -177,16 +154,9 @@ mod tests {
             status: 0x0000_0002,
             body,
         })]);
-        let mut operation = SingleStep::new();
-
-        let event = run(
-            &mut Exchange::new(&mut io),
-            &mut operation,
-            &mut NoFingerWait,
-        );
 
         assert_eq!(
-            event,
+            drive(&mut io),
             Event::Reply {
                 status: 0x0f,
                 body: body_with_status(0x0f),
@@ -201,28 +171,14 @@ mod tests {
             body: Vec::new(),
         })]);
 
-        assert_eq!(
-            run(
-                &mut Exchange::new(&mut io),
-                &mut SingleStep::new(),
-                &mut NoFingerWait
-            ),
-            Event::ReplyWithoutBody
-        );
+        assert_eq!(drive(&mut io), Event::ReplyWithoutBody);
     }
 
     #[test]
     fn a_transport_failure_becomes_the_core_transport_event() {
         let mut io = ScriptedIo::replies(vec![Err(ExchangeError::Out(UsbError::Timeout))]);
 
-        assert_eq!(
-            run(
-                &mut Exchange::new(&mut io),
-                &mut SingleStep::new(),
-                &mut NoFingerWait
-            ),
-            Event::Transport(TransportError::Timeout)
-        );
+        assert_eq!(drive(&mut io), Event::Transport(TransportError::Timeout));
     }
 
     #[test]
@@ -233,14 +189,7 @@ mod tests {
         ] {
             let mut io = ScriptedIo::replies(vec![Err(ExchangeError::Interrupt(error))]);
 
-            assert_eq!(
-                run(
-                    &mut Exchange::new(&mut io),
-                    &mut SingleStep::new(),
-                    &mut NoFingerWait
-                ),
-                Event::Transport(expected)
-            );
+            assert_eq!(drive(&mut io), Event::Transport(expected));
         }
     }
 
@@ -264,15 +213,23 @@ mod tests {
         })]);
 
         assert_eq!(
-            run(
-                &mut Exchange::new(&mut io),
-                &mut SingleStep::new(),
-                &mut NoFingerWait
-            ),
+            drive(&mut io),
             Event::Reply {
                 status: 0,
                 body: vec![0u8; 10],
             }
+        );
+    }
+
+    #[test]
+    fn a_finger_wait_is_refused_until_capture_exists() {
+        let mut io = ScriptedIo::replies(Vec::new());
+        let mut exchange = Exchange::new(&mut io);
+
+        assert_eq!(
+            exchange.wait_finger(),
+            Event::Cancelled,
+            "an unexpected finger wait must tear down rather than hang"
         );
     }
 }

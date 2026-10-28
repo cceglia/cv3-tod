@@ -22,6 +22,10 @@ Status: scaffolding. Nothing here talks to the sensor yet.
 third-party C implementation and the audit of it. They are reference only: never built, never
 installed, excluded from the crates and from git.
 
+`*.cvrec` files written by `cvctl ... --record` are local recordings of one real session. They may
+contain session material and must not be committed. Committed fixtures are synthetic and built from
+the frame codec; `cvctl replay <file>` reproduces a recording without hardware.
+
 ## Building
 
 ```sh

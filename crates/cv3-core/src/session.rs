@@ -69,6 +69,14 @@ impl SessionKey {
         Self(bytes)
     }
 
+    /// Builds a key from raw bytes, for test support and the fuzz target.
+    ///
+    /// The protocol's real key is derived by the handshake and nothing in the driver calls this.
+    /// It exists so a reply parser can be fed arbitrary device bytes without a hardware session.
+    pub fn from_bytes(bytes: [u8; SESSION_KEY_LEN]) -> Self {
+        Self(bytes)
+    }
+
     /// The raw key bytes.
     pub fn as_bytes(&self) -> &[u8; SESSION_KEY_LEN] {
         &self.0

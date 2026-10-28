@@ -12,7 +12,32 @@ fn a_bare_invocation_prints_usage_to_stderr_and_exits_one() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "");
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        "usage: cvctl devices\n       cvctl handshake [--show-key]\n       cvctl open \
-         [--bad-sequence]\n       cvctl close\n"
+        "usage: cvctl devices\n       cvctl handshake [--show-key] [--record <file>]\n       \
+         cvctl open [--bad-sequence] [--record <file>]\n       cvctl close [--record <file>]\n       \
+         cvctl replay <file>\n"
+    );
+}
+
+#[test]
+fn replay_of_a_missing_file_exits_non_zero_with_a_clear_message() {
+    let path = std::env::temp_dir().join(format!(
+        "cv3-cli-missing-{}-{}.cvrec",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cvctl"))
+        .arg("replay")
+        .arg(&path)
+        .output()
+        .expect("cvctl runs");
+
+    assert_ne!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot read transcript"),
+        "the message names the missing transcript: {stderr}"
     );
 }

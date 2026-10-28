@@ -2,3 +2,5 @@
 /extracted/
 /tmp/
 /*.deb
+# Local session recordings may contain session material; never commit them.
+*.cvrec

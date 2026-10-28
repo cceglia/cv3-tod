@@ -3,14 +3,19 @@
 //! The command is deliberately small: it parses one subcommand, runs the probe and maps the
 //! outcome onto the documented exit codes. Everything observable is a return value or a line on
 //! one of the two streams, which is what the tests assert.
+//!
+//! Recording wraps the same transport an ordinary run uses, so a real session becomes a transcript
+//! file with no second code path. Replay drives a fresh operation over that transcript with no
+//! hardware at all.
 
 use std::io::Write;
 
 use cv3_core::handshake::{Handshake, HandshakeError};
-use cv3_core::session::{CloseSession, OpenError, OpenSession, Session};
+use cv3_core::session::{CloseError, CloseSession, OpenError, OpenSession, Session};
+use cv3_core::transcript::{RecordingTransport, ReplayTransport, Transcript};
+use cv3_core::transport::{Transport, run as drive};
 
 use crate::discovery::{CommandSession, ProbeError, UsbBackend, open_for_command, probe};
-use crate::driver::{NoFingerWait, run as drive};
 use crate::random::{RandomError, RunSecrets, random_iv};
 use crate::signals::Shutdown;
 
@@ -20,11 +25,103 @@ pub const EXIT_OK: u8 = 0;
 pub const EXIT_OTHER: u8 = 1;
 /// The sensor refused the wrap sequence (`0x0F`); distinct so a probe run can tell it apart.
 pub const EXIT_SEQUENCE: u8 = 5;
+/// A replay stopped matching its transcript; distinct from a replay that reproduced a failure.
+pub const EXIT_DIVERGED: u8 = 6;
 
 const USAGE: &str = "usage: cvctl devices
-       cvctl handshake [--show-key]
-       cvctl open [--bad-sequence]
-       cvctl close";
+       cvctl handshake [--show-key] [--record <file>]
+       cvctl open [--bad-sequence] [--record <file>]
+       cvctl close [--record <file>]
+       cvctl replay <file>";
+
+/// One parsed invocation.
+enum Command<'a> {
+    Devices,
+    Handshake {
+        show_key: bool,
+        record: Option<&'a str>,
+    },
+    Open {
+        bad_sequence: bool,
+        record: Option<&'a str>,
+    },
+    Close {
+        record: Option<&'a str>,
+    },
+    Replay {
+        file: &'a str,
+    },
+}
+
+/// The flags one subcommand accepts.
+struct Flags<'a> {
+    show_key: bool,
+    bad_sequence: bool,
+    record: Option<&'a str>,
+}
+
+/// Parses the command line by hand: no dependency, and every unknown or repeated flag is a usage
+/// error rather than something silently ignored.
+fn parse(args: &[String]) -> Option<Command<'_>> {
+    let (command, rest) = args.split_first()?;
+    match command.as_str() {
+        "devices" if rest.is_empty() => Some(Command::Devices),
+        "handshake" => {
+            let flags = parse_flags(rest, true, false, true)?;
+            Some(Command::Handshake {
+                show_key: flags.show_key,
+                record: flags.record,
+            })
+        }
+        "open" => {
+            let flags = parse_flags(rest, false, true, true)?;
+            Some(Command::Open {
+                bad_sequence: flags.bad_sequence,
+                record: flags.record,
+            })
+        }
+        "close" => {
+            let flags = parse_flags(rest, false, false, true)?;
+            Some(Command::Close {
+                record: flags.record,
+            })
+        }
+        "replay" => match rest {
+            [file] => Some(Command::Replay { file }),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parse_flags<'a>(
+    args: &'a [String],
+    allow_show_key: bool,
+    allow_bad_sequence: bool,
+    allow_record: bool,
+) -> Option<Flags<'a>> {
+    let mut flags = Flags {
+        show_key: false,
+        bad_sequence: false,
+        record: None,
+    };
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--show-key" if allow_show_key && !flags.show_key => flags.show_key = true,
+            "--bad-sequence" if allow_bad_sequence && !flags.bad_sequence => {
+                flags.bad_sequence = true;
+            }
+            "--record" if allow_record && flags.record.is_none() => {
+                index += 1;
+                flags.record = Some(args.get(index)?.as_str());
+            }
+            _ => return None,
+        }
+        index += 1;
+    }
+    Some(flags)
+}
 
 /// Runs one invocation and returns its exit status.
 ///
@@ -36,133 +133,200 @@ pub fn run(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
-    match args {
-        [command] if command == "devices" => match probe(backend, shutdown) {
-            Ok(outcome) => {
-                let _ = writeln!(out, "{}", outcome.sensor.location());
-                EXIT_OK
-            }
-            Err(error) => {
-                report(&error, err);
-                error.exit_code()
-            }
-        },
-        [command] if command == "handshake" => handshake(backend, shutdown, false, out, err),
-        [command, flag] if command == "handshake" && flag == "--show-key" => {
-            handshake(backend, shutdown, true, out, err)
+    match parse(args) {
+        Some(Command::Devices) => devices(backend, shutdown, out, err),
+        Some(Command::Handshake { show_key, record }) => {
+            handshake(backend, shutdown, show_key, record, out, err)
         }
-        [command] if command == "open" => open(backend, shutdown, false, out, err),
-        [command, flag] if command == "open" && flag == "--bad-sequence" => {
-            open(backend, shutdown, true, out, err)
-        }
-        [command] if command == "close" => close(backend, shutdown, out, err),
-        _ => {
+        Some(Command::Open {
+            bad_sequence,
+            record,
+        }) => open(backend, shutdown, bad_sequence, record, out, err),
+        Some(Command::Close { record }) => close(backend, shutdown, record, out, err),
+        Some(Command::Replay { file }) => replay(file, out, err),
+        None => {
             let _ = writeln!(err, "{USAGE}");
             EXIT_OTHER
         }
     }
 }
 
-/// A completed handshake and the claimed command channel that produced it.
+fn devices(
+    backend: &mut dyn UsbBackend,
+    shutdown: &dyn Shutdown,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    match probe(backend, shutdown) {
+        Ok(outcome) => {
+            let _ = writeln!(out, "{}", outcome.sensor.location());
+            EXIT_OK
+        }
+        Err(error) => {
+            report(&error, err);
+            error.exit_code()
+        }
+    }
+}
+
+/// A completed handshake and the derivative the caller prints.
 struct HandshakeRun {
-    channel: CommandSession,
     session: Session,
     host_public: [u8; 64],
 }
 
-/// Why the shared handshake step did not produce a session.
-enum HandshakeFailure {
-    Probe(ProbeError),
-    Random(RandomError),
-    Handshake(HandshakeError),
-}
-
-/// Runs the handshake, keeping the handle only when `keep_handle` asks for a secure session.
-fn establish(
-    backend: &mut dyn UsbBackend,
-    shutdown: &dyn Shutdown,
+/// Runs the handshake over any transport, keeping the handle only when asked.
+fn handshake_over(
+    transport: &mut dyn Transport,
+    secrets: RunSecrets,
     keep_handle: bool,
-) -> Result<HandshakeRun, HandshakeFailure> {
-    let mut channel = open_for_command(backend, shutdown).map_err(HandshakeFailure::Probe)?;
-
-    // The host keypair is fresh for every invocation and is never stored.
-    let secrets = RunSecrets::generate().map_err(HandshakeFailure::Random)?;
+) -> Result<HandshakeRun, HandshakeError> {
     let host_public = secrets.host_key.public_key();
     let mut operation = Handshake::new(secrets.client_nonce, secrets.host_key, secrets.host_nonce);
     if keep_handle {
         operation = operation.keeping_handle();
     }
-
-    let outcome = {
-        let mut exchange = channel.exchange();
-        drive(&mut exchange, &mut operation, &mut NoFingerWait)
-    };
-    let session = outcome.map_err(HandshakeFailure::Handshake)?;
+    let session = drive(&mut operation, transport)?;
     Ok(HandshakeRun {
-        channel,
         session,
         host_public,
     })
 }
 
-/// Reports a failed shared handshake step and returns its exit status.
-fn report_handshake(failure: HandshakeFailure, err: &mut dyn Write) -> u8 {
-    match failure {
-        HandshakeFailure::Probe(error) => {
-            report(&error, err);
-            error.exit_code()
+/// Where an open run stopped.
+enum OpenFailure {
+    Handshake(HandshakeError),
+    Open(OpenError),
+}
+
+/// Opens the wrapped session and closes it again, exactly as one `cvctl open` invocation does.
+fn open_over(
+    transport: &mut dyn Transport,
+    secrets: RunSecrets,
+    iv: [u8; cv3_core::crypto::BLOCK_LEN],
+    bad_sequence: bool,
+) -> Result<(u32, Result<(), CloseError>), OpenFailure> {
+    let run = handshake_over(transport, secrets, true).map_err(OpenFailure::Handshake)?;
+    let mut operation = OpenSession::new(run.session, iv);
+    if bad_sequence {
+        operation = operation.at_sequence(1);
+    }
+    match drive(&mut operation, transport) {
+        Ok(session) => {
+            let handle = session.handle;
+            drop(session);
+            let mut close = CloseSession::new(handle);
+            Ok((handle, drive(&mut close, transport)))
         }
-        HandshakeFailure::Random(error) => {
-            let _ = writeln!(err, "cvctl: {error}");
+        Err(error) => Err(OpenFailure::Open(error)),
+    }
+}
+
+/// Where a close run stopped.
+enum CloseFailure {
+    Handshake(HandshakeError),
+    Close(CloseError),
+}
+
+/// Runs the handshake, keeps its handle, then closes that handle.
+fn close_over(transport: &mut dyn Transport, secrets: RunSecrets) -> Result<(), CloseFailure> {
+    let run = handshake_over(transport, secrets, true).map_err(CloseFailure::Handshake)?;
+    let mut operation = CloseSession::new(run.session.handle);
+    drop(run.session);
+    drive(&mut operation, transport).map_err(CloseFailure::Close)
+}
+
+/// Wraps the probe's exchange in a recording transport when `record` asks for one.
+///
+/// The same operation runs either way. A write failure is returned to the caller rather than
+/// swallowed: the user asked for a transcript, and a missing one must be visible.
+fn with_transport<R>(
+    channel: &mut CommandSession,
+    command: &str,
+    record: Option<&str>,
+    run_operation: impl FnOnce(&mut dyn Transport) -> R,
+) -> (R, Option<std::io::Error>) {
+    match record {
+        Some(path) => {
+            let mut transport = RecordingTransport::new(channel.exchange(), command);
+            let result = run_operation(&mut transport);
+            let transcript = transport.into_transcript();
+            let error = std::fs::write(path, transcript.to_bytes()).err();
+            (result, error)
+        }
+        None => {
+            let mut transport = channel.exchange();
+            (run_operation(&mut transport), None)
+        }
+    }
+}
+
+fn finish_recording(error: Option<std::io::Error>, err: &mut dyn Write, code: u8) -> u8 {
+    match error {
+        Some(error) => {
+            let _ = writeln!(err, "cvctl: writing the transcript failed: {error}");
             EXIT_OTHER
         }
-        HandshakeFailure::Handshake(error) => {
-            let _ = writeln!(err, "cvctl: handshake failed: {error}");
-            EXIT_OTHER
-        }
+        None => code,
     }
 }
 
 /// Runs one `0x23` / `0x24` handshake and prints what it learned.
-///
-/// This is the ticket-02 behaviour: the handshake closes the handle before returning.
 fn handshake(
     backend: &mut dyn UsbBackend,
     shutdown: &dyn Shutdown,
     show_key: bool,
+    record: Option<&str>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
-    let run = match establish(backend, shutdown, false) {
-        Ok(run) => run,
-        Err(failure) => return report_handshake(failure, err),
+    let mut channel = match open_for_command(backend, shutdown) {
+        Ok(channel) => channel,
+        Err(error) => {
+            report(&error, err);
+            return error.exit_code();
+        }
     };
-    let HandshakeRun {
-        session,
-        host_public,
-        ..
-    } = run;
+    let secrets = match RunSecrets::generate() {
+        Ok(secrets) => secrets,
+        Err(error) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            return EXIT_OTHER;
+        }
+    };
 
-    let _ = writeln!(out, "handle {:#010x}", session.handle);
-    let _ = writeln!(out, "client nonce {} bytes", session.client_nonce_len);
-    let _ = writeln!(out, "device nonce {} bytes", session.device_nonce_len);
-    let _ = writeln!(out, "host nonce {} bytes", session.host_nonce_len);
-    let _ = writeln!(out, "host public key {}", hex(&host_public));
-    let _ = writeln!(out, "key fingerprint {}", hex(&session.key().fingerprint()));
-    if show_key {
-        let _ = writeln!(out, "key {}", hex(session.key().as_bytes()));
-    }
-    EXIT_OK
+    let (outcome, record_error) = with_transport(&mut channel, "handshake", record, |transport| {
+        handshake_over(transport, secrets, false)
+    });
+
+    let code = match outcome {
+        Ok(run) => {
+            let session = run.session;
+            let _ = writeln!(out, "handle {:#010x}", session.handle);
+            let _ = writeln!(out, "client nonce {} bytes", session.client_nonce_len);
+            let _ = writeln!(out, "device nonce {} bytes", session.device_nonce_len);
+            let _ = writeln!(out, "host nonce {} bytes", session.host_nonce_len);
+            let _ = writeln!(out, "host public key {}", hex(&run.host_public));
+            let _ = writeln!(out, "key fingerprint {}", hex(&session.key().fingerprint()));
+            if show_key {
+                let _ = writeln!(out, "key {}", hex(session.key().as_bytes()));
+            }
+            EXIT_OK
+        }
+        Err(error) => {
+            let _ = writeln!(err, "cvctl: handshake failed: {error}");
+            EXIT_OTHER
+        }
+    };
+    finish_recording(record_error, err, code)
 }
 
 /// Opens the wrapped `0x02` session, prints the handle, then closes it before exiting.
-///
-/// `bad_sequence` is the probe-only diagnostic: it sends sequence 1 on a fresh session so the
-/// sensor answers `0x0F`, which surfaces as [`EXIT_SEQUENCE`].
 fn open(
     backend: &mut dyn UsbBackend,
     shutdown: &dyn Shutdown,
     bad_sequence: bool,
+    record: Option<&str>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
@@ -173,45 +337,39 @@ fn open(
             return EXIT_OTHER;
         }
     };
-    let run = match establish(backend, shutdown, true) {
-        Ok(run) => run,
-        Err(failure) => return report_handshake(failure, err),
+    let mut channel = match open_for_command(backend, shutdown) {
+        Ok(channel) => channel,
+        Err(error) => {
+            report(&error, err);
+            return error.exit_code();
+        }
     };
-    let HandshakeRun {
-        mut channel,
-        session,
-        ..
-    } = run;
-
-    let mut operation = OpenSession::new(session, iv);
-    if bad_sequence {
-        operation = operation.at_sequence(1);
-    }
-    let outcome = {
-        let mut exchange = channel.exchange();
-        drive(&mut exchange, &mut operation, &mut NoFingerWait)
+    let secrets = match RunSecrets::generate() {
+        Ok(secrets) => secrets,
+        Err(error) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            return EXIT_OTHER;
+        }
     };
 
-    match outcome {
-        Ok(session) => {
-            let handle = session.handle;
+    let (outcome, record_error) = with_transport(&mut channel, "open", record, |transport| {
+        open_over(transport, secrets, iv, bad_sequence)
+    });
+
+    let code = match outcome {
+        Ok((handle, closed)) => {
             let _ = writeln!(out, "handle {handle:#010x}");
             let _ = writeln!(out, "secure session open");
-
-            // One invocation leaves no handle behind, so the next `cvctl open` cannot be told the
-            // session is already open.
-            drop(session);
-            let mut close = CloseSession::new(handle);
-            let closed = {
-                let mut exchange = channel.exchange();
-                drive(&mut exchange, &mut close, &mut NoFingerWait)
-            };
             if let Err(error) = closed {
                 let _ = writeln!(err, "cvctl: {error}");
             }
             EXIT_OK
         }
-        Err(error) => {
+        Err(OpenFailure::Handshake(error)) => {
+            let _ = writeln!(err, "cvctl: handshake failed: {error}");
+            EXIT_OTHER
+        }
+        Err(OpenFailure::Open(error)) => {
             let _ = writeln!(err, "cvctl: {error}");
             if matches!(error, OpenError::WrongSequence) {
                 EXIT_SEQUENCE
@@ -219,38 +377,183 @@ fn open(
                 EXIT_OTHER
             }
         }
-    }
+    };
+    finish_recording(record_error, err, code)
 }
 
 /// Closes the secure session the handshake kept open.
 fn close(
     backend: &mut dyn UsbBackend,
     shutdown: &dyn Shutdown,
+    record: Option<&str>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
-    let run = match establish(backend, shutdown, true) {
-        Ok(run) => run,
-        Err(failure) => return report_handshake(failure, err),
+    let mut channel = match open_for_command(backend, shutdown) {
+        Ok(channel) => channel,
+        Err(error) => {
+            report(&error, err);
+            return error.exit_code();
+        }
     };
-    let HandshakeRun {
-        mut channel,
-        session,
-        ..
-    } = run;
+    let secrets = match RunSecrets::generate() {
+        Ok(secrets) => secrets,
+        Err(error) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            return EXIT_OTHER;
+        }
+    };
 
-    let mut operation = CloseSession::new(session.handle);
-    drop(session);
-    let closed = {
-        let mut exchange = channel.exchange();
-        drive(&mut exchange, &mut operation, &mut NoFingerWait)
-    };
-    match closed {
+    let (outcome, record_error) = with_transport(&mut channel, "close", record, |transport| {
+        close_over(transport, secrets)
+    });
+
+    let code = match outcome {
         Ok(()) => {
             let _ = writeln!(out, "secure session closed");
             EXIT_OK
         }
+        Err(CloseFailure::Handshake(error)) => {
+            let _ = writeln!(err, "cvctl: handshake failed: {error}");
+            EXIT_OTHER
+        }
+        Err(CloseFailure::Close(error)) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            EXIT_OTHER
+        }
+    };
+    finish_recording(record_error, err, code)
+}
+
+/// What a replay run produced.
+enum ReplayOutcome {
+    Random(RandomError),
+    Handshake(Result<Session, HandshakeError>),
+    Open(Result<(u32, Result<(), CloseError>), OpenFailure>),
+    Close(Result<(), CloseFailure>),
+}
+
+fn replay_handshake(transport: &mut ReplayTransport) -> ReplayOutcome {
+    match RunSecrets::generate() {
+        Ok(secrets) => ReplayOutcome::Handshake(
+            handshake_over(transport, secrets, false).map(|run| run.session),
+        ),
+        Err(error) => ReplayOutcome::Random(error),
+    }
+}
+
+fn replay_open(transport: &mut ReplayTransport) -> ReplayOutcome {
+    let secrets = match RunSecrets::generate() {
+        Ok(secrets) => secrets,
+        Err(error) => return ReplayOutcome::Random(error),
+    };
+    let iv = match random_iv() {
+        Ok(iv) => iv,
+        Err(error) => return ReplayOutcome::Random(error),
+    };
+    ReplayOutcome::Open(open_over(transport, secrets, iv, false))
+}
+
+fn replay_close(transport: &mut ReplayTransport) -> ReplayOutcome {
+    match RunSecrets::generate() {
+        Ok(secrets) => ReplayOutcome::Close(close_over(transport, secrets)),
+        Err(error) => ReplayOutcome::Random(error),
+    }
+}
+
+/// Replays a recorded invocation with no hardware.
+fn replay(file: &str, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    let bytes = match std::fs::read(file) {
+        Ok(bytes) => bytes,
         Err(error) => {
+            let _ = writeln!(err, "cvctl: cannot read transcript {file}: {error}");
+            return EXIT_OTHER;
+        }
+    };
+    let transcript = match Transcript::from_bytes(&bytes) {
+        Ok(transcript) => transcript,
+        Err(error) => {
+            let _ = writeln!(err, "cvctl: invalid transcript {file}: {error}");
+            return EXIT_OTHER;
+        }
+    };
+
+    let command = transcript.command().to_owned();
+    let mut transport = ReplayTransport::new(transcript);
+    let outcome = match command.as_str() {
+        "handshake" => replay_handshake(&mut transport),
+        "open" => replay_open(&mut transport),
+        "close" => replay_close(&mut transport),
+        other => {
+            let _ = writeln!(err, "cvctl: transcript records unknown command {other:?}");
+            return EXIT_OTHER;
+        }
+    };
+
+    // Divergence wins over the operation's own result: the operation ran against bytes that did
+    // not match the recording, so its answer is not a replay of anything.
+    if let Err(divergence) = transport.finish() {
+        let _ = writeln!(
+            err,
+            "cvctl: replay diverged from the transcript: {divergence}"
+        );
+        return EXIT_DIVERGED;
+    }
+
+    report_replay(outcome, out, err)
+}
+
+fn report_replay(outcome: ReplayOutcome, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    match outcome {
+        ReplayOutcome::Random(error) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            EXIT_OTHER
+        }
+        ReplayOutcome::Handshake(Ok(session)) => {
+            let _ = writeln!(out, "handle {:#010x}", session.handle);
+            let _ = writeln!(out, "client nonce {} bytes", session.client_nonce_len);
+            let _ = writeln!(out, "device nonce {} bytes", session.device_nonce_len);
+            let _ = writeln!(out, "host nonce {} bytes", session.host_nonce_len);
+            let _ = writeln!(
+                out,
+                "note: replay uses a fresh host keypair; the session key fingerprint differs from \
+                 the recording"
+            );
+            EXIT_OK
+        }
+        ReplayOutcome::Handshake(Err(error)) => {
+            let _ = writeln!(err, "cvctl: handshake failed: {error}");
+            EXIT_OTHER
+        }
+        ReplayOutcome::Open(Ok((handle, closed))) => {
+            let _ = writeln!(out, "handle {handle:#010x}");
+            let _ = writeln!(out, "secure session open");
+            if let Err(error) = closed {
+                let _ = writeln!(err, "cvctl: {error}");
+            }
+            EXIT_OK
+        }
+        ReplayOutcome::Open(Err(OpenFailure::Handshake(error))) => {
+            let _ = writeln!(err, "cvctl: handshake failed: {error}");
+            EXIT_OTHER
+        }
+        ReplayOutcome::Open(Err(OpenFailure::Open(error))) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            if matches!(error, OpenError::WrongSequence) {
+                EXIT_SEQUENCE
+            } else {
+                EXIT_OTHER
+            }
+        }
+        ReplayOutcome::Close(Ok(())) => {
+            let _ = writeln!(out, "secure session closed");
+            EXIT_OK
+        }
+        ReplayOutcome::Close(Err(CloseFailure::Handshake(error))) => {
+            let _ = writeln!(err, "cvctl: handshake failed: {error}");
+            EXIT_OTHER
+        }
+        ReplayOutcome::Close(Err(CloseFailure::Close(error))) => {
             let _ = writeln!(err, "cvctl: {error}");
             EXIT_OTHER
         }
@@ -276,8 +579,12 @@ fn report(error: &ProbeError, err: &mut dyn Write) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use cv3_core::frame;
     use cv3_core::proto::{attr, cmd};
+    use cv3_core::transcript::TranscriptRecord;
 
     use crate::discovery::UsbError;
     use crate::layout::{EndpointDescriptor, TransferType};
@@ -311,6 +618,43 @@ mod tests {
     fn host_public_key(usb: &FakeUsb) -> Vec<u8> {
         let frame = sent_command(usb, cmd::CHALLENGE_RESPONSE).expect("0x24 was sent");
         frame[44 + 20..44 + 84].to_vec()
+    }
+
+    /// A unique, not-yet-created path under the system temporary directory.
+    struct TempRecord(PathBuf);
+
+    impl TempRecord {
+        fn new(label: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!(
+                "cv3-{label}-{}-{count}-{nanos}.cvrec",
+                std::process::id()
+            ));
+            Self(path)
+        }
+
+        fn path(&self) -> &str {
+            self.0.to_str().expect("the temporary path is UTF-8")
+        }
+
+        fn write(&self, bytes: &[u8]) {
+            std::fs::write(&self.0, bytes).expect("the temporary transcript is writable");
+        }
+
+        fn exists(&self) -> bool {
+            Path::exists(&self.0)
+        }
+    }
+
+    impl Drop for TempRecord {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
     }
 
     #[test]
@@ -482,6 +826,19 @@ mod tests {
 
         assert_eq!(code, 1);
         assert_eq!(err, format!("{USAGE}\n"));
+    }
+
+    #[test]
+    fn a_record_flag_without_a_path_is_a_usage_error() {
+        let mut usb = FakeUsb::with_sensor();
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["handshake", "--record"], &mut usb, &shutdown);
+
+        assert_eq!(code, 1);
+        assert_eq!(out, "");
+        assert_eq!(err, format!("{USAGE}\n"));
+        assert!(usb.calls().is_empty());
     }
 
     #[test]
@@ -767,5 +1124,129 @@ mod tests {
         assert_eq!(out, "");
         assert!(err.contains("disconnected"), "{err}");
         assert!(err.contains("closed locally"), "{err}");
+    }
+
+    #[test]
+    fn a_recorded_handshake_replays_without_hardware() {
+        let record = TempRecord::new("handshake-replay");
+        let shutdown = SignalFlag::new();
+        let mut usb = FakeUsb::with_sensor();
+
+        let (code, out, err) = run_with(
+            &["handshake", "--record", record.path()],
+            &mut usb,
+            &shutdown,
+        );
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(err, "");
+        assert!(out.contains(&format!("handle {TEST_HANDLE:#010x}")));
+        assert!(record.exists(), "the recording was written");
+
+        let mut replay_usb = FakeUsb::default();
+        let (code, out, err) = run_with(&["replay", record.path()], &mut replay_usb, &shutdown);
+
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(err, "");
+        assert!(out.starts_with(&format!("handle {TEST_HANDLE:#010x}\n")));
+        assert!(out.contains("client nonce 20 bytes"), "{out}");
+        assert!(out.contains("device nonce 20 bytes"), "{out}");
+        assert!(out.contains("host nonce 20 bytes"), "{out}");
+        assert!(
+            out.contains("fresh host keypair"),
+            "the replay says the derived key differs: {out}"
+        );
+        assert!(
+            replay_usb.calls().is_empty(),
+            "replay never touches a USB backend"
+        );
+    }
+
+    #[test]
+    fn a_recorded_failed_open_replays_the_same_error() {
+        let record = TempRecord::new("open-replay");
+        let shutdown = SignalFlag::new();
+        let mut usb = FakeUsb::with_sensor();
+        usb.open_status = 0x0c;
+
+        let (record_code, record_out, record_err) =
+            run_with(&["open", "--record", record.path()], &mut usb, &shutdown);
+        assert_eq!(record_code, 1);
+        assert_eq!(record_out, "");
+        assert!(record_err.contains("0x0c"), "{record_err}");
+        assert!(record.exists());
+
+        let mut replay_usb = FakeUsb::default();
+        let (code, out, err) = run_with(&["replay", record.path()], &mut replay_usb, &shutdown);
+
+        assert_eq!(code, 1);
+        assert_eq!(out, "");
+        assert_eq!(err, record_err, "the same failure and message replay");
+        assert!(replay_usb.calls().is_empty());
+    }
+
+    #[test]
+    fn replay_rejects_a_missing_file() {
+        let missing = TempRecord::new("missing");
+        let mut usb = FakeUsb::default();
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["replay", missing.path()], &mut usb, &shutdown);
+
+        assert_eq!(code, 1);
+        assert_eq!(out, "");
+        assert!(err.contains("cannot read transcript"), "{err}");
+        assert!(usb.calls().is_empty());
+    }
+
+    #[test]
+    fn replay_rejects_a_corrupt_file() {
+        let record = TempRecord::new("corrupt");
+        record.write(b"this is not a transcript");
+        let mut usb = FakeUsb::default();
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["replay", record.path()], &mut usb, &shutdown);
+
+        assert_eq!(code, 1);
+        assert_eq!(out, "");
+        assert!(err.contains("invalid transcript"), "{err}");
+        assert!(usb.calls().is_empty());
+    }
+
+    #[test]
+    fn replay_reports_a_divergent_transcript() {
+        let record = TempRecord::new("divergent");
+        let mut transcript = Transcript::new("handshake");
+        transcript.push(TranscriptRecord::HostFrame(frame::build_plain(
+            cmd::CHALLENGE_RESPONSE,
+            attr::CHALLENGE_RESPONSE,
+            0,
+            &[],
+        )));
+        transcript.push(TranscriptRecord::ReplyWithoutBody);
+        record.write(&transcript.to_bytes());
+
+        let mut usb = FakeUsb::default();
+        let shutdown = SignalFlag::new();
+        let (code, out, err) = run_with(&["replay", record.path()], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_DIVERGED);
+        assert_eq!(out, "");
+        assert!(err.contains("diverged"), "{err}");
+        assert!(usb.calls().is_empty());
+    }
+
+    #[test]
+    fn replay_rejects_a_transcript_for_an_unknown_command() {
+        let record = TempRecord::new("unknown-command");
+        record.write(&Transcript::new("enrol").to_bytes());
+        let mut usb = FakeUsb::default();
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["replay", record.path()], &mut usb, &shutdown);
+
+        assert_eq!(code, 1);
+        assert_eq!(out, "");
+        assert!(err.contains("unknown command"), "{err}");
     }
 }
