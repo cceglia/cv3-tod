@@ -50,8 +50,8 @@ pub use session::{
     TeardownError, UnwrapError, WrapError,
 };
 pub use transcript::{
-    Divergence, FrameKey, RecordingTransport, ReplayTransport, SessionMaterial, Transcript,
-    TranscriptError, TranscriptRecord,
+    Divergence, FrameKey, RecordingTransport, ReplayTransport, Transcript, TranscriptError,
+    TranscriptRecord,
 };
 pub use transport::{FailingTransport, ScriptedOutcome, ScriptedTransport, Transport};
 pub use verify::{

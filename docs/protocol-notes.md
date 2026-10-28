@@ -63,6 +63,21 @@ mid-capture); it is the case to look for when reading a hardware run.
 The observation is the sensor's answer to the second arm, not the printed verdict: the sequence
 lives inside the MAC and is not printed.
 
+## Match replies
+
+**Not measured.** Ticket 07 requires that the reply to a no-match be captured in the same detail as
+a match. A hardware run must record, for a match and for a no-match:
+
+- the verdict word at plaintext `+8`, exactly as the sensor sent it;
+- whether a 20-byte value is present at plaintext `+32` (that is, whether the decrypted plaintext
+  is at least 52 bytes) and, if present, whether it equals the value the enrolled print returned;
+- the exact wrapped reply body length and the exact decrypted plaintext length.
+
+The question is load-bearing: if a no-match reply already carries the enrolled finger's value at
+`+32`, then flipping the verdict word would pass an id comparison, and ticket 10's binding would
+not be a defence. Until the run is written down here, the driver assumes nothing about the value.
+Do not fill these fields in from the reference or by inference.
+
 ## Binding
 
 Not yet established. Ticket 09 owns the binding facts: whether the sensor accepts a capture and a

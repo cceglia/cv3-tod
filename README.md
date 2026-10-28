@@ -1,9 +1,27 @@
 # controlvault3
 
-A Linux driver for the Dell/Broadcom **ControlVault 3** fingerprint sensor (BCM58200, USB
-`0a5c:5843`), written in Rust with a thin C shim for the libfprint TOD interface.
+A Linux driver project for the Dell/Broadcom **ControlVault 3** fingerprint sensor (BCM58200, USB
+`0a5c:5843`): a Rust protocol core and probe, with a thin C shim planned for the libfprint TOD
+interface.
 
-Status: scaffolding. Nothing here talks to the sensor yet.
+Status: protocol probe. The Rust core speaks the sensor's ECDH handshake and secure session and
+performs capture, enrolment and verification; `cvctl` drives it against the sensor directly. Still
+missing: the libfprint TOD plugin (`crates/cv3-tod`, not built yet), binding a match to the print
+that was enrolled (ticket 10), and the template inventory with list and delete. Until those land
+this is a probe, not a login driver.
+
+## What the probe can do
+
+| Command | What it establishes |
+|---|---|
+| `devices` | Finds the sensor and prints its stable USB location. |
+| `handshake` | Runs `0x23`/`0x24`, derives the session key and releases the handle. |
+| `open` / `close` | Opens the wrapped `0x02` session and releases it with plain `0x04`. |
+| `capture` | Arms `0x66`, waits for the finger, reads the sample hash and tears the session down. |
+| `enroll` | Discards, starts, captures, submits, commits and prints the template id it now holds. |
+| `verify` | Captures and matches `0x73`, printing the raw verdict word, the 20-byte value and the reply lengths. |
+| `cancel-then-verify` | Cancels a capture mid-session and verifies in the same session; it settles the wrap-sequence question. |
+| `handshake`/`open`/`close --record` | Writes a wire-only transcript; `cvctl replay <file>` reproduces it without hardware. |
 
 ## Layout
 
@@ -22,21 +40,28 @@ Status: scaffolding. Nothing here talks to the sensor yet.
 third-party C implementation and the audit of it. They are reference only: never built, never
 installed, excluded from the crates and from git.
 
-`*.cvrec` files written by `cvctl ... --record` are local recordings of one real session. A
-`cvctl verify --record` file additionally carries the run's ephemeral host key, nonces and IVs so
-that the wrapped match reply can be replayed exactly; it is sensitive and must not be committed.
-`.gitignore` keeps `*.cvrec` out of git. Committed fixtures are synthetic and built from the frame
-codec; `cvctl replay <file>` reproduces a recording without hardware.
+`*.cvrec` files written by `cvctl ... --record` are local recordings of one real session. They
+are **wire-only**: handshake, open and close only, storing the frames as they went on the wire but
+not the host secret key or any separate session material. Replay uses a fresh ephemeral host key,
+so frames match on command, attribute and handle rather than byte for byte. A recording still
+contains real device traffic, so `.gitignore` keeps `*.cvrec` out of git. Committed fixtures are
+synthetic and built from the frame codec; `cvctl replay <file>` reproduces a recording without
+hardware. `verify` has no `--record`: a match reply cannot be decrypted on replay without storing
+the session's key material, which the SPEC forbids.
 
 ## Building
 
 ```sh
-cargo test          # core only; the probe needs no hardware yet
+cargo test          # whole workspace; no hardware needed
 cargo build --release
 ```
 
 The probe drives the sensor through the kernel's USB device nodes and therefore runs as root.
 `cv3-tod` additionally needs `libfprint-2-tod-dev`.
+
+`./scripts/check-core.sh` mechanically checks that the core's direct dependencies are only the
+pinned crypto set and that its source contains no `unsafe`; the GitHub workflow runs it alongside
+formatting, clippy and the workspace tests.
 
 ## `cvctl` exit codes
 
@@ -56,7 +81,8 @@ The probe drives the sensor through the kernel's USB device nodes and therefore 
 | 128 + signal | interrupted by a catchable signal (for example 130 for `SIGINT`) |
 
 `capture` prints the sample hash on success and always runs the cancel-then-close teardown before
-exiting. `verify` prints `match` or `no match`, the 20-byte value (or `value absent`), the raw reply
+exiting. `verify` prints the raw verdict word with its meaning (`verdict 1 (match)`,
+`verdict 2 (no match, unexpected word)`), the 20-byte value (or `value absent`), the raw reply
 length and the decrypted plaintext length, then runs the same teardown. The value's meaning is not
 established, and `verify` does not yet compare it with anything: ticket 10 owns id binding.
 
@@ -65,6 +91,14 @@ question: it arms a capture, cancels it with the mid-session `0x68` before any f
 full verification in the same session and prints its verdict the way `verify` does. An arm that
 answers `0x85` is consumed, cancelled and re-armed, which is the case the two readings of the rule
 disagree about. See `docs/protocol-notes.md`.
+
+`handshake --show-key` adds the derived session key to the ordinary report. Without the flag only
+its short fingerprint is printed, because the key is freshly generated for the run and sensitive.
+
+`--hex` on `handshake`, `open`, `close`, `capture`, `enroll`, `verify` and `cancel-then-verify`
+writes every host frame and every device reply body to **stderr** as lowercase hex, prefixed `> `
+and `< ` (`< empty` for a reply with no body). The decoded output on stdout is unchanged. The flag
+is a transport wrapper over the core's `Transport` seam, so no operation changes.
 
 A catchable signal (`SIGINT`, `SIGTERM`, `SIGHUP`) during the finger wait cancels that transfer,
 tears the session down (`0x68`, then `0x04`) and exits `128 + signal`; command transfers are never

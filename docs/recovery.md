@@ -1,7 +1,8 @@
 # Recovering a wedged sensor
 
 The command interface can be left stuck by an interrupted run. This page is the operator's ladder.
-It is deliberately short, and it stops at step 2.
+It has one repair step and then stops: the USB `authorized` toggle is the only recovery this
+project sanctions. Anything stronger is how a light wedge becomes a deep one.
 
 ## Light wedge vs deep wedge
 
@@ -12,9 +13,8 @@ endpoint is stuck; the USB stack is healthy.
 A **deep wedge** is a sensor that no longer enumerates. The kernel reports it as
 `unable to enumerate USB device`, and nothing in software brings it back.
 
-The distinction is the whole reason for this page: the first two steps of the ladder repair a light
-wedge, while the reset people reach for next turns one into a deep wedge, and a deep wedge costs a
-full power-down.
+The distinction is the whole reason for this page: the `authorized` toggle repairs a light wedge,
+while a reset turns it into a deep wedge, and a deep wedge costs a full power-down.
 
 ## The ladder
 
@@ -44,22 +44,13 @@ Measured on 2026-09-01 at 17:32:09: the toggle re-enumerated the device fine, wi
 only a bulk endpoint stuck. The evidence is recorded in the project's reference notes; it has not
 been re-measured by this driver.
 
-### 2. `clear_halt` on the three endpoints
+### 2. Nothing stronger — then a power cycle
 
-If the toggle does not clear it, clear the halt condition on the sensor's three endpoints: bulk OUT
-`0x01`, bulk IN `0x81` and interrupt IN `0x85`. This is the USB `CLEAR_FEATURE(ENDPOINT_HALT)`
-request, and it is what Windows does instead of resetting the device.
-
-The reference material's `cvrecover` tool performs it. This repository does not ship a recovery
-tool, so there is no shell one-liner to quote here; use that tool or issue
-`USBDEVFS_CLEAR_HALT` on the endpoint from a userspace program. Do **not** substitute `usbreset`
-or any other device reset for this step: they are the thing the next section forbids.
-
-### 3. Nothing — and then a power cycle
-
-A wedged-but-enumerating chip recovers on its own once nothing is driving it. If steps 1 and 2 do
-not help, leave it alone and, if it is still stuck, power the machine fully down. Do not escalate
-to a port reset.
+There is no second command-level step. A wedged-but-enumerating chip recovers on its own once
+nothing is driving it. If the toggle does not help, leave it alone and, if it is still stuck,
+power the machine fully down. Do not escalate to a port reset or any other USB recovery request:
+the SPEC allows the `authorized` toggle and nothing stronger, and this project sanctions only the
+toggle.
 
 ## Never
 

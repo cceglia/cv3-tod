@@ -11,8 +11,7 @@ use cv3_core::frame;
 use cv3_core::proto::{attr, cmd};
 use cv3_core::session::{OpenError, OpenSession};
 use cv3_core::transcript::{
-    Divergence, RecordingTransport, ReplayTransport, SessionMaterial, Transcript, TranscriptError,
-    TranscriptRecord,
+    Divergence, RecordingTransport, ReplayTransport, Transcript, TranscriptError, TranscriptRecord,
 };
 use cv3_core::transport::{ScriptedOutcome, ScriptedTransport, Transport, run};
 use cv3_core::{Event, Handshake, TransportError};
@@ -54,6 +53,23 @@ fn a_transcript_round_trips_every_record_kind() {
 }
 
 #[test]
+fn a_transcript_is_wire_only_version_one() {
+    let mut transcript = Transcript::new("handshake");
+    transcript.push(TranscriptRecord::ReplyWithoutBody);
+    let bytes = transcript.to_bytes();
+
+    assert_eq!(
+        u16::from_le_bytes([bytes[8], bytes[9]]),
+        1,
+        "v1 is the wire-only format; v2 carried session material and is gone"
+    );
+    assert_eq!(
+        Transcript::from_bytes(&bytes).expect("a transcript this build wrote parses"),
+        transcript
+    );
+}
+
+#[test]
 fn an_unknown_version_is_rejected() {
     let transcript = Transcript::new("handshake");
     let mut bytes = transcript.to_bytes();
@@ -65,117 +81,13 @@ fn an_unknown_version_is_rejected() {
     );
 }
 
-fn material() -> SessionMaterial {
-    SessionMaterial::new(
-        [0x11u8; 32],
-        client_nonce(),
-        host_nonce(),
-        vec![fixed_iv(), [0x22u8; 16], [0x33u8; 16]],
-    )
-}
-
 #[test]
-fn session_material_round_trips_and_marks_the_transcript_sensitive() {
-    let mut transcript = Transcript::new("verify");
-    transcript.push(TranscriptRecord::ReplyWithoutBody);
-    transcript.set_material(material());
-
-    assert!(transcript.is_sensitive());
-    let bytes = transcript.to_bytes();
-    let parsed = Transcript::from_bytes(&bytes).expect("a transcript this build wrote parses");
-
-    assert_eq!(parsed, transcript);
-    assert!(parsed.is_sensitive());
-    let parsed_material = parsed.material().expect("the material survived");
-    assert_eq!(parsed_material.host_secret(), &[0x11u8; 32]);
-    assert_eq!(parsed_material.client_nonce(), &client_nonce());
-    assert_eq!(parsed_material.host_nonce(), &host_nonce());
-    assert_eq!(parsed_material.ivs().len(), 3);
-
-    let debug = format!("{parsed:?}");
-    assert!(
-        !debug.contains("11111111111111111111111111111111"),
-        "the host secret must not appear in Debug: {debug}"
-    );
-    assert!(debug.contains("SessionMaterial(<redacted>)"), "{debug}");
-}
-
-#[test]
-fn a_transcript_without_material_is_not_sensitive() {
-    let transcript = Transcript::new("handshake");
-
-    assert!(!transcript.is_sensitive());
-    assert!(transcript.material().is_none());
-
-    let parsed = Transcript::from_bytes(&transcript.to_bytes()).expect("round trip");
-    assert!(!parsed.is_sensitive());
-    assert!(parsed.material().is_none());
-}
-
-#[test]
-fn an_unknown_material_marker_is_rejected() {
-    let mut transcript = Transcript::new("verify");
-    transcript.push(TranscriptRecord::Finger);
-    let mut bytes = transcript.to_bytes();
-    let marker = bytes.len() - 1;
-    bytes[marker] = 2;
-
-    assert_eq!(
-        Transcript::from_bytes(&bytes),
-        Err(TranscriptError::UnknownMaterialMarker(2))
-    );
-}
-
-#[test]
-fn a_truncated_material_section_is_rejected() {
-    let mut transcript = Transcript::new("verify");
-    transcript.set_material(material());
-    let bytes = transcript.to_bytes();
-
-    for length in 0..bytes.len() {
-        assert!(
-            Transcript::from_bytes(&bytes[..length]).is_err(),
-            "a {length}-byte prefix must not parse"
-        );
-    }
-    assert!(Transcript::from_bytes(&bytes).is_ok());
-}
-
-#[test]
-fn replay_with_recorded_material_compares_the_whole_frame() {
-    let recorded = frame::build_plain(cmd::MATCH, attr::CAPTURE, HANDLE, &[0u8; 4]);
-    let mut transcript = Transcript::new("verify");
-    transcript.set_material(material());
-    transcript.push(TranscriptRecord::HostFrame(recorded.clone()));
-    transcript.push(TranscriptRecord::ReplyWithoutBody);
-
-    let mut changed = recorded.clone();
-    changed[44] ^= 0xff;
-    let mut replay = ReplayTransport::new(transcript);
-    let event = replay.command(&changed);
-
-    assert!(
-        matches!(event, Event::Transport(TransportError::Other(_))),
-        "a byte change reaches the operation as a transport failure"
-    );
-    assert_eq!(
-        replay.divergence(),
-        Some(&Divergence::FrameBytes {
-            at: 44,
-            expected_len: recorded.len(),
-            got_len: changed.len(),
-        })
-    );
-    assert!(replay.finish().is_err());
-}
-
-#[test]
-fn replay_without_material_still_matches_on_command_attribute_and_handle() {
+fn replay_matches_on_command_attribute_and_handle_not_payload() {
     let recorded = frame::build_plain(cmd::MATCH, attr::CAPTURE, HANDLE, &[0u8; 4]);
     let mut changed = recorded.clone();
     changed[44] ^= 0xff;
 
-    let mut transcript = Transcript::new("verify");
+    let mut transcript = Transcript::new("match");
     transcript.push(TranscriptRecord::HostFrame(recorded));
     transcript.push(TranscriptRecord::ReplyWithoutBody);
 

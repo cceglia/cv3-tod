@@ -14,18 +14,21 @@ use cv3_core::cancel::{CancelCapture, CancelError};
 use cv3_core::capture::{
     ArmCapture, ArmOutcome, Capture, CaptureError, CapturedSample, SAMPLE_HASH_LEN,
 };
-use cv3_core::crypto::{BLOCK_LEN, HostKey};
+use cv3_core::crypto::BLOCK_LEN;
 use cv3_core::enrol::{Enrol, EnrolError, EnrolledTemplate, MAX_ACCEPTED_SAMPLES, TemplateSource};
 use cv3_core::handshake::{Handshake, HandshakeError};
 use cv3_core::session::{
     CloseError, CloseSession, OpenError, OpenSession, Session, Teardown, TeardownError,
 };
-use cv3_core::transcript::{RecordingTransport, ReplayTransport, SessionMaterial, Transcript};
+use cv3_core::transcript::{RecordingTransport, ReplayTransport, Transcript};
 use cv3_core::transport::{Transport, run as drive};
-use cv3_core::verify::{MatchError, Verdict, Verification, Verify, VerifyError};
+use cv3_core::verify::{
+    MatchError, VERDICT_MATCH, VERDICT_NO_MATCH, Verdict, Verification, Verify, VerifyError,
+};
 use cv3_core::{Action, Operation};
 
 use crate::discovery::{CommandSession, ProbeError, UsbBackend, open_for_command, probe};
+use crate::hexdump::HexTransport;
 use crate::random::{RandomError, RunSecrets, random_iv};
 use crate::signals::Shutdown;
 
@@ -49,13 +52,13 @@ pub const EXIT_NO_MATCH: u8 = 9;
 pub const EXIT_TRANSPORT: u8 = 10;
 
 const USAGE: &str = "usage: cvctl devices
-       cvctl handshake [--show-key] [--record <file>]
-       cvctl open [--bad-sequence] [--record <file>]
-       cvctl close [--record <file>]
-       cvctl capture
-       cvctl enroll
-       cvctl verify [--record <file>]
-       cvctl cancel-then-verify
+       cvctl handshake [--show-key] [--hex] [--record <file>]
+       cvctl open [--bad-sequence] [--hex] [--record <file>]
+       cvctl close [--hex] [--record <file>]
+       cvctl capture [--hex]
+       cvctl enroll [--hex]
+       cvctl verify [--hex]
+       cvctl cancel-then-verify [--hex]
        cvctl replay <file>";
 
 /// One parsed invocation.
@@ -63,21 +66,30 @@ enum Command<'a> {
     Devices,
     Handshake {
         show_key: bool,
+        hex: bool,
         record: Option<&'a str>,
     },
     Open {
         bad_sequence: bool,
+        hex: bool,
         record: Option<&'a str>,
     },
     Close {
+        hex: bool,
         record: Option<&'a str>,
     },
-    Capture,
-    Enroll,
+    Capture {
+        hex: bool,
+    },
+    Enroll {
+        hex: bool,
+    },
     Verify {
-        record: Option<&'a str>,
+        hex: bool,
     },
-    CancelThenVerify,
+    CancelThenVerify {
+        hex: bool,
+    },
     Replay {
         file: &'a str,
     },
@@ -87,6 +99,7 @@ enum Command<'a> {
 struct Flags<'a> {
     show_key: bool,
     bad_sequence: bool,
+    hex: bool,
     record: Option<&'a str>,
 }
 
@@ -100,6 +113,7 @@ fn parse(args: &[String]) -> Option<Command<'_>> {
             let flags = parse_flags(rest, true, false, true)?;
             Some(Command::Handshake {
                 show_key: flags.show_key,
+                hex: flags.hex,
                 record: flags.record,
             })
         }
@@ -107,24 +121,33 @@ fn parse(args: &[String]) -> Option<Command<'_>> {
             let flags = parse_flags(rest, false, true, true)?;
             Some(Command::Open {
                 bad_sequence: flags.bad_sequence,
+                hex: flags.hex,
                 record: flags.record,
             })
         }
         "close" => {
             let flags = parse_flags(rest, false, false, true)?;
             Some(Command::Close {
+                hex: flags.hex,
                 record: flags.record,
             })
         }
-        "capture" if rest.is_empty() => Some(Command::Capture),
-        "enroll" if rest.is_empty() => Some(Command::Enroll),
+        "capture" => {
+            let flags = parse_flags(rest, false, false, false)?;
+            Some(Command::Capture { hex: flags.hex })
+        }
+        "enroll" => {
+            let flags = parse_flags(rest, false, false, false)?;
+            Some(Command::Enroll { hex: flags.hex })
+        }
         "verify" => {
-            let flags = parse_flags(rest, false, false, true)?;
-            Some(Command::Verify {
-                record: flags.record,
-            })
+            let flags = parse_flags(rest, false, false, false)?;
+            Some(Command::Verify { hex: flags.hex })
         }
-        "cancel-then-verify" if rest.is_empty() => Some(Command::CancelThenVerify),
+        "cancel-then-verify" => {
+            let flags = parse_flags(rest, false, false, false)?;
+            Some(Command::CancelThenVerify { hex: flags.hex })
+        }
         "replay" => match rest {
             [file] => Some(Command::Replay { file }),
             _ => None,
@@ -142,6 +165,7 @@ fn parse_flags<'a>(
     let mut flags = Flags {
         show_key: false,
         bad_sequence: false,
+        hex: false,
         record: None,
     };
     let mut index = 0;
@@ -151,6 +175,7 @@ fn parse_flags<'a>(
             "--bad-sequence" if allow_bad_sequence && !flags.bad_sequence => {
                 flags.bad_sequence = true;
             }
+            "--hex" if !flags.hex => flags.hex = true,
             "--record" if allow_record && flags.record.is_none() => {
                 index += 1;
                 flags.record = Some(args.get(index)?.as_str());
@@ -174,18 +199,23 @@ pub fn run(
 ) -> u8 {
     match parse(args) {
         Some(Command::Devices) => devices(backend, shutdown, out, err),
-        Some(Command::Handshake { show_key, record }) => {
-            handshake(backend, shutdown, show_key, record, out, err)
-        }
+        Some(Command::Handshake {
+            show_key,
+            hex,
+            record,
+        }) => handshake(backend, shutdown, show_key, hex, record, out, err),
         Some(Command::Open {
             bad_sequence,
+            hex,
             record,
-        }) => open(backend, shutdown, bad_sequence, record, out, err),
-        Some(Command::Close { record }) => close(backend, shutdown, record, out, err),
-        Some(Command::Capture) => capture(backend, shutdown, out, err),
-        Some(Command::Enroll) => enroll(backend, shutdown, out, err),
-        Some(Command::Verify { record }) => verify(backend, shutdown, record, out, err),
-        Some(Command::CancelThenVerify) => cancel_then_verify(backend, shutdown, out, err),
+        }) => open(backend, shutdown, bad_sequence, hex, record, out, err),
+        Some(Command::Close { hex, record }) => close(backend, shutdown, hex, record, out, err),
+        Some(Command::Capture { hex }) => capture(backend, shutdown, hex, out, err),
+        Some(Command::Enroll { hex }) => enroll(backend, shutdown, hex, out, err),
+        Some(Command::Verify { hex }) => verify(backend, shutdown, hex, out, err),
+        Some(Command::CancelThenVerify { hex }) => {
+            cancel_then_verify(backend, shutdown, hex, out, err)
+        }
         Some(Command::Replay { file }) => replay(file, out, err),
         None => {
             let _ = writeln!(err, "{USAGE}");
@@ -315,34 +345,52 @@ fn capture_over(
     }
 }
 
-/// Wraps the probe's exchange in a recording transport when `record` asks for one.
+/// Wraps the probe's exchange in a recording and/or hex-dumping transport when asked.
 ///
-/// The same operation runs either way. A write failure is returned to the caller rather than
-/// swallowed: the user asked for a transcript, and a missing one must be visible. When `material`
-/// is present the transcript carries it and is marked sensitive; every other recording stays
-/// material-free and replays with fresh ephemeral keys.
+/// The same operation runs whichever wrappers are present. A write failure is returned to the
+/// caller rather than swallowed: the user asked for a transcript, and a missing one must be
+/// visible. The transcript is wire-only, so replay uses fresh ephemeral keys.
 fn with_transport<R>(
     channel: &mut CommandSession,
     command: &str,
     record: Option<&str>,
-    material: Option<SessionMaterial>,
+    dump_hex: bool,
+    err: &mut dyn Write,
     run_operation: impl FnOnce(&mut dyn Transport) -> R,
 ) -> (R, Option<std::io::Error>) {
     match record {
         Some(path) => {
-            let mut transport = RecordingTransport::new(channel.exchange(), command);
-            let result = run_operation(&mut transport);
-            let mut transcript = transport.into_transcript();
-            if let Some(material) = material {
-                transcript.set_material(material);
-            }
+            let recording = RecordingTransport::new(channel.exchange(), command);
+            let (result, recording) = run_through(recording, dump_hex, err, run_operation);
+            let transcript = recording.into_transcript();
             let error = std::fs::write(path, transcript.to_bytes()).err();
             (result, error)
         }
         None => {
-            let mut transport = channel.exchange();
-            (run_operation(&mut transport), None)
+            let (result, _) = run_through(channel.exchange(), dump_hex, err, run_operation);
+            (result, None)
         }
+    }
+}
+
+/// Runs one operation over `inner`, adding the hex dump as the outermost transport when asked.
+///
+/// Returns the inner transport too, so a recording wrapper underneath can still produce its
+/// transcript after the operation finishes.
+fn run_through<T: Transport, R>(
+    inner: T,
+    dump_hex: bool,
+    err: &mut dyn Write,
+    run_operation: impl FnOnce(&mut dyn Transport) -> R,
+) -> (R, T) {
+    if dump_hex {
+        let mut transport = HexTransport::new(inner, err);
+        let result = run_operation(&mut transport);
+        (result, transport.into_inner())
+    } else {
+        let mut transport = inner;
+        let result = run_operation(&mut transport);
+        (result, transport)
     }
 }
 
@@ -376,6 +424,7 @@ fn handshake(
     backend: &mut dyn UsbBackend,
     shutdown: &dyn Shutdown,
     show_key: bool,
+    dump_hex: bool,
     record: Option<&str>,
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -395,10 +444,14 @@ fn handshake(
         }
     };
 
-    let (outcome, record_error) =
-        with_transport(&mut channel, "handshake", record, None, |transport| {
-            handshake_over(transport, secrets, false)
-        });
+    let (outcome, record_error) = with_transport(
+        &mut channel,
+        "handshake",
+        record,
+        dump_hex,
+        err,
+        |transport| handshake_over(transport, secrets, false),
+    );
 
     let code = match outcome {
         Ok(run) => {
@@ -428,6 +481,7 @@ fn open(
     backend: &mut dyn UsbBackend,
     shutdown: &dyn Shutdown,
     bad_sequence: bool,
+    dump_hex: bool,
     record: Option<&str>,
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -454,9 +508,10 @@ fn open(
         }
     };
 
-    let (outcome, record_error) = with_transport(&mut channel, "open", record, None, |transport| {
-        open_over(transport, secrets, iv, bad_sequence)
-    });
+    let (outcome, record_error) =
+        with_transport(&mut channel, "open", record, dump_hex, err, |transport| {
+            open_over(transport, secrets, iv, bad_sequence)
+        });
 
     let code = match outcome {
         Ok((handle, closed)) => {
@@ -488,6 +543,7 @@ fn open(
 fn close(
     backend: &mut dyn UsbBackend,
     shutdown: &dyn Shutdown,
+    dump_hex: bool,
     record: Option<&str>,
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -508,7 +564,7 @@ fn close(
     };
 
     let (outcome, record_error) =
-        with_transport(&mut channel, "close", record, None, |transport| {
+        with_transport(&mut channel, "close", record, dump_hex, err, |transport| {
             close_over(transport, secrets)
         });
 
@@ -534,6 +590,7 @@ fn close(
 fn capture(
     backend: &mut dyn UsbBackend,
     shutdown: &dyn Shutdown,
+    dump_hex: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
@@ -566,8 +623,9 @@ fn capture(
         }
     };
 
-    let mut exchange = channel.exchange();
-    let outcome = capture_over(&mut exchange, secrets, open_iv, capture_iv);
+    let (outcome, _) = with_transport(&mut channel, "capture", None, dump_hex, err, |transport| {
+        capture_over(transport, secrets, open_iv, capture_iv)
+    });
 
     let code = match outcome {
         Ok((sample_hash, teardown)) => {
@@ -684,6 +742,7 @@ fn enrol_over(
 fn enroll(
     backend: &mut dyn UsbBackend,
     shutdown: &dyn Shutdown,
+    dump_hex: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
@@ -716,8 +775,10 @@ fn enroll(
         }
     };
 
-    let mut exchange = channel.exchange();
-    let code = match enrol_over(&mut exchange, secrets, open_iv, base_iv, out) {
+    let (outcome, _) = with_transport(&mut channel, "enroll", None, dump_hex, err, |transport| {
+        enrol_over(transport, secrets, open_iv, base_iv, out)
+    });
+    let code = match outcome {
         Ok((report, teardown)) => {
             let _ = writeln!(
                 out,
@@ -789,13 +850,14 @@ fn verify_over(
     }
 }
 
-/// Prints the verdict, the 20-byte value (or its absence) and both lengths.
+/// Prints the decoded verdict word, the 20-byte value (or its absence) and both lengths.
 fn print_verdict(verdict: &Verdict, out: &mut dyn Write) {
-    let _ = writeln!(
-        out,
-        "{}",
-        if verdict.matched { "match" } else { "no match" }
-    );
+    let meaning = match verdict.word {
+        VERDICT_MATCH => "match",
+        VERDICT_NO_MATCH => "no match",
+        _ => "no match, unexpected word",
+    };
+    let _ = writeln!(out, "verdict {} ({meaning})", verdict.word);
     match &verdict.value {
         Some(value) => {
             let _ = writeln!(out, "value {}", hex(value));
@@ -846,7 +908,7 @@ fn verify_error_code(error: &VerifyError) -> u8 {
 fn verify(
     backend: &mut dyn UsbBackend,
     shutdown: &dyn Shutdown,
-    record: Option<&str>,
+    dump_hex: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
@@ -885,20 +947,9 @@ fn verify(
             return EXIT_OTHER;
         }
     };
-    let material = SessionMaterial::new(
-        secrets.host_key.secret_bytes(),
-        secrets.client_nonce,
-        secrets.host_nonce,
-        vec![open_iv, capture_iv, match_iv],
-    );
-
-    let (outcome, record_error) = with_transport(
-        &mut channel,
-        "verify",
-        record,
-        Some(material),
-        |transport| verify_over(transport, secrets, open_iv, capture_iv, match_iv),
-    );
+    let (outcome, _) = with_transport(&mut channel, "verify", None, dump_hex, err, |transport| {
+        verify_over(transport, secrets, open_iv, capture_iv, match_iv)
+    });
 
     let code = match outcome {
         Ok((verdict, teardown)) => {
@@ -929,8 +980,7 @@ fn verify(
             verify_error_code(&error)
         }
     };
-    let code = signalled_exit(shutdown, err, code);
-    finish_recording(record_error, err, code)
+    signalled_exit(shutdown, err, code)
 }
 
 /// Where a cancel-then-verify run stopped.
@@ -992,6 +1042,7 @@ fn cancel_then_verify_over(
 fn cancel_then_verify(
     backend: &mut dyn UsbBackend,
     shutdown: &dyn Shutdown,
+    dump_hex: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
@@ -1022,14 +1073,15 @@ fn cancel_then_verify(
         }
     };
 
-    let mut exchange = channel.exchange();
-    let outcome = cancel_then_verify_over(
-        &mut exchange,
-        secrets,
-        open_iv,
-        arm_iv,
-        capture_iv,
-        match_iv,
+    let (outcome, _) = with_transport(
+        &mut channel,
+        "cancel-then-verify",
+        None,
+        dump_hex,
+        err,
+        |transport| {
+            cancel_then_verify_over(transport, secrets, open_iv, arm_iv, capture_iv, match_iv)
+        },
     );
 
     let code = match outcome {
@@ -1083,11 +1135,9 @@ fn cancel_then_verify(
 /// What a replay run produced.
 enum ReplayOutcome {
     Random(RandomError),
-    Message(String),
     Handshake(Result<Session, HandshakeError>),
     Open(Result<(u32, Result<(), CloseError>), OpenFailure>),
     Close(Result<(), CloseFailure>),
-    Verify(Result<(Verdict, Result<(), TeardownError>), VerifyFailure>),
 }
 
 fn replay_handshake(transport: &mut ReplayTransport) -> ReplayOutcome {
@@ -1118,33 +1168,6 @@ fn replay_close(transport: &mut ReplayTransport) -> ReplayOutcome {
     }
 }
 
-/// Replays a verify recording using the session material it carries.
-///
-/// The recorded host secret and nonces rebuild the same session key, and the recorded IVs rebuild
-/// the same `0x66` and `0x73` frames, so the wrapped no-match reply decrypts exactly as it did on
-/// hardware. A transcript without material cannot be replayed this way.
-fn replay_verify(transport: &mut ReplayTransport, material: &SessionMaterial) -> ReplayOutcome {
-    let host_key = match HostKey::from_bytes(material.host_secret()) {
-        Ok(host_key) => host_key,
-        Err(error) => {
-            return ReplayOutcome::Message(format!("invalid session material: {error}"));
-        }
-    };
-    let secrets = RunSecrets {
-        host_key,
-        client_nonce: *material.client_nonce(),
-        host_nonce: *material.host_nonce(),
-    };
-    let ivs = material.ivs();
-    if ivs.len() < 3 {
-        return ReplayOutcome::Message(format!(
-            "verify session material has {} IV(s), needs three (open, capture, match)",
-            ivs.len()
-        ));
-    }
-    ReplayOutcome::Verify(verify_over(transport, secrets, ivs[0], ivs[1], ivs[2]))
-}
-
 /// Replays a recorded invocation with no hardware.
 fn replay(file: &str, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
     let bytes = match std::fs::read(file) {
@@ -1163,34 +1186,16 @@ fn replay(file: &str, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
     };
 
     let command = transcript.command().to_owned();
-    let material = transcript.material().cloned();
     let mut transport = ReplayTransport::new(transcript);
     let outcome = match command.as_str() {
         "handshake" => replay_handshake(&mut transport),
         "open" => replay_open(&mut transport),
         "close" => replay_close(&mut transport),
-        "verify" => match material.as_ref() {
-            Some(material) => replay_verify(&mut transport, material),
-            None => {
-                let _ = writeln!(
-                    err,
-                    "cvctl: verify transcript has no session material; only a verify recorded \
-                     with --record can be replayed"
-                );
-                return EXIT_OTHER;
-            }
-        },
         other => {
             let _ = writeln!(err, "cvctl: transcript records unknown command {other:?}");
             return EXIT_OTHER;
         }
     };
-
-    // A pre-run problem with the material is not a divergence: the operation never received a
-    // frame, so leftover records say nothing about its behaviour.
-    if matches!(&outcome, ReplayOutcome::Message(_)) {
-        return report_replay(outcome, out, err);
-    }
 
     // Divergence wins over the operation's own result: the operation ran against bytes that did
     // not match the recording, so its answer is not a replay of anything.
@@ -1209,10 +1214,6 @@ fn report_replay(outcome: ReplayOutcome, out: &mut dyn Write, err: &mut dyn Writ
     match outcome {
         ReplayOutcome::Random(error) => {
             let _ = writeln!(err, "cvctl: {error}");
-            EXIT_OTHER
-        }
-        ReplayOutcome::Message(message) => {
-            let _ = writeln!(err, "cvctl: {message}");
             EXIT_OTHER
         }
         ReplayOutcome::Handshake(Ok(session)) => {
@@ -1263,33 +1264,6 @@ fn report_replay(outcome: ReplayOutcome, out: &mut dyn Write, err: &mut dyn Writ
             let _ = writeln!(err, "cvctl: {error}");
             EXIT_OTHER
         }
-        ReplayOutcome::Verify(Ok((verdict, teardown))) => {
-            print_verdict(&verdict, out);
-            if let Err(error) = teardown {
-                let _ = writeln!(err, "cvctl: {error}");
-            }
-            if verdict.matched {
-                EXIT_OK
-            } else {
-                EXIT_NO_MATCH
-            }
-        }
-        ReplayOutcome::Verify(Err(VerifyFailure::Handshake(error))) => {
-            let _ = writeln!(err, "cvctl: handshake failed: {error}");
-            EXIT_OTHER
-        }
-        ReplayOutcome::Verify(Err(VerifyFailure::Open(error))) => {
-            let _ = writeln!(err, "cvctl: {error}");
-            if matches!(error, OpenError::WrongSequence) {
-                EXIT_SEQUENCE
-            } else {
-                EXIT_OTHER
-            }
-        }
-        ReplayOutcome::Verify(Err(VerifyFailure::Verify(error))) => {
-            let _ = writeln!(err, "cvctl: verification failed: {error}");
-            verify_error_code(&error)
-        }
     }
 }
 
@@ -1322,7 +1296,10 @@ mod tests {
     use crate::discovery::UsbError;
     use crate::layout::{EndpointDescriptor, TransferType};
     use crate::signals::SignalFlag;
-    use crate::testing::{ENROLMENT_ID, FakeUsb, MATCH_VALUE, SAMPLE_HASH, TEST_HANDLE, sensor};
+    use crate::testing::{
+        DEVICE_NONCE, DEVICE_PUBLIC, ENROLMENT_ID, FakeUsb, MATCH_VALUE, SAMPLE_HASH, TEST_HANDLE,
+        sensor,
+    };
 
     fn run_with(args: &[&str], usb: &mut FakeUsb, shutdown: &dyn Shutdown) -> (u8, String, String) {
         let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
@@ -1575,6 +1552,27 @@ mod tests {
     }
 
     #[test]
+    fn hex_is_accepted_on_every_hardware_subcommand_and_nowhere_else() {
+        for args in [
+            vec!["handshake", "--hex"],
+            vec!["open", "--hex"],
+            vec!["close", "--hex"],
+            vec!["capture", "--hex"],
+            vec!["enroll", "--hex"],
+            vec!["verify", "--hex"],
+            vec!["cancel-then-verify", "--hex"],
+        ] {
+            let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+            assert!(parse(&args).is_some(), "{args:?} should accept --hex");
+        }
+
+        for args in [vec!["devices", "--hex"], vec!["replay", "file", "--hex"]] {
+            let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+            assert!(parse(&args).is_none(), "{args:?} should reject --hex");
+        }
+    }
+
+    #[test]
     fn handshake_prints_the_handle_nonce_lengths_and_key_fingerprint() {
         let mut usb = FakeUsb::with_sensor();
         let shutdown = SignalFlag::new();
@@ -1626,6 +1624,68 @@ mod tests {
             .strip_prefix("key fingerprint ")
             .expect("fingerprint");
         assert_ne!(fingerprint, raw, "the fingerprint is not the key");
+    }
+
+    #[test]
+    fn hex_dumps_both_directions_to_stderr_and_leaves_stdout_unchanged() {
+        let mut usb = FakeUsb::with_sensor();
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["handshake", "--hex"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(
+            out.lines().count(),
+            6,
+            "stdout is the ordinary report: {out}"
+        );
+        assert!(
+            !out.contains("> ") && !out.contains("< "),
+            "the hex dump never reaches stdout: {out}"
+        );
+
+        let sent = usb.sent.borrow();
+        let host: Vec<&str> = err.lines().filter(|line| line.starts_with("> ")).collect();
+        let device: Vec<&str> = err.lines().filter(|line| line.starts_with("< ")).collect();
+
+        assert_eq!(host.len(), sent.len(), "one host line per frame: {err}");
+        for (line, frame) in host.iter().zip(sent.iter()) {
+            assert_eq!(*line, format!("> {}", hex(frame)));
+        }
+
+        assert_eq!(device.len(), sent.len(), "one device line per reply: {err}");
+
+        // The scripted sensor's replies are deterministic, so the device direction can be
+        // asserted exactly: the 0x23 parameter block, the empty 0x24 body, then the empty close.
+        let mut challenge_param = [0u8; 148];
+        challenge_param[..64].copy_from_slice(&DEVICE_PUBLIC);
+        challenge_param[64..128].fill(0xcc);
+        challenge_param[128..].copy_from_slice(&DEVICE_NONCE);
+        let expected_device = [
+            frame::build_plain_reply(
+                cmd::CHALLENGE,
+                attr::CHALLENGE,
+                TEST_HANDLE,
+                0,
+                &challenge_param,
+            ),
+            frame::build_plain_reply(
+                cmd::CHALLENGE_RESPONSE,
+                attr::CHALLENGE_RESPONSE,
+                TEST_HANDLE,
+                0,
+                &[],
+            ),
+        ];
+        assert_eq!(device[0], format!("< {}", hex(&expected_device[0])));
+        assert_eq!(device[1], format!("< {}", hex(&expected_device[1])));
+        assert_eq!(device[2], "< empty");
+
+        assert_eq!(
+            err.lines().count(),
+            sent.len() * 2,
+            "each frame has one line in each direction: {err}"
+        );
     }
 
     #[test]
@@ -2316,16 +2376,24 @@ mod tests {
     }
 
     fn verify_output(
-        verdict: &str,
+        word: u32,
         value: Option<&[u8; 20]>,
         reply: usize,
         plaintext: usize,
     ) -> String {
+        let meaning = match word {
+            VERDICT_MATCH => "match",
+            VERDICT_NO_MATCH => "no match",
+            _ => "no match, unexpected word",
+        };
         let value = match value {
             Some(value) => format!("value {}", hex(value)),
             None => "value absent".to_owned(),
         };
-        format!("{verdict}\n{value}\nreply length {reply}\nplaintext length {plaintext}\n")
+        format!(
+            "verdict {word} ({meaning})\n{value}\nreply length {reply}\nplaintext length \
+             {plaintext}\n"
+        )
     }
 
     #[test]
@@ -2339,7 +2407,7 @@ mod tests {
         assert_eq!(err, "");
         assert_eq!(
             out,
-            verify_output("match", Some(&MATCH_VALUE), 108, 52),
+            verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52),
             "the verdict, value and lengths are printed exactly as verify prints them"
         );
         assert_eq!(
@@ -2436,7 +2504,10 @@ mod tests {
 
         assert_eq!(code, EXIT_OK, "{err}");
         assert_eq!(err, "");
-        assert_eq!(out, verify_output("match", Some(&MATCH_VALUE), 108, 52));
+        assert_eq!(
+            out,
+            verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
+        );
         assert_eq!(
             sent_commands(&usb),
             [
@@ -2471,7 +2542,10 @@ mod tests {
 
         assert_eq!(code, EXIT_NO_MATCH);
         assert_eq!(err, "");
-        assert_eq!(out, verify_output("no match", Some(&MATCH_VALUE), 108, 52));
+        assert_eq!(
+            out,
+            verify_output(VERDICT_NO_MATCH, Some(&MATCH_VALUE), 108, 52)
+        );
         assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
         assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some());
     }
@@ -2615,7 +2689,7 @@ mod tests {
         assert_eq!(err, "");
         assert_eq!(
             out,
-            verify_output("match", Some(&MATCH_VALUE), 108, 52),
+            verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52),
             "the verdict, the value and both lengths"
         );
         assert_eq!(
@@ -2658,7 +2732,7 @@ mod tests {
         assert_eq!(err, "");
         assert_eq!(
             out,
-            verify_output("no match", Some(&MATCH_VALUE), 108, 52),
+            verify_output(VERDICT_NO_MATCH, Some(&MATCH_VALUE), 108, 52),
             "a no-match carries the value when the reply supplies it"
         );
         assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
@@ -2675,7 +2749,7 @@ mod tests {
 
         assert_eq!(code, EXIT_NO_MATCH);
         assert_eq!(err, "");
-        assert_eq!(out, verify_output("no match", None, 76, 28));
+        assert_eq!(out, verify_output(VERDICT_NO_MATCH, None, 76, 28));
         assert!(out.contains("value absent"), "{out}");
     }
 
@@ -2775,45 +2849,41 @@ mod tests {
     }
 
     #[test]
-    fn a_recorded_no_match_verify_replays_with_the_same_detail_and_no_hardware() {
-        let record = TempRecord::new("verify-replay");
-        let shutdown = SignalFlag::new();
+    fn verify_prints_an_unexpected_verdict_word_and_still_exits_no_match() {
         let mut usb = FakeUsb::with_sensor();
-        usb.match_plaintext = Some(match_plaintext(0, Some(&MATCH_VALUE)));
+        usb.match_plaintext = Some(match_plaintext(2, Some(&MATCH_VALUE)));
+        let shutdown = SignalFlag::new();
 
-        let (record_code, record_out, record_err) =
-            run_with(&["verify", "--record", record.path()], &mut usb, &shutdown);
-        assert_eq!(record_code, EXIT_NO_MATCH, "{record_err}");
-        assert_eq!(record_err, "");
-        assert!(record.exists());
+        let (code, out, err) = run_with(&["verify"], &mut usb, &shutdown);
 
-        let bytes = std::fs::read(&record.0).expect("the recording is readable");
-        let transcript = Transcript::from_bytes(&bytes).expect("the recording parses");
-        assert_eq!(transcript.command(), "verify");
-        assert!(
-            transcript.is_sensitive(),
-            "a verify recording carries session material"
-        );
-        assert!(transcript.material().is_some());
-
-        let mut replay_usb = FakeUsb::default();
-        let (code, out, err) = run_with(&["replay", record.path()], &mut replay_usb, &shutdown);
-
-        assert_eq!(code, EXIT_NO_MATCH, "{err}");
+        assert_eq!(code, EXIT_NO_MATCH);
         assert_eq!(err, "");
         assert_eq!(
-            out, record_out,
-            "the replay reproduces the verdict, value and lengths"
-        );
-        assert!(
-            replay_usb.calls().is_empty(),
-            "replay never touches a USB backend"
+            out,
+            verify_output(2, Some(&MATCH_VALUE), 108, 52),
+            "an undefined word is printed raw and never treated as a match"
         );
     }
 
     #[test]
-    fn replay_rejects_a_verify_transcript_without_session_material() {
-        let record = TempRecord::new("verify-no-material");
+    fn verify_rejects_record_because_recordings_are_wire_only() {
+        let record = TempRecord::new("verify-record");
+        let mut usb = FakeUsb::with_sensor();
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) =
+            run_with(&["verify", "--record", record.path()], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OTHER);
+        assert_eq!(out, "");
+        assert_eq!(err, format!("{USAGE}\n"));
+        assert!(!record.exists(), "no transcript is written");
+        assert!(usb.calls().is_empty(), "nothing touches the sensor");
+    }
+
+    #[test]
+    fn replay_rejects_a_verify_transcript_as_unknown() {
+        let record = TempRecord::new("verify-unknown");
         record.write(&Transcript::new("verify").to_bytes());
         let mut usb = FakeUsb::default();
         let shutdown = SignalFlag::new();
@@ -2822,36 +2892,14 @@ mod tests {
 
         assert_eq!(code, EXIT_OTHER);
         assert_eq!(out, "");
-        assert!(err.contains("session material"), "{err}");
-        assert!(usb.calls().is_empty());
-    }
-
-    #[test]
-    fn replay_rejects_verify_material_that_is_not_a_valid_key() {
-        let record = TempRecord::new("verify-bad-material");
-        let mut transcript = Transcript::new("verify");
-        transcript.set_material(SessionMaterial::new(
-            [0u8; 32],
-            [0u8; 20],
-            [0u8; 20],
-            vec![[0u8; 16]; 3],
-        ));
-        record.write(&transcript.to_bytes());
-        let mut usb = FakeUsb::default();
-        let shutdown = SignalFlag::new();
-
-        let (code, out, err) = run_with(&["replay", record.path()], &mut usb, &shutdown);
-
-        assert_eq!(code, EXIT_OTHER);
-        assert_eq!(out, "");
-        assert!(err.contains("invalid session material"), "{err}");
+        assert!(err.contains("unknown command"), "{err}");
         assert!(usb.calls().is_empty());
     }
 
     #[test]
     fn replay_rejects_an_unknown_transcript_version() {
         let record = TempRecord::new("unknown-version");
-        let mut bytes = Transcript::new("verify").to_bytes();
+        let mut bytes = Transcript::new("handshake").to_bytes();
         bytes[8..10].copy_from_slice(&99u16.to_le_bytes());
         record.write(&bytes);
         let mut usb = FakeUsb::default();

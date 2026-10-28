@@ -184,17 +184,6 @@ impl HostKey {
         out
     }
 
-    /// The 32-byte big-endian secret scalar.
-    ///
-    /// This is ephemeral material, exposed only so a recorded session can be replayed exactly;
-    /// nothing in the shipping path stores it. Treat the result as sensitive.
-    pub fn secret_bytes(&self) -> [u8; 32] {
-        let bytes = self.0.to_bytes();
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&bytes);
-        out
-    }
-
     /// ECDH with the device's `X || Y` public key, returning the 32-byte X coordinate.
     pub fn ecdh(&self, peer: &[u8; 64]) -> Result<[u8; 32], CryptoError> {
         let mut sec1 = [0u8; 65];
@@ -387,13 +376,6 @@ mod tests {
         let host = HostKey::from_bytes(&host_secret).expect("RFC scalar is valid");
         assert_eq!(host.public_key(), host_public, "g^i");
         assert_eq!(host.ecdh(&device_public).expect("valid point"), shared);
-    }
-
-    #[test]
-    fn secret_bytes_round_trip_to_the_same_public_key() {
-        let key = HostKey::from_bytes(&[7u8; 32]).expect("valid scalar");
-        let restored = HostKey::from_bytes(&key.secret_bytes()).expect("the bytes are a scalar");
-        assert_eq!(key.public_key(), restored.public_key());
     }
 
     #[test]

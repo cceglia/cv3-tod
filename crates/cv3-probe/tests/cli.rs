@@ -12,10 +12,11 @@ fn a_bare_invocation_prints_usage_to_stderr_and_exits_one() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "");
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        "usage: cvctl devices\n       cvctl handshake [--show-key] [--record <file>]\n       \
-         cvctl open [--bad-sequence] [--record <file>]\n       cvctl close [--record <file>]\n       \
-         cvctl capture\n       cvctl enroll\n       cvctl verify [--record <file>]\n       \
-         cvctl cancel-then-verify\n       cvctl replay <file>\n"
+        "usage: cvctl devices\n       cvctl handshake [--show-key] [--hex] [--record <file>]\n       \
+         cvctl open [--bad-sequence] [--hex] [--record <file>]\n       \
+         cvctl close [--hex] [--record <file>]\n       \
+         cvctl capture [--hex]\n       cvctl enroll [--hex]\n       cvctl verify [--hex]\n       \
+         cvctl cancel-then-verify [--hex]\n       cvctl replay <file>\n"
     );
 }
 

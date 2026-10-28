@@ -2,5 +2,5 @@
 /extracted/
 /tmp/
 /*.deb
-# Local session recordings may contain session material; never commit them.
+# Local session recordings are real device traffic; never commit them.
 *.cvrec
