@@ -436,6 +436,11 @@ impl HandshakeSensor {
             &ciphertext,
         );
         body[20..24].copy_from_slice(&command_status.to_le_bytes());
+        // The sensor stamps wrapped replies with the reply encoding, not the command encoding:
+        // measured on hardware on 2026-10-28 (`0x66` answered with encoding `0x03`). The fake
+        // mirrors the wire so the offline suite cannot stay green on an assumption the sensor
+        // does not make.
+        body[11] = cv3_core::proto::Encoding::WrappedReply as u8;
         body
     }
 

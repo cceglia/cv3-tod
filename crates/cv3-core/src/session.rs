@@ -96,9 +96,13 @@ impl SessionKey {
     /// Lengths are device-controlled, so every bound is checked before slicing or decrypting. The
     /// ciphertext must be non-empty, a whole number of blocks, and no longer than
     /// [`MAX_CIPHERTEXT_LEN`]; PKCS#7 padding must be well formed.
+    ///
+    /// Both wrapped encodings are accepted: `0x02`, which the host uses on commands, and `0x03`,
+    /// which the sensor was measured to use on replies (see [`Encoding::WrappedReply`]). The body
+    /// is laid out the same either way. Any other encoding is refused.
     pub fn unwrap(&self, body: &[u8]) -> Result<UnwrappedReply, UnwrapError> {
         let header = frame::validate(body).map_err(UnwrapError::Frame)?;
-        if header.encoding != Encoding::Wrapped as u8 {
+        if !Encoding::is_wrapped(header.encoding) {
             return Err(UnwrapError::UnexpectedEncoding(header.encoding));
         }
 
@@ -372,7 +376,8 @@ impl std::error::Error for WrapError {}
 pub enum UnwrapError {
     /// The reply's frame header does not validate.
     Frame(FrameError),
-    /// The reply is not a wrapped frame.
+    /// The reply's encoding is neither wrapped form: not `0x02` (host → sensor) nor `0x03`
+    /// (sensor → host).
     UnexpectedEncoding(u8),
     /// A wrapped reply must carry at least one ciphertext block.
     EmptyCiphertext,
@@ -389,7 +394,11 @@ impl fmt::Display for UnwrapError {
         match self {
             Self::Frame(error) => write!(f, "malformed wrapped reply: {error}"),
             Self::UnexpectedEncoding(encoding) => {
-                write!(f, "wrapped reply has encoding {encoding:#04x}, not 0x02")
+                write!(
+                    f,
+                    "wrapped reply has encoding {encoding:#04x}, neither wrapped encoding (0x02 or \
+                     0x03)"
+                )
             }
             Self::EmptyCiphertext => f.write_str("wrapped reply carries no ciphertext"),
             Self::CiphertextNotAligned { got } => {
@@ -1085,6 +1094,44 @@ mod tests {
             .unwrap(&body)
             .expect("status is not encrypted");
         assert_eq!(reply.header.status, proto::status::BAD_SEQUENCE);
+    }
+
+    #[test]
+    fn a_reply_with_the_reply_encoding_decrypts_like_one_with_the_command_encoding() {
+        let as_command = open_frame(0);
+        let mut as_reply = as_command.clone();
+        as_reply[11] = Encoding::WrappedReply as u8;
+
+        let command = session_key()
+            .unwrap(&as_command)
+            .expect("0x02 is a wrapped encoding");
+        let reply = session_key()
+            .unwrap(&as_reply)
+            .expect("0x03 is a wrapped encoding");
+
+        assert_eq!(reply.plaintext, command.plaintext);
+        assert_eq!(reply.header.handle, command.header.handle);
+        assert_eq!(reply.header.status, command.header.status);
+        assert_eq!(command.header.encoding, Encoding::Wrapped as u8);
+        assert_eq!(reply.header.encoding, Encoding::WrappedReply as u8);
+    }
+
+    #[test]
+    fn unwrap_refuses_the_encodings_that_are_not_wrapped() {
+        for encoding in [
+            Encoding::Plain as u8,
+            Encoding::CloseHandle as u8,
+            0x01,
+            0x05,
+        ] {
+            let mut body = open_frame(0);
+            body[11] = encoding;
+
+            assert_eq!(
+                session_key().unwrap(&body),
+                Err(UnwrapError::UnexpectedEncoding(encoding))
+            );
+        }
     }
 
     #[test]

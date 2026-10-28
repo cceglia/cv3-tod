@@ -102,9 +102,14 @@ fn random_bytes_that_start_like_a_header_never_panic() {
         for byte in &mut bytes[8..] {
             *byte = (next(&mut state) >> 16) as u8;
         }
-        // Half the corpus claims to be a wrapped reply, so the unwrap path is exercised too.
+        // Half the corpus claims to be a wrapped reply, so the unwrap path is exercised too. Both
+        // accepted encodings are covered: 0x02 on commands, 0x03 on replies.
         if next(&mut state) & 1 == 0 {
-            bytes[11] = 0x02;
+            bytes[11] = if next(&mut state) & 1 == 0 {
+                0x02
+            } else {
+                0x03
+            };
             let iv = [0x33u8; 16];
             bytes[24..40].copy_from_slice(&iv);
         }

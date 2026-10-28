@@ -58,9 +58,26 @@ pub enum Encoding {
     /// Parameters are sent as-is.
     Plain = 0x00,
     /// Parameters are AES-128-CBC ciphertext preceded by an IV, with a MAC inside the plaintext.
+    ///
+    /// This is what the host sends on a wrapped command.
     Wrapped = 0x02,
+    /// The same wrapped body as [`Self::Wrapped`], as the sensor sends it: AES-128-CBC ciphertext
+    /// preceded by an IV, with no token inside the plaintext.
+    ///
+    /// Host → sensor wrapped commands use `0x02`; sensor → host wrapped replies were measured to
+    /// use `0x03` on 2026-10-28. The reference ignores this byte and decrypts any body long enough
+    /// to hold an IV and a ciphertext block, so the direction is the only thing it distinguishes.
+    WrappedReply = 0x03,
     /// Close-session frame: parameters are plaintext but the frame is not a normal command.
     CloseHandle = 0x04,
+}
+
+impl Encoding {
+    /// Whether `byte` is either direction's wrapped encoding: [`Self::Wrapped`] on a command,
+    /// [`Self::WrappedReply`] on a reply.
+    pub fn is_wrapped(byte: u8) -> bool {
+        byte == Self::Wrapped as u8 || byte == Self::WrappedReply as u8
+    }
 }
 
 /// Status word at header offset 20. Zero is success; these are the values the protocol uses to

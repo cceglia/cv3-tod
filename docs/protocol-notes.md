@@ -6,6 +6,25 @@ reference material** (the audited third-party implementation and its write-up, k
 build). Most of this document is the second kind today; it exists so the difference is never
 blurred.
 
+## Measured on 2026-10-28
+
+Measured with `cvctl` on the sensor, in a root hardware run whose log is
+`target/hardware-acceptance-20261028-200518.log`:
+
+- **Handshake.** A fresh host keypair completes the `0x23` / `0x24` exchange. Two consecutive
+  handshakes produced different host public keys and different session key fingerprints.
+- **Wrapped open.** The wrapped `0x02` open succeeds at sequence 0, on a fresh session and again
+  after a close.
+- **Sequence rejection.** A deliberate sequence 1 on a fresh session is rejected with `0x0F`
+  (`cvctl open --bad-sequence`).
+- **Reply encoding.** The `0x66` capture reply carries encoding `0x03` in the frame header, while
+  the wrapped command the host sends carries `0x02`. The driver accepted only `0x02` before this
+  run and refused every reply; it now accepts both (see `Encoding::WrappedReply`).
+- **Device nonce.** The device nonce is 20 bytes as this driver reads it at `HEADER_LEN + 128`.
+
+Steps 05–09 of that run all failed at the reply-encoding check above, so the run measured nothing
+beyond these points: no capture, match reply or binding fact comes from it.
+
 ## Wrap sequence
 
 The wrap sequence is the per-session counter the driver and the sensor keep in step while a
