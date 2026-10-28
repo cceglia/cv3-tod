@@ -1,12 +1,18 @@
-//! Verification: the wrapped `0x73` match, and the capture-then-match composition.
+//! Verification: the wrapped `0x72` request, and the capture-then-verify composition.
 //!
 //! ```text
 //! host → sensor  0x66 wrapped, attr 0x47   arm a capture (a [`Capture`])
 //! sensor → host                             the finger event
-//! host → sensor  0x73 wrapped, attr 0x47   TLV 88 bytes, plaintext 128 bytes
-//! sensor → host  wrapped reply             verdict word at plaintext +8,
+//! host → sensor  0x72 wrapped, attr 0x47   TLV 88 bytes, plaintext 128 bytes
+//! sensor → host  wrapped reply             status 0x00 or 0x89,
+//!                                          verdict word at plaintext +8,
 //!                                          20-byte value at plaintext +32 when long enough
 //! ```
+//!
+//! `0x72` is the one-to-one verify the vendor's `cv_do_fingerprint_verify` sends. `0x73` is
+//! `cv_do_fingerprint_identify`, the one-to-many request ticket 20 owns; [`request_frame`] builds
+//! both from the same 88-byte TLV and 128-byte plaintext, so the request body is identical and
+//! only the command word changes. [`Match::with_command`] selects `0x73` for a hardware probe.
 //!
 //! [`Match`] sends the five entries the audited reference sends and completes the last one:
 //! `(3, 20, template_id)`. The reference's block stops at that entry's eight-byte header, so its
@@ -14,6 +20,11 @@
 //! both an enrolled and an unenrolled finger. The sensor exposes `cv_fingerprint_verify_w_hash`,
 //! which takes a template id, so the driver supplies one (twenty zero bytes when the caller has
 //! none). **The completed 88-byte request has not been measured yet.**
+//!
+//! The vendor's verify special-cases status `0x89` next to `0x00`, so the driver accepts both as
+//! "the sensor answered" and decodes the body. That is all `0x89` is taken to mean: the verdict
+//! still comes from the plaintext, and [`Verdict::status`] reports the raw status so a hardware run
+//! shows which one the sensor used.
 //!
 //! The reply is wrapped and carries no MAC. Its plaintext is read at fixed offsets, never by
 //! scanning: the verdict word is the `u32` at `+8` and the value is the twenty bytes at `+32`
@@ -46,9 +57,10 @@ use crate::operation::Operation;
 use crate::proto::{self, attr, cmd};
 use crate::session::{Session, Teardown, UnwrapError, WrapError};
 
-/// Length of the `0x73` parameter block: five full entries plus `(3, 20, template_id)`.
+/// Length of the verify request's parameter block: five full entries plus
+/// `(3, 20, template_id)`.
 pub const MATCH_TLV_LEN: usize = 88;
-/// Plaintext length the driver sends with `0x73`: 88 TLV bytes, the 32-byte token, zero-padded.
+/// Plaintext length the driver sends: 88 TLV bytes, the 32-byte token, zero-padded.
 pub const MATCH_PLAINTEXT_LEN: usize = 128;
 /// Length of the value at plaintext `+32`, and of the template id in the request.
 pub const MATCH_VALUE_LEN: usize = 20;
@@ -61,7 +73,7 @@ pub const VERDICT_MATCH: u32 = 1;
 /// The verdict word that means "no match".
 pub const VERDICT_NO_MATCH: u32 = 0;
 
-/// The 88-byte `0x73` parameter block.
+/// The 88-byte verify parameter block.
 ///
 /// Five `(tag, 4, value)` entries then `(3, 20, template_id)`. The audited reference ends the
 /// block at the final entry's eight-byte header, leaving the declared value bytes absent; that
@@ -89,7 +101,29 @@ pub fn match_tlv(handle: u32, template_id: Option<&[u8; MATCH_VALUE_LEN]>) -> [u
     tlv
 }
 
-/// A decoded `0x73` reply.
+/// One wrapped verify request: `command`, the 88-byte TLV and a 128-byte plaintext.
+///
+/// This is the one request builder. Verification sends [`cmd::VERIFY`] (`0x72`); [`cmd::IDENTIFY`]
+/// (`0x73`) is the one-to-many request ticket 20 owns and builds the same request body with the
+/// other command word, which is what the probe's `--command 73` measures.
+pub fn request_frame(
+    session: &Session,
+    command: u16,
+    template_id: Option<&[u8; MATCH_VALUE_LEN]>,
+    iv: &[u8; crypto::BLOCK_LEN],
+    sequence: u32,
+) -> Result<Vec<u8>, WrapError> {
+    session.wrap(
+        command,
+        attr::CAPTURE,
+        &match_tlv(session.handle, template_id),
+        MATCH_PLAINTEXT_LEN,
+        iv,
+        sequence,
+    )
+}
+
+/// A decoded verify reply.
 ///
 /// `word` is preserved exactly as the sensor sent it. Only [`VERDICT_MATCH`] counts as a match;
 /// every other word, including an unexpected one, is reported as a no-match with the raw word
@@ -98,6 +132,10 @@ pub fn match_tlv(handle: u32, template_id: Option<&[u8; MATCH_VALUE_LEN]>) -> [u
 /// **unestablished** and it is not an id or a binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
+    /// The command the request carried: [`cmd::VERIFY`] normally, [`cmd::IDENTIFY`] on a probe.
+    pub command: u16,
+    /// The raw status the sensor answered with: `0x00`, or the `0x89` the vendor special-cases.
+    pub status: u32,
     /// The raw little-endian verdict word at plaintext `+8`.
     pub word: u32,
     /// `word == 1`. The flag alone; no id comparison is performed here.
@@ -110,16 +148,16 @@ pub struct Verdict {
     pub reply_len: usize,
 }
 
-/// A successful match and the session it leaves open.
+/// A successful verify and the session it leaves open.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Verification {
     /// What the sensor answered.
     pub verdict: Verdict,
-    /// The session, still open, at the sequence the `0x73` reply left it at.
+    /// The session, still open, at the sequence the verify reply left it at.
     pub session: Session,
 }
 
-/// Why a match did not produce a verdict.
+/// Why a verify did not produce a verdict.
 ///
 /// Every variant is distinct on purpose: a hardware run can tell a refused command, a bodyless
 /// reply, a reply too short for its verdict word, an undecryptable reply, a transport failure, a
@@ -128,11 +166,13 @@ pub struct Verification {
 pub enum MatchError {
     /// The sensor rejected the wrap sequence (`0x0F`).
     WrongSequence,
-    /// The sensor answered `0x73` with another non-zero status.
+    /// The sensor answered the verify request with a status other than `0x00` or `0x89`.
     ///
     /// The reply length and, when the body decrypted, the plaintext are kept so a hardware run can
     /// see a `0x59` that still carried a body; the message prints the first bytes of the plaintext.
     SensorStatus {
+        /// The command the request carried.
+        command: u16,
         /// The status word the sensor returned.
         status: u32,
         /// The raw wrapped reply body length, header included (`0` for a body-less reply).
@@ -165,18 +205,19 @@ impl fmt::Display for MatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WrongSequence => f.write_str(
-                "sensor rejected the wrap sequence (status 0x0f) on the 0x73 match: the command \
+                "sensor rejected the wrap sequence (status 0x0f) on the verify request: the command \
                  carried a stale or unexpected sequence",
             ),
             Self::SensorStatus {
+                command,
                 status,
                 reply_len,
                 plaintext,
             } => {
                 write!(
                     f,
-                    "sensor rejected the 0x73 match with status {status:#04x} (raw reply \
-                     {reply_len} bytes)"
+                    "sensor rejected the request 0x{command:02x} with status {status:#04x} (raw \
+                     reply {reply_len} bytes)"
                 )?;
                 match plaintext {
                     Some(bytes) => {
@@ -187,22 +228,22 @@ impl fmt::Display for MatchError {
                     None => f.write_str("; the body did not decrypt"),
                 }
             }
-            Self::MissingReply => f.write_str("sensor answered the 0x73 match without a body"),
+            Self::MissingReply => f.write_str("sensor answered the verify request without a body"),
             Self::MissingVerdict {
                 plaintext_len,
                 reply_len,
             } => write!(
                 f,
-                "the 0x73 reply decrypted to {plaintext_len} bytes, too short for the verdict \
+                "the verify reply decrypted to {plaintext_len} bytes, too short for the verdict \
                  word at +{VERDICT_OFFSET} (reply was {reply_len} bytes); this is not a no-match"
             ),
-            Self::MalformedReply(error) => write!(f, "malformed 0x73 match reply: {error}"),
+            Self::MalformedReply(error) => write!(f, "malformed verify reply: {error}"),
             Self::Build(error) => {
-                write!(f, "cannot build the wrapped 0x73 match command: {error}")
+                write!(f, "cannot build the wrapped verify command: {error}")
             }
-            Self::Transport(error) => write!(f, "transport failed during the 0x73 match: {error}"),
-            Self::Cancelled => f.write_str("match cancelled"),
-            Self::UnexpectedEvent => f.write_str("unexpected event while waiting for the match"),
+            Self::Transport(error) => write!(f, "transport failed during verify: {error}"),
+            Self::Cancelled => f.write_str("verify cancelled"),
+            Self::UnexpectedEvent => f.write_str("unexpected event while waiting for the verify reply"),
             Self::AlreadyFinished => f.write_str("operation has already finished"),
         }
     }
@@ -224,7 +265,7 @@ enum MatchState {
     Done,
 }
 
-/// The wrapped `0x73` match.
+/// The wrapped verify request.
 ///
 /// The operation owns the [`Session`] it was built with and returns it on success. `iv` is the
 /// CBC IV for this one request; the probe draws it from the operating system.
@@ -233,30 +274,42 @@ pub struct Match {
     handle: u32,
     iv: [u8; crypto::BLOCK_LEN],
     template_id: Option<[u8; MATCH_VALUE_LEN]>,
+    command: u16,
     state: MatchState,
 }
 
 impl Match {
-    /// Builds a match for a live session that has already captured a finger.
+    /// Builds a verify for a live session that has already captured a finger.
     ///
-    /// The last TLV entry carries twenty zero bytes unless [`Self::with_template_id`] supplies the
-    /// template id the enrolment committed with.
+    /// The request is the vendor's `0x72` verify. The last TLV entry carries twenty zero bytes
+    /// unless [`Self::with_template_id`] supplies the template id the enrolment committed with.
     pub fn new(session: Session, iv: [u8; crypto::BLOCK_LEN]) -> Self {
         Self {
             handle: session.handle,
             session: Some(session),
             iv,
             template_id: None,
+            command: cmd::VERIFY,
             state: MatchState::NotStarted,
         }
     }
 
-    /// Supplies the 20-byte template id the `0x73` request names.
+    /// Supplies the 20-byte template id the request names.
     ///
     /// `None` sends twenty zero bytes, which is the request the driver sent before the template id
     /// was known to be part of the block. The caller that has an enrolment id should pass it.
     pub fn with_template_id(mut self, template_id: Option<[u8; MATCH_VALUE_LEN]>) -> Self {
         self.template_id = template_id;
+        self
+    }
+
+    /// Sends `command` instead of the default [`cmd::VERIFY`].
+    ///
+    /// This exists for one measurement: [`cmd::IDENTIFY`] (`0x73`) is the one-to-many request the
+    /// audited reference called a match, and the probe compares the two frames on hardware. The
+    /// request body is identical, so the caller supplies only the command word.
+    pub fn with_command(mut self, command: u16) -> Self {
+        self.command = command;
         self
     }
 
@@ -282,17 +335,6 @@ impl Match {
         }
     }
 
-    fn match_frame(&self, session: &Session) -> Result<Vec<u8>, WrapError> {
-        session.wrap(
-            cmd::MATCH,
-            attr::CAPTURE,
-            &match_tlv(session.handle, self.template_id.as_ref()),
-            MATCH_PLAINTEXT_LEN,
-            &self.iv,
-            session.next_sequence(),
-        )
-    }
-
     fn on_reply(&mut self, status: u32, body: Vec<u8>) -> Action<MatchOutcome> {
         // The one sequence predicate applies before the reply is interpreted: a body advances the
         // counter unless the sensor said 0x0F.
@@ -304,7 +346,7 @@ impl Match {
         if status == proto::status::BAD_SEQUENCE {
             return self.begin_teardown(MatchError::WrongSequence);
         }
-        if status != proto::status::OK {
+        if !answered(status) {
             // A refusal can still carry a body; keep it for the hardware diagnostic instead of
             // discarding it with the status.
             let reply_len = body.len();
@@ -314,6 +356,7 @@ impl Match {
                 .and_then(|session| session.key().unwrap(&body).ok())
                 .map(|reply| reply.plaintext);
             return self.begin_teardown(MatchError::SensorStatus {
+                command: self.command,
                 status,
                 reply_len,
                 plaintext,
@@ -348,6 +391,8 @@ impl Match {
             None
         };
         let verdict = Verdict {
+            command: self.command,
+            status,
             word,
             matched: word == VERDICT_MATCH,
             value,
@@ -371,6 +416,14 @@ fn le32(bytes: &[u8], offset: usize) -> u32 {
     ])
 }
 
+/// Whether `status` is one the sensor's verify answer carries.
+///
+/// The vendor's `cv_do_fingerprint_verify` special-cases `0x89` next to success, so both are
+/// treated as the sensor having answered; the verdict is still decoded from the body.
+fn answered(status: u32) -> bool {
+    matches!(status, proto::status::OK | proto::status::VERIFY_ANSWERED)
+}
+
 /// Writes at most the first 64 bytes as hex, so a refusal's body cannot flood a terminal.
 fn write_first_hex(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
     const LIMIT: usize = 64;
@@ -391,7 +444,13 @@ impl Operation for Match {
             return self.finish(Err(MatchError::AlreadyFinished));
         }
         let built = match self.session.as_ref() {
-            Some(session) => self.match_frame(session),
+            Some(session) => request_frame(
+                session,
+                self.command,
+                self.template_id.as_ref(),
+                &self.iv,
+                session.next_sequence(),
+            ),
             None => return self.finish(Err(MatchError::AlreadyFinished)),
         };
         match built {
@@ -476,22 +535,24 @@ enum VerifyState {
 ///
 /// The caller supplies one IV per wrapped request, because the core generates no randomness. On
 /// success the session is returned still open; the probe tears it down before exiting. A capture
-/// failure has already torn the session down, and so has a match failure, so verification never
+/// failure has already torn the session down, and so has a verify failure, so verification never
 /// sends a second cancel-and-close pair for a handle that is already gone.
 pub struct Verify {
     session: Option<Session>,
     capture_iv: [u8; crypto::BLOCK_LEN],
     match_iv: [u8; crypto::BLOCK_LEN],
     template_id: Option<[u8; MATCH_VALUE_LEN]>,
+    command: u16,
     state: VerifyState,
 }
 
 impl Verify {
     /// Builds a verification for a live session.
     ///
-    /// `capture_iv` is the IV for the `0x66` arm and `match_iv` the IV for the `0x73` match. They
-    /// must differ; the caller draws both from the operating system. The match sends twenty zero
-    /// bytes as its template id unless [`Self::with_template_id`] supplies one.
+    /// `capture_iv` is the IV for the `0x66` arm and `match_iv` the IV for the verify request.
+    /// They must differ; the caller draws both from the operating system. The verify sends twenty
+    /// zero bytes as its template id unless [`Self::with_template_id`] supplies one, and the
+    /// vendor's `0x72` unless [`Self::with_command`] selects another command.
     pub fn new(
         session: Session,
         capture_iv: [u8; crypto::BLOCK_LEN],
@@ -502,6 +563,7 @@ impl Verify {
             capture_iv,
             match_iv,
             template_id: None,
+            command: cmd::VERIFY,
             state: VerifyState::NotStarted,
         }
     }
@@ -509,6 +571,12 @@ impl Verify {
     /// Supplies the 20-byte template id the composed [`Match`] request names.
     pub fn with_template_id(mut self, template_id: Option<[u8; MATCH_VALUE_LEN]>) -> Self {
         self.template_id = template_id;
+        self
+    }
+
+    /// Sends `command` on the composed [`Match`] instead of the default [`cmd::VERIFY`].
+    pub fn with_command(mut self, command: u16) -> Self {
+        self.command = command;
         self
     }
 
@@ -549,8 +617,9 @@ impl Verify {
     ) -> Action<VerifyOutcome> {
         match result {
             Ok(CapturedSample { session, .. }) => {
-                let mut matching =
-                    Match::new(session, self.match_iv).with_template_id(self.template_id);
+                let mut matching = Match::new(session, self.match_iv)
+                    .with_template_id(self.template_id)
+                    .with_command(self.command);
                 self.advance_match(matching.start(), matching)
             }
             // The capture already ran its own teardown; repeating it would send a second
@@ -673,6 +742,7 @@ mod tests {
     #[test]
     fn a_non_zero_status_keeps_the_reply_and_plaintext_for_the_message() {
         let error = MatchError::SensorStatus {
+            command: cmd::VERIFY,
             status: 0x59,
             reply_len: 108,
             plaintext: Some(vec![0xab; 52]),
@@ -680,6 +750,10 @@ mod tests {
         let text = error.to_string();
 
         assert!(text.contains("status 0x59"), "{text}");
+        assert!(
+            text.contains("0x72"),
+            "the refused command is named: {text}"
+        );
         assert!(text.contains("raw reply 108 bytes"), "{text}");
         assert!(text.contains("decrypted plaintext 52 bytes"), "{text}");
         assert!(text.contains(&"ab".repeat(52)), "{text}");
@@ -688,14 +762,23 @@ mod tests {
     #[test]
     fn the_diagnostic_hex_is_bounded_to_the_first_64_bytes() {
         let error = MatchError::SensorStatus {
+            command: cmd::IDENTIFY,
             status: 0x59,
             reply_len: 108,
             plaintext: Some(vec![0xcd; 100]),
         };
         let text = error.to_string();
 
-        assert!(text.contains(&"cd".repeat(64)), "{text}");
+        assert!(text.contains("cd".repeat(64).as_str()), "{text}");
         assert!(!text.contains(&"cd".repeat(65)), "{text}");
         assert!(text.contains("..."), "{text}");
+    }
+
+    #[test]
+    fn only_the_two_verify_answer_statuses_count_as_answered() {
+        assert!(answered(proto::status::OK));
+        assert!(answered(proto::status::VERIFY_ANSWERED));
+        assert!(!answered(proto::status::RESCAN_A));
+        assert!(!answered(0x59));
     }
 }

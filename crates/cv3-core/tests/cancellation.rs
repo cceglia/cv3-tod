@@ -106,6 +106,8 @@ fn one_session_arms_cancels_and_then_verifies_with_the_documented_frames_and_seq
     assert_eq!(
         verdict,
         Verdict {
+            command: cmd::VERIFY,
+            status: 0,
             word: 1,
             matched: true,
             value: Some(common::MATCH_VALUE),
@@ -116,7 +118,7 @@ fn one_session_arms_cancels_and_then_verifies_with_the_documented_frames_and_seq
     assert_eq!(
         session.next_sequence(),
         4,
-        "the 0x73 reply advanced once more"
+        "the verify reply advanced once more"
     );
 
     // Tear the one session down: sessionless 0x68, then 0x04.

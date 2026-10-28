@@ -42,7 +42,7 @@ fn random_buffers_never_panic() {
 
 #[test]
 fn near_valid_frames_and_wrapped_bodies_never_panic() {
-    let plain = frame::build_plain(cmd::MATCH, attr::CAPTURE, 7, &[0xAB; 32]);
+    let plain = frame::build_plain(cmd::VERIFY, attr::CAPTURE, 7, &[0xAB; 32]);
     let iv = [0x11u8; 16];
 
     // Every truncation of a valid frame.
@@ -71,7 +71,7 @@ fn near_valid_frames_and_wrapped_bodies_never_panic() {
     for length in 0..=48 {
         let ciphertext = vec![0x22u8; length];
         let wrapped = frame::build_wrapped(
-            cmd::MATCH,
+            cmd::VERIFY,
             attr::CAPTURE,
             7,
             &iv,
@@ -81,7 +81,7 @@ fn near_valid_frames_and_wrapped_bodies_never_panic() {
         exercise(&wrapped);
     }
     let oversized =
-        frame::build_wrapped(cmd::MATCH, attr::CAPTURE, 7, &iv, 0, &vec![0x22u8; 5_000]);
+        frame::build_wrapped(cmd::VERIFY, attr::CAPTURE, 7, &iv, 0, &vec![0x22u8; 5_000]);
     exercise(&oversized);
 
     // A wrapped body whose header claims a length the buffer cannot hold.

@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn reply_status_is_read_from_offset_20() {
-        let mut frame = build_plain(cmd::MATCH, attr::CAPTURE, 7, &[0u8; 32]);
+        let mut frame = build_plain(cmd::VERIFY, attr::CAPTURE, 7, &[0u8; 32]);
         put32(&mut frame, STATUS_OFFSET, 0x85);
 
         let header = validate(&frame).expect("frame validates");

@@ -216,7 +216,7 @@ mod tests {
     }
 
     fn body_with_status(status: u32) -> Vec<u8> {
-        frame::build_plain_reply(cmd::MATCH, attr::CAPTURE, 7, status, &[0u8; 32])
+        frame::build_plain_reply(cmd::VERIFY, attr::CAPTURE, 7, status, &[0u8; 32])
     }
 
     #[test]

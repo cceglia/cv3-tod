@@ -17,7 +17,7 @@ use cv3_core::transport::{ScriptedOutcome, ScriptedTransport, Transport, run};
 use cv3_core::{Event, Handshake, TransportError};
 
 fn host_frame() -> Vec<u8> {
-    frame::build_plain(cmd::MATCH, attr::CAPTURE, HANDLE, &[0u8; 4])
+    frame::build_plain(cmd::VERIFY, attr::CAPTURE, HANDLE, &[0u8; 4])
 }
 
 fn all_records() -> Vec<TranscriptRecord> {
@@ -83,7 +83,7 @@ fn an_unknown_version_is_rejected() {
 
 #[test]
 fn replay_matches_on_command_attribute_and_handle_not_payload() {
-    let recorded = frame::build_plain(cmd::MATCH, attr::CAPTURE, HANDLE, &[0u8; 4]);
+    let recorded = frame::build_plain(cmd::VERIFY, attr::CAPTURE, HANDLE, &[0u8; 4]);
     let mut changed = recorded.clone();
     changed[44] ^= 0xff;
 

@@ -21,7 +21,7 @@ this is a probe, not a login driver.
 | `inventory` | Sends the wrapped `0x2F` inventory query and dumps its reply: the raw and plaintext lengths, the plaintext in 16-byte rows and a best-effort TLV scan. It is the ticket-16 measurement tool and does not yet decode the reply. |
 | `enroll` | Discards, starts, captures, submits, commits and prints the template id it now holds. `--commit-sample-hash` forces the last sample hash into the commit. |
 | `enroll-then-verify` | Enrols and commits, then takes one confirmation touch and matches it in the **same session**. It is the ticket-09 measurement tool: it reports whether a match immediately after a commit works and what value comes back, and it is **not** a binding check. `--commit-sample-hash` forces the last sample hash into the commit and the confirmation match. |
-| `verify` | Captures and matches `0x73`, printing the raw verdict word, the 20-byte value and the reply lengths. |
+| `verify` | Captures and sends the vendor-confirmed `0x72` verify, printing the command sent, the raw status, the verdict word, the 20-byte value and the reply lengths. `--command 73` sends the identify request instead, for comparison. |
 | `cancel-then-verify` | Cancels a capture mid-session and verifies in the same session; it is the run that can settle the wrap-sequence question when the first arm answers `0x85`, and the current reading is unmeasured. |
 | `handshake`/`open`/`close --record` | Writes a wire-only transcript; `cvctl replay <file>` reproduces it without hardware. |
 
@@ -85,17 +85,25 @@ formatting, clippy, the workspace tests, and `cargo-deny` for RustSec advisories
 | 128 + signal | interrupted by a catchable signal (for example 130 for `SIGINT`) |
 
 `capture` prints the sample hash on success and always runs the cancel-then-close teardown before
-exiting. `verify` prints the raw verdict word with its meaning (`verdict 1 (match)`,
+exiting. `verify` sends `0x72`, the command the vendor's `cv_do_fingerprint_verify` uses: one captured finger
+against one template, with the template id supplied by `--template` (twenty zero bytes otherwise).
+`0x73` is `cv_do_fingerprint_identify`, the one-to-many request ticket 20 owns; `--command 73` sends
+it with the identical 88-byte TLV and 128-byte plaintext so a hardware run can compare the two. The
+decode prints the command actually sent and the raw reply status (`0x00` or the `0x89` the vendor
+special-cases), then the verdict word with its meaning (`verdict 1 (match)`,
 `verdict 2 (no match, unexpected word)`), the 20-byte value (or `value absent`), the raw reply
-length and the decrypted plaintext length, then runs the same teardown. The value's meaning is not
-established, and `verify` does not yet compare it with anything: ticket 10 owns id binding.
+length and the decrypted plaintext length, and then runs the same teardown. The verdict still comes
+from the decoded body, whatever the status: what `0x89` means is left for a hardware run to settle.
+The value's meaning is not established, and `verify` does not yet compare it with anything: ticket
+10 owns id binding.
 
 `cvctl enroll-then-verify` is the ticket-09 measurement tool: it enrols and commits, prints the
-template id and its source, then takes one more touch and runs `0x73` in the **same secure
-session**, printing the verdict the way `verify` does. It answers whether a capture and match
-immediately after a commit are accepted and what value that reply carries. It deliberately does
-not compare the value with the enrolment id — ticket 10 owns binding — so a match here proves only
-that the sensor matched some enrolled template.
+template id and its source, then takes one more touch and sends the `0x72` verify in the **same
+secure session**, printing the command, status and verdict the way `verify` does. `--command 73`
+swaps in the identify request. It answers whether a capture and verify immediately after a commit
+are accepted and what value that reply carries. It deliberately does not compare the value with the
+enrolment id — ticket 10 owns binding — so a match here proves only that the sensor matched some
+enrolled template.
 
 `cvctl inventory` is ticket 16's first step: it reports the two lengths, the decrypted plaintext
 and a best-effort TLV scan of the `0x2F` reply, without assuming the reply lists stored templates.

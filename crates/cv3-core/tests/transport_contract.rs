@@ -11,7 +11,7 @@ use cv3_core::transport::{FailingTransport, ScriptedOutcome, ScriptedTransport, 
 use cv3_core::{Event, TransportError};
 
 fn host_frame() -> Vec<u8> {
-    frame::build_plain(cmd::MATCH, attr::CAPTURE, 7, &[0u8; 4])
+    frame::build_plain(cmd::VERIFY, attr::CAPTURE, 7, &[0u8; 4])
 }
 
 fn record(event: &Event) -> TranscriptRecord {

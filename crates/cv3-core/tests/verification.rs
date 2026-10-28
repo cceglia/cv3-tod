@@ -2,15 +2,17 @@
 //!
 //! Every expected frame is built with the same codec the implementation uses, from constants
 //! written out independently here: the command numbers, attributes, TLV layouts and sequence
-//! numbers come from the protocol description, not from the module under test. The `0x73` request
-//! is asserted byte for byte, including the completed `(3, 20, template_id)` entry.
+//! numbers come from the protocol description, not from the module under test. The `0x72` verify
+//! request is asserted byte for byte, including the completed `(3, 20, template_id)` entry, and
+//! `0x73` is asserted as the same request with only its command word changed.
 
 mod common;
 
 use common::{
     HANDLE, MATCH_PLAINTEXT_LEN, MATCH_TLV_LEN, MATCH_VALUE, SAMPLE_HASH, arm_frame, capture_reply,
-    fixed_iv, match_frame, match_frame_at, match_frame_at_with, match_frame_with, match_plaintext,
-    match_plaintext_with_len, match_reply, match_tlv, opened_session, sample_hash_plaintext,
+    command_frame_at_with, fixed_iv, match_frame, match_frame_at, match_frame_at_with,
+    match_frame_with, match_plaintext, match_plaintext_with_len, match_reply, match_tlv,
+    opened_session, sample_hash_plaintext,
 };
 use cv3_core::crypto;
 use cv3_core::frame;
@@ -118,7 +120,7 @@ fn a_verify_arms_waits_matches_and_reports_the_reply() {
 }
 
 #[test]
-fn the_match_frame_is_eighty_eight_tlv_bytes_at_plaintext_len_128() {
+fn the_verify_frame_is_eighty_eight_tlv_bytes_at_plaintext_len_128() {
     let mut transport = ScriptedTransport::default();
     let session = opened_session(&mut transport);
     let key = *session.key().as_bytes();
@@ -146,7 +148,11 @@ fn the_match_frame_is_eighty_eight_tlv_bytes_at_plaintext_len_128() {
     );
     assert_eq!(le32(frame, 0), 1, "magic");
     assert_eq!(le32(frame, 4), 188, "total length");
-    assert_eq!(&frame[8..10], &cmd::MATCH.to_le_bytes(), "0x73");
+    assert_eq!(
+        &frame[8..10],
+        &cmd::VERIFY.to_le_bytes(),
+        "0x72 is the vendor's verify"
+    );
     assert_eq!(frame[10], attr::CAPTURE, "attribute 0x47");
     assert_eq!(frame[11], 0x02, "wrapped encoding");
     assert_eq!(le32(frame, 16), HANDLE, "session handle");
@@ -164,6 +170,87 @@ fn the_match_frame_is_eighty_eight_tlv_bytes_at_plaintext_len_128() {
         "the rest of the plaintext is zero padding after the token"
     );
     assert_eq!(verification.verdict.plaintext_len, 52);
+    assert_eq!(verification.verdict.command, cmd::VERIFY);
+    assert_eq!(verification.verdict.status, 0);
+}
+
+#[test]
+fn the_identify_command_reuses_the_request_and_changes_only_its_command_word() {
+    let mut transport = ScriptedTransport::default();
+    let session = opened_session(&mut transport);
+    let key = *session.key().as_bytes();
+    let template = [0x5au8; 20];
+    let sequence = session.next_sequence();
+    let expected_identify = command_frame_at_with(
+        &session,
+        cmd::IDENTIFY,
+        &match_iv(),
+        sequence,
+        Some(&template),
+    );
+    let expected_verify = command_frame_at_with(
+        &session,
+        cmd::VERIFY,
+        &match_iv(),
+        sequence,
+        Some(&template),
+    );
+
+    transport.push(ScriptedOutcome::Reply {
+        status: 0,
+        body: match_reply(&session, 0, &match_plaintext(1, Some(&MATCH_VALUE))),
+    });
+    let mut operation = Match::new(session, match_iv())
+        .with_template_id(Some(template))
+        .with_command(cmd::IDENTIFY);
+    let verification = run(&mut operation, &mut transport).expect("the reply decodes");
+
+    let frame = &transport.sent()[3];
+    assert_eq!(
+        frame, &expected_identify,
+        "0x73 keeps the frame the driver sent before the command was corrected"
+    );
+    assert_eq!(
+        &expected_verify[8..10],
+        &[0x72, 0x00],
+        "the default verify is 0x72"
+    );
+    assert_eq!(
+        &expected_identify[8..10],
+        &[0x73, 0x00],
+        "the probe's request is 0x73"
+    );
+    for (at, name) in [(10, "attribute"), (11, "encoding"), (16, "handle")] {
+        assert_eq!(expected_verify[at], expected_identify[at], "{name}");
+    }
+    assert_eq!(&expected_verify[24..40], &expected_identify[24..40], "IV");
+    assert_eq!(
+        &expected_verify[40..44],
+        &expected_identify[40..44],
+        "declared TLV length"
+    );
+
+    // The two plaintexts start with the same TLV. Only the token after it differs, because the
+    // token covers the frame header and so covers the command word.
+    let plaintext_of = |frame: &[u8]| {
+        let mut iv = [0u8; crypto::BLOCK_LEN];
+        iv.copy_from_slice(&frame[24..40]);
+        crypto::decrypt_cbc(&key, &iv, &frame[44..]).expect("the request decrypts")
+    };
+    let verify_plaintext = plaintext_of(&expected_verify);
+    let identify_plaintext = plaintext_of(&expected_identify);
+    assert_eq!(
+        &verify_plaintext[..MATCH_TLV_LEN],
+        &identify_plaintext[..MATCH_TLV_LEN],
+        "the request body is the same 88-byte TLV"
+    );
+    assert_eq!(verify_plaintext.len(), MATCH_PLAINTEXT_LEN);
+    assert_eq!(identify_plaintext.len(), MATCH_PLAINTEXT_LEN);
+    assert_ne!(
+        verify_plaintext, identify_plaintext,
+        "the token covers the header, so the command word changes it"
+    );
+    assert_eq!(verification.verdict.command, cmd::IDENTIFY);
 }
 
 #[test]
@@ -333,6 +420,7 @@ fn a_sensor_status_on_the_match_reply_tears_down_and_is_distinct() {
     assert_eq!(
         run(&mut operation, &mut transport),
         Err(MatchError::SensorStatus {
+            command: cmd::VERIFY,
             status: 0x0c,
             reply_len: reply.len(),
             plaintext: Some(Vec::new()),
@@ -341,6 +429,115 @@ fn a_sensor_status_on_the_match_reply_tears_down_and_is_distinct() {
     let sent = transport.sent();
     assert_eq!(sent[4], frame::build_cancel_capture(HANDLE));
     assert_eq!(sent[5], frame::build_close_handle(HANDLE));
+    transport.assert_exhausted();
+}
+
+#[test]
+fn the_zero_eight_nine_status_the_vendor_special_cases_is_answered_and_one_means_matched() {
+    let mut transport = ScriptedTransport::default();
+    let session = opened_session(&mut transport);
+    let reply = match_reply(&session, 0x89, &match_plaintext(1, Some(&MATCH_VALUE)));
+
+    transport.push(ScriptedOutcome::Reply {
+        status: 0x89,
+        body: reply.clone(),
+    });
+    let mut operation = Match::new(session, match_iv());
+    let verification =
+        run(&mut operation, &mut transport).expect("0x89 carries a decodable body, not a refusal");
+
+    assert_eq!(
+        verification.verdict.status, 0x89,
+        "the raw status is reported"
+    );
+    assert_eq!(verification.verdict.command, cmd::VERIFY);
+    assert_eq!(verification.verdict.word, 1);
+    assert!(
+        verification.verdict.matched,
+        "the verdict comes from the body"
+    );
+    assert_eq!(verification.verdict.value, Some(MATCH_VALUE));
+    assert_eq!(verification.verdict.reply_len, reply.len());
+    assert_eq!(verification.verdict.plaintext_len, 52);
+    assert_eq!(
+        transport.sent().len(),
+        4,
+        "an answered reply is not a teardown trigger"
+    );
+    transport.assert_exhausted();
+}
+
+#[test]
+fn the_zero_eight_nine_status_with_a_zero_verdict_word_is_a_no_match() {
+    let mut transport = ScriptedTransport::default();
+    let session = opened_session(&mut transport);
+
+    transport.push(ScriptedOutcome::Reply {
+        status: 0x89,
+        body: match_reply(&session, 0x89, &match_plaintext(0, Some(&MATCH_VALUE))),
+    });
+    let mut operation = Match::new(session, match_iv());
+    let verification =
+        run(&mut operation, &mut transport).expect("0x89 carries a decodable body, not a refusal");
+
+    assert_eq!(verification.verdict.status, 0x89);
+    assert_eq!(verification.verdict.word, 0);
+    assert!(
+        !verification.verdict.matched,
+        "a zero verdict word is a no-match whatever the status"
+    );
+    assert_eq!(verification.verdict.value, Some(MATCH_VALUE));
+}
+
+#[test]
+fn a_status_other_than_zero_and_zero_eight_nine_is_still_a_sensor_status() {
+    let mut transport = ScriptedTransport::default();
+    let session = opened_session(&mut transport);
+    let reply = match_reply(&session, 0x8f, &match_plaintext(1, Some(&MATCH_VALUE)));
+
+    transport.push(ScriptedOutcome::Reply {
+        status: 0x8f,
+        body: reply.clone(),
+    });
+    transport.push(teardown_replies()[0].clone());
+    transport.push(teardown_replies()[1].clone());
+    let mut operation = Match::new(session, match_iv());
+
+    let error = run(&mut operation, &mut transport).expect_err("0x8f is a refusal");
+    assert!(
+        error.to_string().contains("status 0x8f"),
+        "the status is named: {error}"
+    );
+    assert!(
+        error.to_string().contains("0x72"),
+        "the command is named: {error}"
+    );
+    assert_eq!(
+        error,
+        MatchError::SensorStatus {
+            command: cmd::VERIFY,
+            status: 0x8f,
+            reply_len: reply.len(),
+            plaintext: Some(match_plaintext(1, Some(&MATCH_VALUE))),
+        }
+    );
+    transport.assert_exhausted();
+}
+
+#[test]
+fn a_zero_eight_nine_reply_without_a_body_is_still_a_missing_reply() {
+    let mut transport = ScriptedTransport::default();
+    let session = opened_session(&mut transport);
+
+    transport.push(ScriptedOutcome::ReplyWithoutBody);
+    transport.push(teardown_replies()[0].clone());
+    transport.push(teardown_replies()[1].clone());
+    let mut operation = Match::new(session, match_iv());
+
+    assert_eq!(
+        run(&mut operation, &mut transport),
+        Err(MatchError::MissingReply)
+    );
     transport.assert_exhausted();
 }
 
@@ -370,6 +567,7 @@ fn the_measured_zero_five_nine_status_keeps_the_reply_for_diagnostics() {
     assert_eq!(
         error,
         MatchError::SensorStatus {
+            command: cmd::VERIFY,
             status: 0x59,
             reply_len: reply.len(),
             plaintext: Some(match_plaintext(0, Some(&MATCH_VALUE))),
@@ -429,7 +627,7 @@ fn an_unwrap_failure_is_reported_and_tears_down() {
     transport.push(ScriptedOutcome::Reply {
         status: 0,
         body: frame::build_wrapped(
-            cmd::MATCH,
+            cmd::VERIFY,
             attr::CAPTURE,
             HANDLE,
             &fixed_iv(),
@@ -596,6 +794,7 @@ fn a_match_failure_after_a_successful_capture_tears_down_once() {
     assert_eq!(
         run(&mut verify, &mut transport),
         Err(VerifyError::Match(MatchError::SensorStatus {
+            command: cmd::VERIFY,
             status: 0x0c,
             reply_len: reply.len(),
             plaintext: Some(Vec::new()),

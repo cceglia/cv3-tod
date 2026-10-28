@@ -18,6 +18,7 @@ use cv3_core::crypto::BLOCK_LEN;
 use cv3_core::enrol::{Enrol, EnrolError, EnrolledTemplate, MAX_ACCEPTED_SAMPLES, TemplateSource};
 use cv3_core::handshake::{Handshake, HandshakeError};
 use cv3_core::inventory::{Inventory, InventoryError, InventoryReply, scan_tlv};
+use cv3_core::proto::cmd;
 use cv3_core::session::{
     CloseError, CloseSession, OpenError, OpenSession, Session, Teardown, TeardownError,
 };
@@ -59,8 +60,8 @@ const USAGE: &str = "usage: cvctl devices
        cvctl capture [--hex]
        cvctl inventory [--hex]
        cvctl enroll [--commit-sample-hash] [--hex]
-       cvctl enroll-then-verify [--commit-sample-hash] [--hex]
-       cvctl verify [--template <40 hex>] [--hex]
+       cvctl enroll-then-verify [--commit-sample-hash] [--command <72|73>] [--hex]
+       cvctl verify [--template <40 hex>] [--command <72|73>] [--hex]
        cvctl cancel-then-verify [--retry-next] [--hex]
        cvctl replay <file>";
 
@@ -94,10 +95,14 @@ enum Command<'a> {
     EnrollThenVerify {
         hex: bool,
         commit_sample_hash: bool,
+        /// The verify request's command: `0x72` by default, `0x73` for the identify probe.
+        command: u16,
     },
     Verify {
         hex: bool,
         template: Option<[u8; cv3_core::verify::MATCH_VALUE_LEN]>,
+        /// The verify request's command: `0x72` by default, `0x73` for the identify probe.
+        command: u16,
     },
     CancelThenVerify {
         hex: bool,
@@ -117,6 +122,7 @@ struct Flags<'a> {
     template: Option<[u8; cv3_core::verify::MATCH_VALUE_LEN]>,
     retry_next: bool,
     commit_sample_hash: bool,
+    command: Option<u16>,
 }
 
 /// Which optional flags a subcommand accepts. Every one defaults to refused, so a flag on the
@@ -129,6 +135,7 @@ struct Accepted {
     template: bool,
     retry_next: bool,
     commit_sample_hash: bool,
+    command: bool,
 }
 
 /// Parses the command line by hand: no dependency, and every unknown or repeated flag is a usage
@@ -206,12 +213,14 @@ fn parse(args: &[String]) -> Option<Command<'_>> {
                 rest,
                 Accepted {
                     commit_sample_hash: true,
+                    command: true,
                     ..Accepted::default()
                 },
             )?;
             Some(Command::EnrollThenVerify {
                 hex: flags.hex,
                 commit_sample_hash: flags.commit_sample_hash,
+                command: flags.command.unwrap_or(cmd::VERIFY),
             })
         }
         "verify" => {
@@ -219,12 +228,14 @@ fn parse(args: &[String]) -> Option<Command<'_>> {
                 rest,
                 Accepted {
                     template: true,
+                    command: true,
                     ..Accepted::default()
                 },
             )?;
             Some(Command::Verify {
                 hex: flags.hex,
                 template: flags.template,
+                command: flags.command.unwrap_or(cmd::VERIFY),
             })
         }
         "cancel-then-verify" => {
@@ -257,6 +268,7 @@ fn parse_flags<'a>(args: &'a [String], accepted: Accepted) -> Option<Flags<'a>> 
         template: None,
         retry_next: false,
         commit_sample_hash: false,
+        command: None,
     };
     let mut index = 0;
     while index < args.len() {
@@ -280,6 +292,10 @@ fn parse_flags<'a>(args: &'a [String], accepted: Accepted) -> Option<Flags<'a>> 
             "--retry-next" if accepted.retry_next && !flags.retry_next => {
                 flags.retry_next = true;
             }
+            "--command" if accepted.command && flags.command.is_none() => {
+                index += 1;
+                flags.command = Some(parse_command(args.get(index)?)?);
+            }
             _ => return None,
         }
         index += 1;
@@ -287,7 +303,7 @@ fn parse_flags<'a>(args: &'a [String], accepted: Accepted) -> Option<Flags<'a>> 
     Some(flags)
 }
 
-/// Parses exactly forty hex digits into the 20-byte template id a `0x73` request names.
+/// Parses exactly forty hex digits into the 20-byte template id a verify request names.
 fn parse_template(text: &str) -> Option<[u8; cv3_core::verify::MATCH_VALUE_LEN]> {
     if text.len() != 40 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
@@ -299,6 +315,18 @@ fn parse_template(text: &str) -> Option<[u8; cv3_core::verify::MATCH_VALUE_LEN]>
         *slot = (high << 4) | low;
     }
     Some(id)
+}
+
+/// Parses the probe's `--command` selector into the verify request's command word.
+///
+/// `72` is the vendor-confirmed verify; `73` is the identify command the audited reference called
+/// a match, kept so one run can send the old frame for comparison.
+fn parse_command(text: &str) -> Option<u16> {
+    match text {
+        "72" => Some(cmd::VERIFY),
+        "73" => Some(cmd::IDENTIFY),
+        _ => None,
+    }
 }
 
 /// Runs one invocation and returns its exit status.
@@ -333,10 +361,21 @@ pub fn run(
         Some(Command::EnrollThenVerify {
             hex,
             commit_sample_hash,
-        }) => enroll_then_verify(backend, shutdown, hex, commit_sample_hash, out, err),
-        Some(Command::Verify { hex, template }) => {
-            verify(backend, shutdown, hex, template, out, err)
-        }
+            command,
+        }) => enroll_then_verify(
+            backend,
+            shutdown,
+            hex,
+            commit_sample_hash,
+            command,
+            out,
+            err,
+        ),
+        Some(Command::Verify {
+            hex,
+            template,
+            command,
+        }) => verify(backend, shutdown, hex, template, command, out, err),
         Some(Command::CancelThenVerify { hex, retry_next }) => {
             cancel_then_verify(backend, shutdown, hex, retry_next, out, err)
         }
@@ -1142,7 +1181,7 @@ enum EnrollThenVerifyFailure {
 /// The IVs and commit variant one enrol-then-verify run uses.
 ///
 /// One IV per wrapped request, because CBC needs a distinct IV for every frame, plus the
-/// `--commit-sample-hash` measurement flag.
+/// `--commit-sample-hash` measurement flag and the confirmation request's command.
 #[derive(Clone, Copy)]
 struct EnrollThenVerifyOptions {
     open_iv: [u8; BLOCK_LEN],
@@ -1150,16 +1189,18 @@ struct EnrollThenVerifyOptions {
     capture_iv: [u8; BLOCK_LEN],
     match_iv: [u8; BLOCK_LEN],
     commit_sample_hash: bool,
+    match_command: u16,
 }
 
-/// Opens **one** session, enrols and commits in it, then takes the confirmation touch and matches
+/// Opens **one** session, enrols and commits in it, then takes the confirmation touch and verifies
 /// it in that same session.
 ///
 /// The wire order is `0x02`, `0x6D`, `0x8A`, (`0x66`, `0x6C`) once per sample, `0x6E`, one more
-/// `0x66`, then `0x73`, followed by the cancel-then-close teardown. The template id is printed
-/// before the confirmation so a failed confirmation still reports what was committed. This is
-/// ticket 09's measurement tool: it reports the value the match returns but never compares it with
-/// the enrolment id, because ticket 10 owns binding.
+/// `0x66`, then the verify request (`0x72` unless `--command 73` asks for identify), followed by
+/// the cancel-then-close teardown. The template id is printed before the confirmation so a failed
+/// confirmation still reports what was committed. This is ticket 09's measurement tool: it reports
+/// the value the verdict returns but never compares it with the enrolment id, because ticket 10
+/// owns binding.
 fn enroll_then_verify_over(
     transport: &mut dyn Transport,
     secrets: RunSecrets,
@@ -1172,6 +1213,7 @@ fn enroll_then_verify_over(
         capture_iv,
         match_iv,
         commit_sample_hash,
+        match_command,
     } = options;
     let run =
         handshake_over(transport, secrets, true).map_err(EnrollThenVerifyFailure::Handshake)?;
@@ -1188,7 +1230,9 @@ fn enroll_then_verify_over(
     print_template(out, &template_id, source);
     let _ = writeln!(out, "match template id {}", hex(&template_id));
 
-    let mut verify = Verify::new(session, capture_iv, match_iv).with_template_id(Some(template_id));
+    let mut verify = Verify::new(session, capture_iv, match_iv)
+        .with_template_id(Some(template_id))
+        .with_command(match_command);
     match drive(&mut verify, transport) {
         Ok(Verification { verdict, session }) => {
             let mut teardown = Teardown::new(session.handle);
@@ -1205,6 +1249,7 @@ fn enroll_then_verify(
     shutdown: &dyn Shutdown,
     dump_hex: bool,
     commit_sample_hash: bool,
+    match_command: u16,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
@@ -1225,6 +1270,7 @@ fn enroll_then_verify(
         capture_iv,
         match_iv,
         commit_sample_hash,
+        match_command,
     };
 
     let mut channel = match open_for_command(backend, shutdown, err) {
@@ -1290,9 +1336,10 @@ enum VerifyFailure {
     Verify(VerifyError),
 }
 
-/// Opens the secure session, runs capture then match, and tears the session down afterwards.
+/// Opens the secure session, captures a finger, then sends the verify request, and tears the
+/// session down afterwards.
 ///
-/// A capture or match failure has already torn the session down; a successful verification is
+/// A capture or verify failure has already torn the session down; a successful verification is
 /// torn down here because the probe does not keep a session between invocations. The verdict is
 /// returned with the teardown's own best-effort result.
 fn verify_over(
@@ -1302,12 +1349,15 @@ fn verify_over(
     capture_iv: [u8; cv3_core::crypto::BLOCK_LEN],
     match_iv: [u8; cv3_core::crypto::BLOCK_LEN],
     template_id: Option<[u8; cv3_core::verify::MATCH_VALUE_LEN]>,
+    command: u16,
 ) -> Result<(Verdict, Result<(), TeardownError>), VerifyFailure> {
     let run = handshake_over(transport, secrets, true).map_err(VerifyFailure::Handshake)?;
     let mut open = OpenSession::new(run.session, open_iv);
     let session = drive(&mut open, transport).map_err(VerifyFailure::Open)?;
 
-    let mut verify = Verify::new(session, capture_iv, match_iv).with_template_id(template_id);
+    let mut verify = Verify::new(session, capture_iv, match_iv)
+        .with_template_id(template_id)
+        .with_command(command);
     match drive(&mut verify, transport) {
         Ok(Verification { verdict, session }) => {
             let mut teardown = Teardown::new(session.handle);
@@ -1318,13 +1368,21 @@ fn verify_over(
     }
 }
 
-/// Prints the decoded verdict word, the 20-byte value (or its absence) and both lengths.
+/// Prints the command sent, the raw reply status, the decoded verdict word, the 20-byte value (or
+/// its absence) and both lengths.
+///
+/// The command comes from the verdict, so the line is what went on the wire rather than what the
+/// caller meant to send. The status is printed raw because it is the measurement: `0x00` and the
+/// vendor-special-cased `0x89` are both answered, and only a hardware run settles which one a match
+/// carries.
 fn print_verdict(verdict: &Verdict, out: &mut dyn Write) {
     let meaning = match verdict.word {
         VERDICT_MATCH => "match",
         VERDICT_NO_MATCH => "no match",
         _ => "no match, unexpected word",
     };
+    let _ = writeln!(out, "command 0x{:02x}", verdict.command);
+    let _ = writeln!(out, "status 0x{:02x}", verdict.status);
     let _ = writeln!(out, "verdict {} ({meaning})", verdict.word);
     match &verdict.value {
         Some(value) => {
@@ -1468,12 +1526,13 @@ fn enrol_error_code(error: &EnrolError) -> u8 {
     }
 }
 
-/// Opens the session, captures a finger, matches it and reports the verdict.
+/// Opens the session, captures a finger, sends the verify request and reports the verdict.
 fn verify(
     backend: &mut dyn UsbBackend,
     shutdown: &dyn Shutdown,
     dump_hex: bool,
     template_id: Option<[u8; cv3_core::verify::MATCH_VALUE_LEN]>,
+    command: u16,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
@@ -1520,6 +1579,7 @@ fn verify(
             capture_iv,
             match_iv,
             template_id,
+            command,
         )
     });
 
@@ -1576,7 +1636,8 @@ struct CancelIvs {
 
 /// Opens **one** session, arms a capture, cancels it before any finger, then verifies in it.
 ///
-/// The wire order is `0x02`, `0x66`, the mid-session `0x68`, `0x66`, the finger event and `0x73`.
+/// The wire order is `0x02`, `0x66`, the mid-session `0x68`, `0x66`, the finger event and the
+/// verify request (`0x72`).
 /// The first arm's status and the sequence each `0x66` carries are printed, because the re-arm's
 /// sequence is the experiment. The default rewinds the counter to the first arm's sequence, which
 /// is what this sensor was measured to require after a cancel; `retry_next` instead keeps the
@@ -3187,12 +3248,19 @@ mod tests {
             "the confirmation match names the forced id: {out}"
         );
         assert!(
-            out.contains(&verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)),
+            out.contains(&verify_output(
+                cmd::VERIFY,
+                0,
+                VERDICT_MATCH,
+                Some(&MATCH_VALUE),
+                108,
+                52
+            )),
             "{out}"
         );
 
         let tlvs = usb.match_tlvs.borrow();
-        assert_eq!(tlvs.len(), 1, "one 0x73 request");
+        assert_eq!(tlvs.len(), 1, "one verify request");
         assert_eq!(&tlvs[0][68..88], &SAMPLE_HASH);
     }
 
@@ -3304,11 +3372,11 @@ mod tests {
                 cmd::UPDATE_ENROLMENT,
                 cmd::COMMIT_ENROLMENT,
                 cmd::ARM_CAPTURE,
-                cmd::MATCH,
+                cmd::VERIFY,
                 cmd::CANCEL_CAPTURE,
                 cmd::CLOSE_SESSION,
             ],
-            "one session: 0x02, the enrolment, then the confirmation capture and 0x73, then teardown"
+            "one session: 0x02, the enrolment, then the confirmation capture and 0x72, then teardown"
         );
         assert_eq!(
             sent_commands(&usb)
@@ -3353,7 +3421,7 @@ mod tests {
              {}",
             hex(&ENROLMENT_ID),
             hex(&ENROLMENT_ID),
-            verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
+            verify_output(cmd::VERIFY, 0, VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
         );
         assert_eq!(
             out, expected,
@@ -3370,15 +3438,56 @@ mod tests {
         let (code, _out, err) = run_with(&["enroll-then-verify"], &mut usb, &shutdown);
 
         assert_eq!(code, EXIT_OK, "{err}");
+        assert!(
+            sent_command(&usb, cmd::IDENTIFY).is_none(),
+            "the default is the vendor's 0x72 verify, not 0x73"
+        );
+        assert_eq!(
+            sent_command(&usb, cmd::VERIFY)
+                .expect("0x72 was sent")
+                .get(8..10),
+            Some(&[0x72u8, 0x00][..]),
+            "the confirmation request is 0x72"
+        );
         let tlvs = usb.match_tlvs.borrow();
-        assert_eq!(tlvs.len(), 1, "one 0x73 request");
+        assert_eq!(tlvs.len(), 1, "one verify request");
         assert_eq!(tlvs[0].len(), 88, "the completed TLV block");
         assert_eq!(&tlvs[0][60..64], &3u32.to_le_bytes(), "tag 3");
         assert_eq!(&tlvs[0][64..68], &20u32.to_le_bytes(), "length 20");
         assert_eq!(
             &tlvs[0][68..88],
             &ENROLMENT_ID,
-            "the match names the enrolment id the commit returned"
+            "the request names the enrolment id the commit returned"
+        );
+    }
+
+    #[test]
+    fn enroll_then_verify_command_seventy_three_keeps_the_committed_id() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.completion_after = Some(2);
+        let shutdown = SignalFlag::new();
+
+        let (code, _out, err) = run_with(
+            &["enroll-then-verify", "--command", "73"],
+            &mut usb,
+            &shutdown,
+        );
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert!(
+            sent_command(&usb, cmd::VERIFY).is_none(),
+            "0x73 replaces the default"
+        );
+        assert!(
+            sent_command(&usb, cmd::IDENTIFY).is_some(),
+            "the probe sends identify"
+        );
+        let tlvs = usb.match_tlvs.borrow();
+        assert_eq!(tlvs.len(), 1);
+        assert_eq!(
+            &tlvs[0][68..88],
+            &ENROLMENT_ID,
+            "the identify probe names the same committed id"
         );
     }
 
@@ -3396,7 +3505,7 @@ mod tests {
             out,
             format!(
                 "match template id {template}\n{}",
-                verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
+                verify_output(cmd::VERIFY, 0, VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
             )
         );
         let tlvs = usb.match_tlvs.borrow();
@@ -3501,6 +3610,8 @@ mod tests {
             "the template id is printed before the confirmation: {out}"
         );
         assert!(out.ends_with(&verify_output(
+            cmd::VERIFY,
+            0,
             VERDICT_NO_MATCH,
             Some(&MATCH_VALUE),
             108,
@@ -3560,7 +3671,7 @@ mod tests {
             1
         );
         assert!(
-            sent_command(&usb, cmd::MATCH).is_none(),
+            sent_command(&usb, cmd::VERIFY).is_none(),
             "the match is never attempted without the confirmation touch"
         );
     }
@@ -3583,7 +3694,7 @@ mod tests {
         assert!(err.contains("0x0c"), "{err}");
         assert!(err.contains("may exist"), "{err}");
         assert!(
-            sent_command(&usb, cmd::MATCH).is_none(),
+            sent_command(&usb, cmd::VERIFY).is_none(),
             "a failed enrolment does not attempt the confirmation match"
         );
         assert_eq!(
@@ -3632,7 +3743,7 @@ mod tests {
             assert_eq!(*line, format!("> {}", hex(frame)));
         }
 
-        for wanted in [cmd::DISCARD_ENROLMENT, cmd::COMMIT_ENROLMENT, cmd::MATCH] {
+        for wanted in [cmd::DISCARD_ENROLMENT, cmd::COMMIT_ENROLMENT, cmd::VERIFY] {
             let frame = sent
                 .iter()
                 .find(|frame| command(frame) == wanted)
@@ -3673,6 +3784,8 @@ mod tests {
     }
 
     fn verify_output(
+        command: u16,
+        status: u32,
         word: u32,
         value: Option<&[u8; 20]>,
         reply: usize,
@@ -3688,8 +3801,8 @@ mod tests {
             None => "value absent".to_owned(),
         };
         format!(
-            "verdict {word} ({meaning})\n{value}\nreply length {reply}\nplaintext length \
-             {plaintext}\n"
+            "command 0x{command:02x}\nstatus 0x{status:02x}\nverdict {word} ({meaning})\n{value}\n\
+             reply length {reply}\nplaintext length {plaintext}\n"
         )
     }
 
@@ -3707,7 +3820,7 @@ mod tests {
             format!(
                 "{}{}",
                 cancel_probe_lines(0x00, 1, 1),
-                verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
+                verify_output(cmd::VERIFY, 0, VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
             ),
             "the experiment lines, then the verdict, value and lengths"
         );
@@ -3720,7 +3833,7 @@ mod tests {
                 cmd::ARM_CAPTURE,
                 cmd::CANCEL_CAPTURE,
                 cmd::ARM_CAPTURE,
-                cmd::MATCH,
+                cmd::VERIFY,
                 cmd::CANCEL_CAPTURE,
                 cmd::CLOSE_SESSION,
             ],
@@ -3785,7 +3898,9 @@ mod tests {
         );
 
         assert_eq!(
-            sent_command(&usb, cmd::MATCH).expect("0x73 was sent").len(),
+            sent_command(&usb, cmd::VERIFY)
+                .expect("0x72 was sent")
+                .len(),
             188,
             "the match is the same 128-plaintext frame verify sends"
         );
@@ -3810,7 +3925,7 @@ mod tests {
             format!(
                 "{}{}",
                 cancel_probe_lines(0x85, 1, 1),
-                verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
+                verify_output(cmd::VERIFY, 0, VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
             ),
             "the first arm's 0x85 is printed, and the default re-arms at the same sequence"
         );
@@ -3823,7 +3938,7 @@ mod tests {
                 cmd::ARM_CAPTURE,
                 cmd::CANCEL_CAPTURE,
                 cmd::ARM_CAPTURE,
-                cmd::MATCH,
+                cmd::VERIFY,
                 cmd::CANCEL_CAPTURE,
                 cmd::CLOSE_SESSION,
             ],
@@ -3853,7 +3968,7 @@ mod tests {
             format!(
                 "{}{}",
                 cancel_probe_lines(0x00, 1, 2),
-                verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
+                verify_output(cmd::VERIFY, 0, VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
             ),
             "the older reading keeps the counter and re-arms at N+1"
         );
@@ -3866,7 +3981,7 @@ mod tests {
                 cmd::ARM_CAPTURE,
                 cmd::CANCEL_CAPTURE,
                 cmd::ARM_CAPTURE,
-                cmd::MATCH,
+                cmd::VERIFY,
                 cmd::CANCEL_CAPTURE,
                 cmd::CLOSE_SESSION,
             ]
@@ -3888,7 +4003,14 @@ mod tests {
             format!(
                 "{}{}",
                 cancel_probe_lines(0x00, 1, 1),
-                verify_output(VERDICT_NO_MATCH, Some(&MATCH_VALUE), 108, 52)
+                verify_output(
+                    cmd::VERIFY,
+                    0,
+                    VERDICT_NO_MATCH,
+                    Some(&MATCH_VALUE),
+                    108,
+                    52
+                )
             )
         );
         assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
@@ -4045,7 +4167,7 @@ mod tests {
         assert_eq!(err, "");
         assert_eq!(
             out,
-            verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52),
+            verify_output(cmd::VERIFY, 0, VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52),
             "the verdict, the value and both lengths"
         );
         assert_eq!(
@@ -4055,23 +4177,171 @@ mod tests {
                 cmd::CHALLENGE_RESPONSE,
                 cmd::OPEN_SESSION,
                 cmd::ARM_CAPTURE,
-                cmd::MATCH,
+                cmd::VERIFY,
                 cmd::CANCEL_CAPTURE,
                 cmd::CLOSE_SESSION,
             ],
             "a successful verify tears down with 0x68 then 0x04 before exiting"
         );
 
-        let match_frame = sent_command(&usb, cmd::MATCH).expect("0x73 was sent");
-        assert_eq!(match_frame[10], attr::CAPTURE);
-        assert_eq!(match_frame[11], 0x02, "the match is wrapped");
-        assert_eq!(le32(&match_frame, 16), TEST_HANDLE);
+        let request = sent_command(&usb, cmd::VERIFY).expect("0x72 was sent");
         assert_eq!(
-            le32(&match_frame, 40),
+            &request[8..10],
+            &[0x72, 0x00],
+            "the default is the vendor's verify"
+        );
+        assert_eq!(request[10], attr::CAPTURE);
+        assert_eq!(request[11], 0x02, "the request is wrapped");
+        assert_eq!(le32(&request, 16), TEST_HANDLE);
+        assert_eq!(
+            le32(&request, 40),
             88,
             "five entries plus the completed (3, 20, template_id)"
         );
-        assert_eq!(match_frame.len(), 188, "128 plaintext bytes plus padding");
+        assert_eq!(request.len(), 188, "128 plaintext bytes plus padding");
+    }
+
+    #[test]
+    fn verify_command_seventy_three_sends_identify_with_the_same_request_body() {
+        let mut usb = FakeUsb::with_sensor();
+        let shutdown = SignalFlag::new();
+        let template = hex(&ENROLMENT_ID);
+
+        let (code, out, err) = run_with(
+            &["verify", "--template", &template, "--command", "73"],
+            &mut usb,
+            &shutdown,
+        );
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(err, "");
+        assert_eq!(
+            out,
+            format!(
+                "match template id {template}\n{}",
+                verify_output(cmd::IDENTIFY, 0, VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
+            ),
+            "the decode names the command that went on the wire"
+        );
+        assert!(
+            sent_command(&usb, cmd::VERIFY).is_none(),
+            "0x72 is replaced, not added"
+        );
+        let request = sent_command(&usb, cmd::IDENTIFY).expect("0x73 was sent");
+        assert_eq!(
+            &request[8..10],
+            &[0x73, 0x00],
+            "0x73 is identify, kept for comparison"
+        );
+        assert_eq!(request.len(), 188, "the same 128-byte plaintext");
+        assert_eq!(le32(&request, 40), 88, "the same 88-byte TLV");
+
+        let tlvs = usb.match_tlvs.borrow();
+        assert_eq!(tlvs.len(), 1);
+        assert_eq!(&tlvs[0][68..88], &ENROLMENT_ID, "the same template id");
+    }
+
+    #[test]
+    fn a_malformed_command_flag_is_a_usage_error() {
+        let shutdown = SignalFlag::new();
+        for command in ["71", "74", "0x72", "72 ", ""] {
+            let mut usb = FakeUsb::with_sensor();
+            let (code, out, err) = run_with(&["verify", "--command", command], &mut usb, &shutdown);
+
+            assert_eq!(code, EXIT_OTHER, "{command:?}");
+            assert_eq!(out, "", "{command:?}");
+            assert_eq!(err, format!("{USAGE}\n"), "{command:?}");
+            assert!(usb.calls().is_empty(), "nothing touches the sensor");
+        }
+    }
+
+    #[test]
+    fn command_is_accepted_only_by_the_two_verify_commands() {
+        let shutdown = SignalFlag::new();
+        for subcommand in [
+            "handshake",
+            "open",
+            "close",
+            "capture",
+            "inventory",
+            "enroll",
+            "cancel-then-verify",
+        ] {
+            let mut usb = FakeUsb::with_sensor();
+            let (code, out, err) = run_with(&[subcommand, "--command", "72"], &mut usb, &shutdown);
+
+            assert_eq!(code, EXIT_OTHER, "{subcommand}");
+            assert_eq!(out, "", "{subcommand}");
+            assert_eq!(err, format!("{USAGE}\n"), "{subcommand}");
+            assert!(usb.calls().is_empty(), "{subcommand} touches nothing");
+        }
+
+        let mut usb = FakeUsb::with_sensor();
+        let (code, _out, err) = run_with(&["verify", "--command", "72"], &mut usb, &shutdown);
+        assert_eq!(code, EXIT_OK, "{err}");
+    }
+
+    #[test]
+    fn verify_reports_the_special_cased_0x89_status_with_a_matched_verdict() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.match_status = 0x89;
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(err, "", "0x89 with a verdict body is not a refusal");
+        assert_eq!(
+            out,
+            verify_output(
+                cmd::VERIFY,
+                0x89,
+                VERDICT_MATCH,
+                Some(&MATCH_VALUE),
+                108,
+                52
+            ),
+            "the raw status and the decoded verdict are both printed"
+        );
+        assert_eq!(
+            sent_commands(&usb),
+            [
+                cmd::CHALLENGE,
+                cmd::CHALLENGE_RESPONSE,
+                cmd::OPEN_SESSION,
+                cmd::ARM_CAPTURE,
+                cmd::VERIFY,
+                cmd::CANCEL_CAPTURE,
+                cmd::CLOSE_SESSION,
+            ],
+            "an answered status still tears the session down before exiting"
+        );
+    }
+
+    #[test]
+    fn verify_reports_the_special_cased_0x89_status_with_a_zero_verdict_as_no_match() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.match_status = 0x89;
+        usb.match_plaintext = Some(match_plaintext(VERDICT_NO_MATCH, Some(&MATCH_VALUE)));
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_NO_MATCH, "{err}");
+        assert_ne!(code, EXIT_OTHER);
+        assert_eq!(err, "");
+        assert_eq!(
+            out,
+            verify_output(
+                cmd::VERIFY,
+                0x89,
+                VERDICT_NO_MATCH,
+                Some(&MATCH_VALUE),
+                108,
+                52
+            ),
+            "the verdict comes from the body, not from the status"
+        );
     }
 
     #[test]
@@ -4102,7 +4372,7 @@ mod tests {
         assert_eq!(err, "", "the request is answered silently");
         assert_eq!(
             out,
-            verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52),
+            verify_output(cmd::VERIFY, 0, VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52),
             "the real announcement still drives the reply"
         );
         assert_eq!(
@@ -4124,7 +4394,7 @@ mod tests {
         assert_eq!(err, "", "the request is answered silently");
         assert_eq!(
             out,
-            verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52),
+            verify_output(cmd::VERIFY, 0, VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52),
             "the real finger event still drives the match"
         );
         assert_eq!(
@@ -4149,7 +4419,7 @@ mod tests {
         );
         assert_eq!(
             out,
-            verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52),
+            verify_output(cmd::VERIFY, 0, VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52),
             "stdout is unchanged"
         );
     }
@@ -4178,7 +4448,7 @@ mod tests {
         assert_eq!(code, EXIT_OK, "{err}");
         assert_eq!(
             out,
-            verify_output(VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52),
+            verify_output(cmd::VERIFY, 0, VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52),
             "the decoded stdout is unchanged by the diagnostic line"
         );
         let packed = err
@@ -4203,7 +4473,14 @@ mod tests {
         assert_eq!(err, "");
         assert_eq!(
             out,
-            verify_output(VERDICT_NO_MATCH, Some(&MATCH_VALUE), 108, 52),
+            verify_output(
+                cmd::VERIFY,
+                0,
+                VERDICT_NO_MATCH,
+                Some(&MATCH_VALUE),
+                108,
+                52
+            ),
             "a no-match carries the value when the reply supplies it"
         );
         assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
@@ -4220,7 +4497,10 @@ mod tests {
 
         assert_eq!(code, EXIT_NO_MATCH);
         assert_eq!(err, "");
-        assert_eq!(out, verify_output(VERDICT_NO_MATCH, None, 76, 28));
+        assert_eq!(
+            out,
+            verify_output(cmd::VERIFY, 0, VERDICT_NO_MATCH, None, 76, 28)
+        );
         assert!(out.contains("value absent"), "{out}");
     }
 
@@ -4331,7 +4611,7 @@ mod tests {
         assert_eq!(err, "");
         assert_eq!(
             out,
-            verify_output(2, Some(&MATCH_VALUE), 108, 52),
+            verify_output(cmd::VERIFY, 0, 2, Some(&MATCH_VALUE), 108, 52),
             "an undefined word is printed raw and never treated as a match"
         );
     }

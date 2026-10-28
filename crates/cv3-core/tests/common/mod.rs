@@ -180,18 +180,18 @@ pub fn sample_hash_plaintext() -> Vec<u8> {
     plaintext
 }
 
-/// The 20-byte value a synthetic `0x73` reply carries at plaintext `+32`.
+/// The 20-byte value a synthetic verify reply carries at plaintext `+32`.
 pub const MATCH_VALUE: [u8; 20] = [
     0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf,
     0xd0, 0xd1, 0xd2, 0xd3,
 ];
 
-/// Length of the `0x73` parameter block: five entries plus `(3, 20, template_id)`.
+/// Length of the verify request's parameter block: five entries plus `(3, 20, template_id)`.
 pub const MATCH_TLV_LEN: usize = 88;
-/// Plaintext length the driver sends with `0x73`.
+/// Plaintext length the driver sends with the verify request.
 pub const MATCH_PLAINTEXT_LEN: usize = 128;
 
-/// The documented 88-byte `0x73` parameter block, built independently of the implementation.
+/// The documented 88-byte verify parameter block, built independently of the implementation.
 ///
 /// Five `(tag, 4, value)` entries followed by `(3, 20, template_id)`. The audited reference stops
 /// after the final entry's eight-byte header; that 68-byte request was refused with `0x59` on
@@ -218,12 +218,12 @@ pub fn match_tlv(handle: u32, template_id: Option<&[u8; 20]>) -> [u8; MATCH_TLV_
     tlv
 }
 
-/// The exact wrapped `0x73` frame a match must send for `session` at its next sequence.
+/// The exact wrapped verify frame a `0x72` request must send for `session` at its next sequence.
 pub fn match_frame(session: &Session, iv: &[u8; 16]) -> Vec<u8> {
     match_frame_with(session, iv, None)
 }
 
-/// The exact wrapped `0x73` frame for `session` at its next sequence with a template id.
+/// The exact wrapped verify frame for `session` at its next sequence with a template id.
 pub fn match_frame_with(
     session: &Session,
     iv: &[u8; 16],
@@ -232,36 +232,47 @@ pub fn match_frame_with(
     match_frame_at_with(session, iv, session.next_sequence(), template_id)
 }
 
-/// The exact wrapped `0x73` frame for `session` at an explicit wrap sequence.
+/// The exact wrapped verify frame for `session` at an explicit wrap sequence.
 pub fn match_frame_at(session: &Session, iv: &[u8; 16], sequence: u32) -> Vec<u8> {
     match_frame_at_with(session, iv, sequence, None)
 }
 
-/// The exact wrapped `0x73` frame at an explicit sequence with a template id.
+/// The exact wrapped verify frame at an explicit sequence with a template id.
 pub fn match_frame_at_with(
     session: &Session,
     iv: &[u8; 16],
     sequence: u32,
     template_id: Option<&[u8; 20]>,
 ) -> Vec<u8> {
+    command_frame_at_with(session, cmd::VERIFY, iv, sequence, template_id)
+}
+
+/// The same request with an explicit command: `0x72` for verify, `0x73` for identify.
+pub fn command_frame_at_with(
+    session: &Session,
+    command: u16,
+    iv: &[u8; 16],
+    sequence: u32,
+    template_id: Option<&[u8; 20]>,
+) -> Vec<u8> {
     session
         .wrap(
-            cmd::MATCH,
+            command,
             attr::CAPTURE,
             &match_tlv(session.handle, template_id),
             MATCH_PLAINTEXT_LEN,
             iv,
             sequence,
         )
-        .expect("the match constants build a frame")
+        .expect("the verify constants build a frame")
 }
 
-/// A synthetic wrapped match reply whose plaintext is `plaintext`.
+/// A synthetic wrapped verify reply whose plaintext is `plaintext`.
 pub fn match_reply(session: &Session, status: u32, plaintext: &[u8]) -> Vec<u8> {
     let iv = fixed_iv();
     let ciphertext = crypto::encrypt_cbc(session.key().as_bytes(), &iv, plaintext);
     let mut body = frame::build_wrapped(
-        cmd::MATCH,
+        cmd::VERIFY,
         attr::CAPTURE,
         session.handle,
         &iv,

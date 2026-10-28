@@ -67,13 +67,26 @@ The acceptance run whose log is `target/hardware-acceptance-20261028-201206.log`
   all completed. The enrolment committed and reported a sensor **enrolment id**
   (`80f5eb3d7e7e2034cd960db24c059208b41586c3` in step 06, `b05432744322b732b58b5d54e2812ed7603ffab2`
   in step 09).
-- **`0x73` refused with `0x59`.** For both an enrolled and an unenrolled finger, the match request
-  as the audited reference builds it — a 68-byte TLV whose final `(3, 20)` entry carries no value
-  bytes — was answered `0x59`. The request now completes that entry with the 20-byte template id
-  (88-byte TLV, 128-byte plaintext). **The completed request has not been measured.**
+- **`0x73` refused with `0x59`.** For both an enrolled and an unenrolled finger, the request as the
+  audited reference builds it — a 68-byte TLV whose final `(3, 20)` entry carries no value bytes —
+  was answered `0x59`. Completing that entry with the 20-byte template id (88-byte TLV, 128-byte
+  plaintext) changed the answer to `0x0E`. The same `0x0E` came back from the `0x2F` query with the
+  reference's 56-byte TLV (a body-less 44-byte reply).
+- **`0x72` is verify; `0x73` is identify.** Disassembly of the vendor blob
+  (`extracted/broadcom/.../libfprint-2-tod-1-broadcom.so`) shows `cv_do_fingerprint_verify` calling
+  `cvhManageCVAPICall` with command `0x72` and `cv_do_fingerprint_identify` calling it with `0x73`
+  (falling back to `0x2F` without a template list). The reference labels `0x73` as match, which is
+  why the verify-shaped request was refused. The probe now sends `0x72` for verification and keeps
+  `0x73` for identify. Both statuses `0x00` and `0x89` are treated as "answered" because the vendor
+  special-cases `0x89`; the verdict is still read from the reply body. **The `0x72` request has not
+  been measured.**
+- **Commit id.** Committing with the sensor's enrolment id succeeded (`0x00`); committing with the
+  last sample hash instead was refused with `0x8E`. The enrolment id is the id to commit.
 - **Re-arm after a cancel.** In `cancel-then-verify` the first arm answered `0x00` at sequence N,
   the mid-session cancel left the session open, and the re-arm at N+1 was rejected with `0x0F`.
-  The first arm did not answer `0x85`, so this run did not exercise the capture-pending case.
+  Re-arming at N was also rejected with `0x0F`, so the plain cancel does not simply leave the
+  counter unchanged. The first arm did not answer `0x85`, so this run did not exercise the
+  capture-pending case.
 
 ## Wrap sequence
 

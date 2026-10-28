@@ -21,6 +21,7 @@ fuzz_target!(|data: &[u8]| {
 
     // The decrypted capture reply is scanned for the sample hash; it is device-controlled too.
     let _ = cv3_core::capture::find_tlv_value(data, 20);
+    let _ = cv3_core::inventory::scan_tlv(data);
 
     // The replay parser reads a file, which is also untrusted input.
     let _ = Transcript::from_bytes(data);

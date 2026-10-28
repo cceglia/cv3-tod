@@ -17,8 +17,8 @@ fn a_bare_invocation_prints_usage_to_stderr_and_exits_one() {
          cvctl close [--hex] [--record <file>]\n       \
          cvctl capture [--hex]\n       cvctl inventory [--hex]\n       \
          cvctl enroll [--commit-sample-hash] [--hex]\n       \
-         cvctl enroll-then-verify [--commit-sample-hash] [--hex]\n       \
-         cvctl verify [--template <40 hex>] [--hex]\n       \
+         cvctl enroll-then-verify [--commit-sample-hash] [--command <72|73>] [--hex]\n       \
+         cvctl verify [--template <40 hex>] [--command <72|73>] [--hex]\n       \
          cvctl cancel-then-verify [--retry-next] [--hex]\n       cvctl replay <file>\n"
     );
 }

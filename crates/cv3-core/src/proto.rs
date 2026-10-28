@@ -25,8 +25,12 @@ pub mod cmd {
     pub const UPDATE_ENROLMENT: u16 = 0x6C;
     /// Commit the enrolment, storing the template.
     pub const COMMIT_ENROLMENT: u16 = 0x6E;
-    /// Match the captured finger against the sensor's store.
-    pub const MATCH: u16 = 0x73;
+    /// Verify one captured finger against one template: the vendor's `cv_do_fingerprint_verify`
+    /// sends this, and its request carries the optional template id.
+    pub const VERIFY: u16 = 0x72;
+    /// Identify the captured finger against the sensor's store: the vendor's
+    /// `cv_do_fingerprint_identify` sends this one-to-many request, which ticket 20 owns.
+    pub const IDENTIFY: u16 = 0x73;
     /// Query the sensor's template inventory (reply format not yet decoded).
     pub const INVENTORY: u16 = 0x2F;
 }
@@ -97,6 +101,11 @@ pub mod status {
     pub const RESCAN_A: u32 = 0xA4;
     /// Rescan: the sample was unusable.
     pub const RESCAN_B: u32 = 0x89;
+    /// The second status the sensor answers the `0x72` verify with. The vendor's
+    /// `cv_do_fingerprint_verify` special-cases it next to `0x00`, so the driver treats it as
+    /// "the sensor answered" and decodes the reply body; what it means for the verdict is not
+    /// established here, and [`VERIFY_ANSWERED`](Self::VERIFY_ANSWERED) names only that handling.
+    pub const VERIFY_ANSWERED: u32 = 0x89;
 }
 
 /// USB endpoints: commands go out on bulk `0x01`, replies arrive on bulk `0x81`, and the sensor

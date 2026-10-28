@@ -102,14 +102,14 @@ pub struct FakeUsb {
     pub commit_status: u32,
     /// If set, the scripted sensor fails the `0x6e` commit in the transport.
     pub commit_command_error: Option<UsbError>,
-    /// Status the scripted sensor answers the wrapped `0x73` match with.
+    /// Status the scripted sensor answers the wrapped verify request (`0x72` or `0x73`) with.
     pub match_status: u32,
-    /// If set, the decrypted plaintext of the `0x73` reply; by default it carries a match and
+    /// If set, the decrypted plaintext of the verify reply; by default it carries a match and
     /// `MATCH_VALUE` at `+32`.
     pub match_plaintext: Option<Vec<u8>>,
-    /// If set, the scripted sensor fails the wrapped `0x73` match in the transport.
+    /// If set, the scripted sensor fails the wrapped verify request in the transport.
     pub match_command_error: Option<UsbError>,
-    /// The decrypted TLV of every `0x73` request the scripted sensor received, in order.
+    /// The decrypted TLV of every verify request the scripted sensor received, in order.
     pub match_tlvs: Rc<RefCell<Vec<Vec<u8>>>>,
     /// Status the scripted sensor answers the wrapped `0x2f` inventory query with.
     pub inventory_status: u32,
@@ -385,7 +385,7 @@ pub const ENROLMENT_ID: [u8; 20] = [
     0xb0, 0xb1, 0xb2, 0xb3,
 ];
 
-/// The 20-byte value the scripted `0x73` reply carries at plaintext `+32`.
+/// The 20-byte value the scripted verify reply carries at plaintext `+32`.
 pub const MATCH_VALUE: [u8; 20] = [
     0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf,
     0xd0, 0xd1, 0xd2, 0xd3,
@@ -427,7 +427,7 @@ pub struct HandshakeSensor {
     pub match_status: u32,
     pub match_plaintext: Option<Vec<u8>>,
     pub match_command_error: Option<UsbError>,
-    /// The decrypted TLV of each `0x73` request, recorded for the probe's tests.
+    /// The decrypted TLV of each verify request, recorded for the probe's tests.
     pub match_tlvs: Rc<RefCell<Vec<Vec<u8>>>>,
     pub inventory_status: u32,
     pub inventory_plaintext: Option<Vec<u8>>,
@@ -475,7 +475,7 @@ impl HandshakeSensor {
         self.session_key = Some(key);
     }
 
-    /// Records the leading TLV of a wrapped `0x73` request, decrypting it with the session key.
+    /// Records the leading TLV of a wrapped verify request, decrypting it with the session key.
     ///
     /// The TLV length is in the frame header at `PARAM_LEN_OFFSET`; the ciphertext follows the
     /// 44-byte header. Best effort: a malformed request records nothing rather than panicking.
@@ -557,7 +557,7 @@ impl HandshakeSensor {
         }
     }
 
-    fn match_reply(&self) -> Reply {
+    fn match_reply(&self, command: u16) -> Reply {
         let plaintext = self.match_plaintext.clone().unwrap_or_else(|| {
             let mut plaintext = vec![0u8; 52];
             plaintext[8..12].copy_from_slice(&1u32.to_le_bytes());
@@ -566,7 +566,8 @@ impl HandshakeSensor {
         });
         Reply {
             status: 0,
-            body: self.wrapped_body(cmd::MATCH, attr::CAPTURE, self.match_status, &plaintext),
+            // The sensor echoes the request's command word, whether that is 0x72 or 0x73.
+            body: self.wrapped_body(command, attr::CAPTURE, self.match_status, &plaintext),
         }
     }
 
@@ -665,7 +666,7 @@ impl HandshakeSensor {
                 ),
             },
             cmd::ARM_CAPTURE => self.arm_reply(),
-            cmd::MATCH => self.match_reply(),
+            cmd::VERIFY | cmd::IDENTIFY => self.match_reply(command),
             cmd::INVENTORY => {
                 if let Some(body) = &self.inventory_body {
                     return Reply {
@@ -752,7 +753,7 @@ impl UsbIo for HandshakeSensor {
                     return Err(error.clone());
                 }
             }
-            cmd::MATCH => {
+            cmd::VERIFY | cmd::IDENTIFY => {
                 if let Some(error) = &self.match_command_error {
                     return Err(error.clone());
                 }
