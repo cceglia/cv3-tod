@@ -172,44 +172,53 @@ cover both readings so the decision is a one-line change rather than a rewrite.
 **Enrolment.** Discard any pending enrolment, start, then loop: arm a capture, wait for the finger
 event, submit the sample. Accepted samples advance progress; unusable samples are re-requested; the
 sensor's "no more samples" reply stops the loop. Completion is recognised when the reply carries an
-**enrolment id** distinct from the **sample hash** that was submitted. The driver tells `libfprint` to
-expect **thirteen** stages: twelve samples plus one confirmation touch after the commit. Committing
-without an explicit completion signal uses the last submitted sample hash as the template id; the
-stored record says which of the two it is.
+**enrolment id** distinct from the **sample hash** that was submitted, and the sensor may report
+completion before twelve samples. The driver tells `libfprint` to expect **thirteen** stages: up to
+twelve samples plus one confirmation touch after the commit, fewer if the sensor completes early.
+Committing without an explicit completion signal uses the last submitted sample hash as the template
+id; the stored record says which of the two it is.
 
 **Verification and id binding.** Verification arms a capture, waits for the finger event, and asks the
 sensor to match. A match is only accepted when the returned **match id** equals the one recorded for
 the print being verified; the sensor's match flag alone is not enough.
 
-The match id is never returned by enrolment, only alongside a match. After committing, the driver
-therefore asks for one more touch and records the match id from that confirmation. **This mechanism is
-unproven**: neither reference implementation performs a match immediately after a commit, and nobody
-has established whether the value at that position is per-finger or per-template, or that it is stable
-across sessions. Establishing that is a prerequisite, not an implementation detail.
+Whether the match reply's id can be known at enrolment at all is **unestablished**: the reference says
+in one comment that it is not comparable with the completion id and that the two "never match", and
+that comment is the same one whose other half is dismissed as folklore. Until it is measured, the
+driver assumes nothing about it.
 
-Two limits are properties of the design, not bugs to fix later. The driver cannot prove that the
-confirmation touch is the same finger as the twelve samples; it trusts the person at the device. And
-the comparison detects an altered match flag, not a replayed reply. Both are stated in the project's
-documentation and in the driver's claims.
+The driver obtains the match id by asking for one more touch after the commit and recording what comes
+back. **This mechanism is unproven**: neither reference implementation performs a match immediately
+after a commit, nobody has established whether the value is per-finger or per-template, or that it is
+stable across sessions. Establishing that is a prerequisite, not an implementation detail.
+
+The defence against an altered match flag holds only if a no-match reply does not already carry the
+enrolled finger's value at that position; if it does, flipping the flag passes the comparison. The
+contents of a no-match reply are therefore measured before the comparison is relied on. Two further
+limits are properties of the design: the driver cannot prove that the confirmation touch is the same
+finger as the twelve samples, and the comparison does not detect a replayed reply. All of this is
+stated in the project's documentation and in the driver's claims.
 
 **No unbound prints.** If the confirmation does not happen, fails, or the match id proves unstable, the
 enrolment fails and the user retries. There is no degraded mode that silently trusts the match flag:
 that would reintroduce the cross-user hole this project exists to close. A template committed before a
-failed confirmation is left on the sensor; the driver reports it as orphaned, because the protocol has
-no way to remove it until deletion exists.
+failed confirmation **may remain on the sensor**: without the inventory the driver cannot even identify
+it, and without a delete command it cannot remove it. The driver says so instead of claiming a clean
+failure.
 
 **Print payload.** The data stored per print is a fixed, versioned binary record: a magic and version,
 the **enrolment id** (or the sample hash used in its place), the **match id**, and flags recording
 which id is which and that the print is bound. No serialisation dependency, no JSON, no schema.
 Unknown versions are rejected rather than guessed. Every stored print is bound, by the decision above.
 
-**Storage model.** The sensor's store is the source of truth where the inventory query can be decoded:
-the driver maps templates to prints with a **store diff** taken around each enrolment, and declares
-the storage, list, delete and clear features to `libfprint`. Identification does not depend on the
-inventory: it needs match ids, which every stored print already carries, so it is declared whenever
-prints are bound. Where the inventory cannot be decoded, the driver stores prints host-side and
-declares neither list, delete nor clear. Which model is active is decided at open time by whether the
-inventory query was decoded on this sensor, and is visible in the features the driver reports.
+**Storage model.** The sensor's store is the source of truth where the presumed inventory query can be
+decoded: the driver maps templates to prints with a **store diff** taken around each enrolment, and
+declares the storage, list, delete and clear features to `libfprint`. Identification does not depend on
+the inventory: it needs match ids, which every stored print already carries, so it is a separate
+capability declared whenever prints are bound. Where the inventory cannot be decoded, the driver stores
+prints host-side and declares neither list, delete nor clear. Which model is active is decided at open
+time by whether the query was decoded on this sensor, and is visible in the features the driver
+reports. That `0x2F` is the inventory at all is itself a hypothesis; the reference only dumps its reply.
 
 **Deletion.** Deletion is a sensor operation when an opcode for it is known. If none is found, the
 driver reports deletion as unsupported and keeps the print visible; it never emulates deletion by
@@ -283,8 +292,10 @@ that acceptable.
 
 ## Out of Scope
 
-- Listing, deletion and identification through the sensor's store until the inventory query is decoded;
-  the first release may ship without them and must then declare the corresponding features absent.
+- Listing, deletion and identification through the sensor's store until the presumed inventory query is
+  decoded; the first release may ship without list and delete, and must then declare those features
+  absent. Identification needs no inventory and is scheduled separately, but is outside first-release
+  acceptance.
 - A "clear all" control in desktop clients: `fprintd` exposes deletion per print and per user, not a
   global wipe. The driver implements the storage-clear operation; whether a client can reach it is a
   client question.

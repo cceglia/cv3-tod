@@ -6,15 +6,19 @@ match.
 
 **Blocked by:** 09 (binding facts), 06 (enrolment), 07 (verification)
 
+If ticket 09 returns a negative result, this ticket closes with that finding instead of being
+implemented.
+
 **Status:** ready-for-agent
 
-- [ ] After committing an enrolment, the driver asks for one confirmation touch and records the match
-      id the sensor returns for it, as the thirteenth of thirteen declared stages
-- [ ] Verification requires the returned match id to equal the recorded one, and fails with a distinct
-      reason when the sensor reports a match but the ids differ
+- [ ] After committing, the driver asks for one confirmation touch and records the value the sensor
+      returns for it
+- [ ] Verification requires the returned value to equal the recorded one **and** the reply to have the
+      exact structure the match command produces, so a flag flip that leaves the value untouched is not
+      enough by itself
 - [ ] A different finger enrolled on the same sensor does not satisfy verification for this print
-- [ ] If the confirmation does not happen or fails, the enrolment fails and no print is stored; the
-      template left on the sensor is reported as orphaned
+- [ ] If the confirmation does not happen or fails, no print is stored, and the driver reports that a
+      template may remain on the sensor and cannot be identified or removed yet
 - [ ] The stored record round-trips through the versioned payload, and an unknown payload version is
       rejected
 - [ ] The limits are documented where the code lives: the confirmation cannot be proven to be the same
