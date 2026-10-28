@@ -28,6 +28,7 @@ pub mod proto;
 pub mod session;
 pub mod transcript;
 pub mod transport;
+pub mod verify;
 
 pub use capture::{
     CAPTURE_PLAINTEXT_LEN, CAPTURE_TLV_LEN, Capture, CaptureError, CapturedSample, SAMPLE_HASH_LEN,
@@ -47,10 +48,15 @@ pub use session::{
     UnwrapError, WrapError,
 };
 pub use transcript::{
-    Divergence, FrameKey, RecordingTransport, ReplayTransport, Transcript, TranscriptError,
-    TranscriptRecord,
+    Divergence, FrameKey, RecordingTransport, ReplayTransport, SessionMaterial, Transcript,
+    TranscriptError, TranscriptRecord,
 };
 pub use transport::{FailingTransport, ScriptedOutcome, ScriptedTransport, Transport};
+pub use verify::{
+    MATCH_PLAINTEXT_LEN, MATCH_TLV_LEN, MATCH_VALUE_LEN, Match, MatchError, VALUE_OFFSET,
+    VERDICT_MATCH, VERDICT_NO_MATCH, VERDICT_OFFSET, Verdict, Verification, Verify, VerifyError,
+    match_tlv,
+};
 
 /// Version of the core crate, reported by the probe.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

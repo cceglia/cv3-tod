@@ -175,6 +175,102 @@ pub fn sample_hash_plaintext() -> Vec<u8> {
     plaintext
 }
 
+/// The 20-byte value a synthetic `0x73` reply carries at plaintext `+32`.
+pub const MATCH_VALUE: [u8; 20] = [
+    0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf,
+    0xd0, 0xd1, 0xd2, 0xd3,
+];
+
+/// Length of the `0x73` parameter block, exactly as the audited reference sends it.
+pub const MATCH_TLV_LEN: usize = 68;
+/// Plaintext length the reference sends with `0x73`.
+pub const MATCH_PLAINTEXT_LEN: usize = 112;
+
+/// The documented 68-byte `0x73` parameter block, built independently of the implementation.
+///
+/// Five `(tag, 4, value)` entries followed by `(3, 20)` whose value bytes are deliberately absent:
+/// the reference ends the block at the final 8-byte header. This is a firmware-shaped request, not
+/// a well-formed TLV list.
+pub fn match_tlv(handle: u32) -> [u8; MATCH_TLV_LEN] {
+    let mut tlv = [0u8; MATCH_TLV_LEN];
+    let entries: [(usize, u32, u32); 5] = [
+        (0, 0, handle),
+        (12, 0, 0x148),
+        (24, 0, 0x53e2),
+        (36, 0, 0),
+        (48, 2, 0x007b_0ad3),
+    ];
+    for (at, tag, value) in entries {
+        tlv[at..at + 4].copy_from_slice(&tag.to_le_bytes());
+        tlv[at + 4..at + 8].copy_from_slice(&4u32.to_le_bytes());
+        tlv[at + 8..at + 12].copy_from_slice(&value.to_le_bytes());
+    }
+    tlv[60..64].copy_from_slice(&3u32.to_le_bytes());
+    tlv[64..68].copy_from_slice(&20u32.to_le_bytes());
+    tlv
+}
+
+/// The exact wrapped `0x73` frame a match must send for `session` at its next sequence.
+pub fn match_frame(session: &Session, iv: &[u8; 16]) -> Vec<u8> {
+    match_frame_at(session, iv, session.next_sequence())
+}
+
+/// The exact wrapped `0x73` frame for `session` at an explicit wrap sequence.
+pub fn match_frame_at(session: &Session, iv: &[u8; 16], sequence: u32) -> Vec<u8> {
+    session
+        .wrap(
+            cmd::MATCH,
+            attr::CAPTURE,
+            &match_tlv(session.handle),
+            MATCH_PLAINTEXT_LEN,
+            iv,
+            sequence,
+        )
+        .expect("the match constants build a frame")
+}
+
+/// A synthetic wrapped match reply whose plaintext is `plaintext`.
+pub fn match_reply(session: &Session, status: u32, plaintext: &[u8]) -> Vec<u8> {
+    let iv = fixed_iv();
+    let ciphertext = crypto::encrypt_cbc(session.key().as_bytes(), &iv, plaintext);
+    let mut body = frame::build_wrapped(
+        cmd::MATCH,
+        attr::CAPTURE,
+        session.handle,
+        &iv,
+        plaintext.len() as u32,
+        &ciphertext,
+    );
+    body[20..24].copy_from_slice(&status.to_le_bytes());
+    body
+}
+
+/// A synthetic match plaintext: the verdict word at `+8`, and the optional value at `+32`.
+///
+/// Without a value the plaintext is 28 bytes, long enough for the word but too short for the
+/// 20-byte value. Pass an explicit length through [`match_plaintext_with_len`] to exercise the
+/// too-short-for-the-word case.
+pub fn match_plaintext(word: u32, value: Option<&[u8; 20]>) -> Vec<u8> {
+    match value {
+        Some(_) => match_plaintext_with_len(word, value, 52),
+        None => match_plaintext_with_len(word, None, 28),
+    }
+}
+
+/// A synthetic match plaintext of exactly `len` bytes.
+pub fn match_plaintext_with_len(word: u32, value: Option<&[u8; 20]>, len: usize) -> Vec<u8> {
+    let mut plaintext = vec![0u8; len];
+    if len >= 12 {
+        plaintext[8..12].copy_from_slice(&word.to_le_bytes());
+    }
+    if let Some(value) = value
+        && len >= 52
+    {
+        plaintext[32..52].copy_from_slice(value);
+    }
+    plaintext
+}
+
 /// Runs a handshake that keeps its handle, then the wrapped `0x02`, and returns the live session.
 ///
 /// The scripted outcomes are pushed as each step is reached, so a caller can keep appending.

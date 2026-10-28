@@ -95,6 +95,13 @@ pub struct FakeUsb {
     pub commit_status: u32,
     /// If set, the scripted sensor fails the `0x6e` commit in the transport.
     pub commit_command_error: Option<UsbError>,
+    /// Status the scripted sensor answers the wrapped `0x73` match with.
+    pub match_status: u32,
+    /// If set, the decrypted plaintext of the `0x73` reply; by default it carries a match and
+    /// `MATCH_VALUE` at `+32`.
+    pub match_plaintext: Option<Vec<u8>>,
+    /// If set, the scripted sensor fails the wrapped `0x73` match in the transport.
+    pub match_command_error: Option<UsbError>,
     /// What the finger wait delivers. `None` is a genuine `0x03` finger event.
     pub finger_event: Option<Result<Vec<u8>, UsbError>>,
     pub sent: Rc<RefCell<Vec<Vec<u8>>>>,
@@ -134,6 +141,9 @@ impl Default for FakeUsb {
             enrolment_id: ENROLMENT_ID,
             commit_status: 0,
             commit_command_error: None,
+            match_status: 0,
+            match_plaintext: None,
+            match_command_error: None,
             finger_event: None,
             sent: Rc::new(RefCell::new(Vec::new())),
             log: Rc::new(RefCell::new(Vec::new())),
@@ -213,6 +223,9 @@ impl UsbBackend for FakeUsb {
             enrolment_id: self.enrolment_id,
             commit_status: self.commit_status,
             commit_command_error: self.commit_command_error.clone(),
+            match_status: self.match_status,
+            match_plaintext: self.match_plaintext.clone(),
+            match_command_error: self.match_command_error.clone(),
             accepted_updates: 0,
             finger_event: self.finger_event.clone(),
             session_key: None,
@@ -299,6 +312,12 @@ pub const ENROLMENT_ID: [u8; 20] = [
     0xb0, 0xb1, 0xb2, 0xb3,
 ];
 
+/// The 20-byte value the scripted `0x73` reply carries at plaintext `+32`.
+pub const MATCH_VALUE: [u8; 20] = [
+    0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf,
+    0xd0, 0xd1, 0xd2, 0xd3,
+];
+
 /// A scripted sensor that answers the `0x23` / `0x24` / `0x02` / `0x66` / `0x68` / `0x04` frames,
 /// so the probe's whole handshake, secure-session and capture lifecycle run offline. It records
 /// every frame it was sent.
@@ -329,6 +348,9 @@ pub struct HandshakeSensor {
     pub enrolment_id: [u8; 20],
     pub commit_status: u32,
     pub commit_command_error: Option<UsbError>,
+    pub match_status: u32,
+    pub match_plaintext: Option<Vec<u8>>,
+    pub match_command_error: Option<UsbError>,
     pub accepted_updates: usize,
     pub finger_event: Option<Result<Vec<u8>, UsbError>>,
     pub session_key: Option<[u8; 16]>,
@@ -389,6 +411,19 @@ impl HandshakeSensor {
         Reply {
             status: 0,
             body: self.wrapped_body(cmd::ARM_CAPTURE, attr::CAPTURE, self.arm_status, &plaintext),
+        }
+    }
+
+    fn match_reply(&self) -> Reply {
+        let plaintext = self.match_plaintext.clone().unwrap_or_else(|| {
+            let mut plaintext = vec![0u8; 52];
+            plaintext[8..12].copy_from_slice(&1u32.to_le_bytes());
+            plaintext[32..52].copy_from_slice(&MATCH_VALUE);
+            plaintext
+        });
+        Reply {
+            status: 0,
+            body: self.wrapped_body(cmd::MATCH, attr::CAPTURE, self.match_status, &plaintext),
         }
     }
 
@@ -487,6 +522,7 @@ impl HandshakeSensor {
                 ),
             },
             cmd::ARM_CAPTURE => self.arm_reply(),
+            cmd::MATCH => self.match_reply(),
             cmd::CANCEL_CAPTURE => Reply {
                 status: 0,
                 body: Vec::new(),
@@ -534,6 +570,11 @@ impl UsbIo for HandshakeSensor {
             }
             cmd::ARM_CAPTURE => {
                 if let Some(error) = &self.arm_command_error {
+                    return Err(error.clone());
+                }
+            }
+            cmd::MATCH => {
+                if let Some(error) = &self.match_command_error {
                     return Err(error.clone());
                 }
             }

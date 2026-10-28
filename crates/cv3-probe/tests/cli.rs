@@ -14,7 +14,8 @@ fn a_bare_invocation_prints_usage_to_stderr_and_exits_one() {
         String::from_utf8_lossy(&output.stderr),
         "usage: cvctl devices\n       cvctl handshake [--show-key] [--record <file>]\n       \
          cvctl open [--bad-sequence] [--record <file>]\n       cvctl close [--record <file>]\n       \
-         cvctl capture\n       cvctl enroll\n       cvctl replay <file>\n"
+         cvctl capture\n       cvctl enroll\n       cvctl verify [--record <file>]\n       \
+         cvctl replay <file>\n"
     );
 }
 

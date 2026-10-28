@@ -22,9 +22,11 @@ Status: scaffolding. Nothing here talks to the sensor yet.
 third-party C implementation and the audit of it. They are reference only: never built, never
 installed, excluded from the crates and from git.
 
-`*.cvrec` files written by `cvctl ... --record` are local recordings of one real session. They may
-contain session material and must not be committed. Committed fixtures are synthetic and built from
-the frame codec; `cvctl replay <file>` reproduces a recording without hardware.
+`*.cvrec` files written by `cvctl ... --record` are local recordings of one real session. A
+`cvctl verify --record` file additionally carries the run's ephemeral host key, nonces and IVs so
+that the wrapped match reply can be replayed exactly; it is sensitive and must not be committed.
+`.gitignore` keeps `*.cvrec` out of git. Committed fixtures are synthetic and built from the frame
+codec; `cvctl replay <file>` reproduces a recording without hardware.
 
 ## Building
 
@@ -48,11 +50,15 @@ The probe drives the sensor through the kernel's USB device nodes and therefore 
 | 5 | the sensor rejected the wrap sequence (`0x0F`) |
 | 6 | a replay diverged from its transcript |
 | 7 | `capture` found a capture already armed (`0x85`); the session was torn down |
-| 8 | `capture` timed out waiting for the finger; the session was torn down |
+| 8 | `capture` (or `verify`) timed out waiting for the finger; the session was torn down |
+| 9 | `verify` completed with a genuine no-match; this is a result, not an error |
+| 10 | a transport failure during a command operation; distinct from a finger timeout |
 | 128 + signal | interrupted by a catchable signal (for example 130 for `SIGINT`) |
 
 `capture` prints the sample hash on success and always runs the cancel-then-close teardown before
-exiting.
+exiting. `verify` prints `match` or `no match`, the 20-byte value (or `value absent`), the raw reply
+length and the decrypted plaintext length, then runs the same teardown. The value's meaning is not
+established, and `verify` does not yet compare it with anything: ticket 10 owns id binding.
 
 ## Licence
 

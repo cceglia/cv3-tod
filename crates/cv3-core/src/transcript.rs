@@ -9,11 +9,18 @@
 //!
 //! ```text
 //! +0   8B  magic = "CV3REC\0\0"
-//! +8   u16 version = 1
+//! +8   u16 version = 2
 //! +10  u32 command-name length
 //! +14  ... command name (UTF-8)
 //! +    u32 record count
 //! +    records, each a tag byte followed by its fields
+//! +    u8 material marker: 0 = none, 1 = session material follows
+//! +    if 1:
+//! +        32B host secret scalar (big-endian P-256)
+//! +        20B client nonce
+//! +        20B host nonce
+//! +        u32 IV count
+//! +        IV count * 16B IVs, in the order the run used them
 //! ```
 //!
 //! Record tags: `1` host frame (u32 length + bytes), `2` reply (u32 status, u32 length + body),
@@ -21,17 +28,24 @@
 //! UTF-8 message), `6` cancellation. A parser checks every length against the bytes that remain,
 //! so a truncated or corrupt file is a [`TranscriptError`] and never a panic.
 //!
-//! # Replay matching
+//! # Session material and replay matching
 //!
-//! The host keypair, both nonces, the wrapped IVs and therefore the ciphertext are fresh on every
-//! run, so a replay cannot compare frames byte for byte: `0x24` and `0x02` are different even when
-//! the same operation produced them. Replay therefore matches a requested frame on **command,
-//! attribute and header handle** only. That catches a changed operation shape, a reordered command
-//! or a different handle, but not a different payload under the same command, attribute and handle.
-//! A mismatch, or a transcript that ends or has records left over, is a [`Divergence`], which is
-//! reported as its own outcome rather than silently ignored.
+//! A transcript with material marker `1` is **sensitive**: it carries the ephemeral host secret
+//! and both nonces that derive the session key, plus the IVs of the run. It exists only so replay
+//! can decrypt the recorded wrapped replies and rebuild the exact host frames. Such a file must
+//! never be committed; the probe writes it only under `--record`, the README says so and
+//! `.gitignore` keeps `*.cvrec` out of git. [`Transcript::is_sensitive`] reports the marker.
 //!
-//! # Session material
+//! With material, replay compares each requested frame byte for byte, so a changed payload,
+//! sequence, IV or TLV is a [`Divergence::FrameBytes`] rather than a silent success. Without
+//! material the host keypair, both nonces, the wrapped IVs and therefore the ciphertext are fresh
+//! on every run, so a replay cannot compare frames byte for byte: it matches a requested frame on
+//! **command, attribute and header handle** only. That catches a changed operation shape, a
+//! reordered command or a different handle, but not a different payload under the same command,
+//! attribute and handle. A mismatch, or a transcript that ends or has records left over, is a
+//! [`Divergence`], which is reported as its own outcome rather than silently ignored.
+//!
+//! # Recordings
 //!
 //! A transcript is local evidence, not a committed fixture: it holds real host frames and device
 //! replies from one session. Recordings must not be committed. Committed fixtures stay synthetic
@@ -39,14 +53,21 @@
 
 use std::fmt;
 
+use zeroize::Zeroize;
+
+use crate::crypto;
 use crate::event::{Event, TransportError};
 use crate::frame::{self, FrameError};
+use crate::handshake::NONCE_LEN;
 use crate::transport::Transport;
 
 /// First eight bytes of a transcript.
 pub const MAGIC: [u8; 8] = *b"CV3REC\0\0";
 /// The only transcript version this build writes or reads.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
+
+const MATERIAL_NONE: u8 = 0;
+const MATERIAL_SESSION: u8 = 1;
 
 const RECORD_HOST_FRAME: u8 = 1;
 const RECORD_REPLY: u8 = 2;
@@ -59,6 +80,73 @@ const TRANSPORT_TIMEOUT: u8 = 0;
 const TRANSPORT_DISCONNECTED: u8 = 1;
 const TRANSPORT_STALL: u8 = 2;
 const TRANSPORT_OTHER: u8 = 3;
+
+/// The ephemeral material a replay needs to rebuild one recorded session exactly.
+///
+/// The host secret and both nonces derive the same session key from the recorded `0x23` reply, and
+/// the IVs are the ones each wrapped command used. This is sensitive material: the type redacts
+/// itself from `Debug` and zeroes its bytes on drop.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionMaterial {
+    host_secret: [u8; 32],
+    client_nonce: [u8; NONCE_LEN],
+    host_nonce: [u8; NONCE_LEN],
+    ivs: Vec<[u8; crypto::BLOCK_LEN]>,
+}
+
+impl SessionMaterial {
+    /// Builds material from the values a recorded run used.
+    ///
+    /// `ivs` holds one IV per wrapped command, in the order the operation used them.
+    pub fn new(
+        host_secret: [u8; 32],
+        client_nonce: [u8; NONCE_LEN],
+        host_nonce: [u8; NONCE_LEN],
+        ivs: Vec<[u8; crypto::BLOCK_LEN]>,
+    ) -> Self {
+        Self {
+            host_secret,
+            client_nonce,
+            host_nonce,
+            ivs,
+        }
+    }
+
+    /// The ephemeral host secret scalar.
+    pub fn host_secret(&self) -> &[u8; 32] {
+        &self.host_secret
+    }
+
+    /// The `0x23` client nonce.
+    pub fn client_nonce(&self) -> &[u8; NONCE_LEN] {
+        &self.client_nonce
+    }
+
+    /// The `0x24` host nonce.
+    pub fn host_nonce(&self) -> &[u8; NONCE_LEN] {
+        &self.host_nonce
+    }
+
+    /// The wrapped-command IVs, in the order the run used them.
+    pub fn ivs(&self) -> &[[u8; crypto::BLOCK_LEN]] {
+        &self.ivs
+    }
+}
+
+impl fmt::Debug for SessionMaterial {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SessionMaterial(<redacted>)")
+    }
+}
+
+impl Drop for SessionMaterial {
+    fn drop(&mut self) {
+        self.host_secret.zeroize();
+        self.client_nonce.zeroize();
+        self.host_nonce.zeroize();
+        self.ivs.zeroize();
+    }
+}
 
 /// One recorded direction in a transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,14 +196,16 @@ impl TranscriptRecord {
 pub struct Transcript {
     command: String,
     records: Vec<TranscriptRecord>,
+    material: Option<SessionMaterial>,
 }
 
 impl Transcript {
-    /// Starts an empty transcript for the named subcommand (`handshake`, `open`, `close`).
+    /// Starts an empty transcript for the named subcommand (`handshake`, `open`, `close`, `verify`).
     pub fn new(command: impl Into<String>) -> Self {
         Self {
             command: command.into(),
             records: Vec::new(),
+            material: None,
         }
     }
 
@@ -127,6 +217,30 @@ impl Transcript {
     /// The recorded records, in order.
     pub fn records(&self) -> &[TranscriptRecord] {
         &self.records
+    }
+
+    /// The session material a replay needs, when this recording carries it.
+    pub fn material(&self) -> Option<&SessionMaterial> {
+        self.material.as_ref()
+    }
+
+    /// Whether the transcript carries session material and must be treated as sensitive.
+    pub fn is_sensitive(&self) -> bool {
+        self.material.is_some()
+    }
+
+    /// Attaches the material a replay needs to rebuild the session exactly.
+    ///
+    /// The file becomes sensitive: it now carries the ephemeral host secret, both nonces and the
+    /// IVs. Only `--record` uses this, and only for replay.
+    pub fn set_material(&mut self, material: SessionMaterial) {
+        self.material = Some(material);
+    }
+
+    /// Returns the transcript with material attached, for a builder-style call.
+    pub fn with_material(mut self, material: SessionMaterial) -> Self {
+        self.set_material(material);
+        self
     }
 
     /// Appends one record.
@@ -167,6 +281,21 @@ impl Transcript {
                 TranscriptRecord::Cancelled => out.push(RECORD_CANCELLED),
             }
         }
+
+        match &self.material {
+            None => out.push(MATERIAL_NONE),
+            Some(material) => {
+                out.push(MATERIAL_SESSION);
+                out.extend_from_slice(material.host_secret());
+                out.extend_from_slice(material.client_nonce());
+                out.extend_from_slice(material.host_nonce());
+                out.extend_from_slice(&(material.ivs().len() as u32).to_le_bytes());
+                for iv in material.ivs() {
+                    out.extend_from_slice(iv);
+                }
+            }
+        }
+
         out
     }
 
@@ -228,12 +357,44 @@ impl Transcript {
             records.push(record);
         }
 
+        let material = match cursor.u8()? {
+            MATERIAL_NONE => None,
+            MATERIAL_SESSION => {
+                let host_secret = cursor.array::<32>()?;
+                let client_nonce = cursor.array::<NONCE_LEN>()?;
+                let host_nonce = cursor.array::<NONCE_LEN>()?;
+                let count = cursor.u32()? as usize;
+                if count > cursor.remaining() / crypto::BLOCK_LEN {
+                    return Err(TranscriptError::BadLength {
+                        field: "session material IV count",
+                        value: u32::try_from(count).unwrap_or(u32::MAX),
+                        remaining: cursor.remaining(),
+                    });
+                }
+                let mut ivs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    ivs.push(cursor.array::<{ crypto::BLOCK_LEN }>()?);
+                }
+                Some(SessionMaterial::new(
+                    host_secret,
+                    client_nonce,
+                    host_nonce,
+                    ivs,
+                ))
+            }
+            other => return Err(TranscriptError::UnknownMaterialMarker(other)),
+        };
+
         let trailing = cursor.remaining();
         if trailing != 0 {
             return Err(TranscriptError::TrailingBytes { count: trailing });
         }
 
-        Ok(Self { command, records })
+        Ok(Self {
+            command,
+            records,
+            material,
+        })
     }
 }
 
@@ -277,6 +438,8 @@ pub enum TranscriptError {
     UnknownRecord(u8),
     /// A transport-error kind is not one this version defines.
     UnknownTransport(u8),
+    /// The trailing session-material marker is not one this version defines.
+    UnknownMaterialMarker(u8),
     /// Bytes follow the last record.
     TrailingBytes { count: usize },
 }
@@ -308,6 +471,9 @@ impl fmt::Display for TranscriptError {
             Self::UnknownRecord(tag) => write!(f, "unknown transcript record tag {tag}"),
             Self::UnknownTransport(kind) => {
                 write!(f, "unknown transcript transport-error kind {kind}")
+            }
+            Self::UnknownMaterialMarker(marker) => {
+                write!(f, "unknown session-material marker {marker}")
             }
             Self::TrailingBytes { count } => {
                 write!(f, "{count} bytes follow the last transcript record")
@@ -364,6 +530,13 @@ impl<'a> Cursor<'a> {
         Ok(u32::from_le_bytes(
             self.take(4)?.try_into().expect("take(4)"),
         ))
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], TranscriptError> {
+        Ok(self
+            .take(N)?
+            .try_into()
+            .expect("take(N) returns exactly N bytes"))
     }
 
     /// Reads a length prefix and the bytes it names, refusing a length the buffer cannot hold.
@@ -427,6 +600,7 @@ impl<T: Transport> RecordingTransport<T> {
         Transcript {
             command: self.command.clone(),
             records: self.records.clone(),
+            material: None,
         }
     }
 
@@ -435,6 +609,7 @@ impl<T: Transport> RecordingTransport<T> {
         Transcript {
             command: self.command,
             records: self.records,
+            material: None,
         }
     }
 }
@@ -492,6 +667,13 @@ pub enum Divergence {
     UnreadableRequest(FrameError),
     /// The operation asked for a different command, attribute or handle.
     CommandMismatch { expected: FrameKey, got: FrameKey },
+    /// With session material recorded, the whole frame must match. This reports the first byte
+    /// that differs, or the shorter length when one frame is a prefix of the other.
+    FrameBytes {
+        at: usize,
+        expected_len: usize,
+        got_len: usize,
+    },
     /// The next record was not the host frame the operation was about to send.
     ExpectedHostFrame,
     /// The transcript ended before the operation asked for its next command.
@@ -515,6 +697,15 @@ impl fmt::Display for Divergence {
             Self::CommandMismatch { expected, got } => write!(
                 f,
                 "the operation sent {got}, but the transcript recorded {expected}"
+            ),
+            Self::FrameBytes {
+                at,
+                expected_len,
+                got_len,
+            } => write!(
+                f,
+                "the operation's frame differs from the recording at byte {at} \
+                 ({got_len} bytes sent, {expected_len} recorded)"
             ),
             Self::ExpectedHostFrame => {
                 f.write_str("the transcript expected a host frame but found a device outcome")
@@ -554,16 +745,19 @@ pub struct ReplayTransport {
     next: usize,
     sent: Vec<Vec<u8>>,
     divergence: Option<Divergence>,
+    exact: bool,
 }
 
 impl ReplayTransport {
     /// Replays `transcript`.
     pub fn new(transcript: Transcript) -> Self {
+        let exact = transcript.material().is_some();
         Self {
             transcript,
             next: 0,
             sent: Vec::new(),
             divergence: None,
+            exact,
         }
     }
 
@@ -649,14 +843,27 @@ impl Transport for ReplayTransport {
         let Some(record) = self.transcript.records.get(self.next).cloned() else {
             return self.diverge(Divergence::MissingHostFrame);
         };
-        let expected = match record {
-            TranscriptRecord::HostFrame(recorded) => match FrameKey::of(&recorded) {
-                Ok(key) => key,
-                Err(_) => return self.diverge(Divergence::ExpectedHostFrame),
-            },
+        let recorded = match record {
+            TranscriptRecord::HostFrame(recorded) => recorded,
             _ => return self.diverge(Divergence::ExpectedHostFrame),
         };
-        if got != expected {
+        if self.exact && recorded != frame {
+            let at = recorded
+                .iter()
+                .zip(frame)
+                .position(|(expected, got)| expected != got)
+                .unwrap_or_else(|| recorded.len().min(frame.len()));
+            return self.diverge(Divergence::FrameBytes {
+                at,
+                expected_len: recorded.len(),
+                got_len: frame.len(),
+            });
+        }
+        let expected = match FrameKey::of(&recorded) {
+            Ok(key) => key,
+            Err(_) => return self.diverge(Divergence::ExpectedHostFrame),
+        };
+        if !self.exact && got != expected {
             return self.diverge(Divergence::CommandMismatch { expected, got });
         }
 

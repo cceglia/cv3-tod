@@ -11,13 +11,15 @@
 use std::io::Write;
 
 use cv3_core::capture::{Capture, CaptureError, CapturedSample, SAMPLE_HASH_LEN};
+use cv3_core::crypto::HostKey;
 use cv3_core::enrol::{Enrol, EnrolError, EnrolledTemplate, MAX_ACCEPTED_SAMPLES, TemplateSource};
 use cv3_core::handshake::{Handshake, HandshakeError};
 use cv3_core::session::{
     CloseError, CloseSession, OpenError, OpenSession, Session, Teardown, TeardownError,
 };
-use cv3_core::transcript::{RecordingTransport, ReplayTransport, Transcript};
+use cv3_core::transcript::{RecordingTransport, ReplayTransport, SessionMaterial, Transcript};
 use cv3_core::transport::{Transport, run as drive};
+use cv3_core::verify::{MatchError, Verdict, Verification, Verify, VerifyError};
 use cv3_core::{Action, Operation};
 
 use crate::discovery::{CommandSession, ProbeError, UsbBackend, open_for_command, probe};
@@ -37,6 +39,11 @@ pub const EXIT_DIVERGED: u8 = 6;
 pub const EXIT_CAPTURE_PENDING: u8 = 7;
 /// `capture` waited for the finger and the wait timed out; distinct from a transport failure.
 pub const EXIT_FINGER_TIMEOUT: u8 = 8;
+/// `verify` completed and the sensor reported a genuine no-match. This is a result, not an error:
+/// a script can tell it apart from every failure code.
+pub const EXIT_NO_MATCH: u8 = 9;
+/// A transport failure during a command operation; distinct from a finger timeout.
+pub const EXIT_TRANSPORT: u8 = 10;
 
 const USAGE: &str = "usage: cvctl devices
        cvctl handshake [--show-key] [--record <file>]
@@ -44,6 +51,7 @@ const USAGE: &str = "usage: cvctl devices
        cvctl close [--record <file>]
        cvctl capture
        cvctl enroll
+       cvctl verify [--record <file>]
        cvctl replay <file>";
 
 /// One parsed invocation.
@@ -62,6 +70,9 @@ enum Command<'a> {
     },
     Capture,
     Enroll,
+    Verify {
+        record: Option<&'a str>,
+    },
     Replay {
         file: &'a str,
     },
@@ -102,6 +113,12 @@ fn parse(args: &[String]) -> Option<Command<'_>> {
         }
         "capture" if rest.is_empty() => Some(Command::Capture),
         "enroll" if rest.is_empty() => Some(Command::Enroll),
+        "verify" => {
+            let flags = parse_flags(rest, false, false, true)?;
+            Some(Command::Verify {
+                record: flags.record,
+            })
+        }
         "replay" => match rest {
             [file] => Some(Command::Replay { file }),
             _ => None,
@@ -161,6 +178,7 @@ pub fn run(
         Some(Command::Close { record }) => close(backend, shutdown, record, out, err),
         Some(Command::Capture) => capture(backend, shutdown, out, err),
         Some(Command::Enroll) => enroll(backend, shutdown, out, err),
+        Some(Command::Verify { record }) => verify(backend, shutdown, record, out, err),
         Some(Command::Replay { file }) => replay(file, out, err),
         None => {
             let _ = writeln!(err, "{USAGE}");
@@ -293,18 +311,24 @@ fn capture_over(
 /// Wraps the probe's exchange in a recording transport when `record` asks for one.
 ///
 /// The same operation runs either way. A write failure is returned to the caller rather than
-/// swallowed: the user asked for a transcript, and a missing one must be visible.
+/// swallowed: the user asked for a transcript, and a missing one must be visible. When `material`
+/// is present the transcript carries it and is marked sensitive; every other recording stays
+/// material-free and replays with fresh ephemeral keys.
 fn with_transport<R>(
     channel: &mut CommandSession,
     command: &str,
     record: Option<&str>,
+    material: Option<SessionMaterial>,
     run_operation: impl FnOnce(&mut dyn Transport) -> R,
 ) -> (R, Option<std::io::Error>) {
     match record {
         Some(path) => {
             let mut transport = RecordingTransport::new(channel.exchange(), command);
             let result = run_operation(&mut transport);
-            let transcript = transport.into_transcript();
+            let mut transcript = transport.into_transcript();
+            if let Some(material) = material {
+                transcript.set_material(material);
+            }
             let error = std::fs::write(path, transcript.to_bytes()).err();
             (result, error)
         }
@@ -349,9 +373,10 @@ fn handshake(
         }
     };
 
-    let (outcome, record_error) = with_transport(&mut channel, "handshake", record, |transport| {
-        handshake_over(transport, secrets, false)
-    });
+    let (outcome, record_error) =
+        with_transport(&mut channel, "handshake", record, None, |transport| {
+            handshake_over(transport, secrets, false)
+        });
 
     let code = match outcome {
         Ok(run) => {
@@ -406,7 +431,7 @@ fn open(
         }
     };
 
-    let (outcome, record_error) = with_transport(&mut channel, "open", record, |transport| {
+    let (outcome, record_error) = with_transport(&mut channel, "open", record, None, |transport| {
         open_over(transport, secrets, iv, bad_sequence)
     });
 
@@ -458,9 +483,10 @@ fn close(
         }
     };
 
-    let (outcome, record_error) = with_transport(&mut channel, "close", record, |transport| {
-        close_over(transport, secrets)
-    });
+    let (outcome, record_error) =
+        with_transport(&mut channel, "close", record, None, |transport| {
+            close_over(transport, secrets)
+        });
 
     let code = match outcome {
         Ok(()) => {
@@ -702,12 +728,185 @@ fn enroll(
     }
 }
 
+/// Where a verification run stopped.
+enum VerifyFailure {
+    Handshake(HandshakeError),
+    Open(OpenError),
+    Verify(VerifyError),
+}
+
+/// Opens the secure session, runs capture then match, and tears the session down afterwards.
+///
+/// A capture or match failure has already torn the session down; a successful verification is
+/// torn down here because the probe does not keep a session between invocations. The verdict is
+/// returned with the teardown's own best-effort result.
+fn verify_over(
+    transport: &mut dyn Transport,
+    secrets: RunSecrets,
+    open_iv: [u8; cv3_core::crypto::BLOCK_LEN],
+    capture_iv: [u8; cv3_core::crypto::BLOCK_LEN],
+    match_iv: [u8; cv3_core::crypto::BLOCK_LEN],
+) -> Result<(Verdict, Result<(), TeardownError>), VerifyFailure> {
+    let run = handshake_over(transport, secrets, true).map_err(VerifyFailure::Handshake)?;
+    let mut open = OpenSession::new(run.session, open_iv);
+    let session = drive(&mut open, transport).map_err(VerifyFailure::Open)?;
+
+    let mut verify = Verify::new(session, capture_iv, match_iv);
+    match drive(&mut verify, transport) {
+        Ok(Verification { verdict, session }) => {
+            let mut teardown = Teardown::new(session.handle);
+            drop(session);
+            Ok((verdict, drive(&mut teardown, transport)))
+        }
+        Err(error) => Err(VerifyFailure::Verify(error)),
+    }
+}
+
+/// Prints the verdict, the 20-byte value (or its absence) and both lengths.
+fn print_verdict(verdict: &Verdict, out: &mut dyn Write) {
+    let _ = writeln!(
+        out,
+        "{}",
+        if verdict.matched { "match" } else { "no match" }
+    );
+    match &verdict.value {
+        Some(value) => {
+            let _ = writeln!(out, "value {}", hex(value));
+        }
+        None => {
+            let _ = writeln!(out, "value absent");
+        }
+    }
+    let _ = writeln!(out, "reply length {}", verdict.reply_len);
+    let _ = writeln!(out, "plaintext length {}", verdict.plaintext_len);
+}
+
+/// Maps a verification failure onto the probe's documented exit codes.
+fn verify_error_code(error: &VerifyError) -> u8 {
+    use cv3_core::proto::status;
+
+    match error {
+        VerifyError::Capture(CaptureError::AlreadyPending) => EXIT_CAPTURE_PENDING,
+        VerifyError::Capture(CaptureError::FingerTimeout) => EXIT_FINGER_TIMEOUT,
+        VerifyError::Capture(CaptureError::Transport(_)) => EXIT_TRANSPORT,
+        VerifyError::Capture(CaptureError::SensorStatus(code)) if *code == status::BAD_SEQUENCE => {
+            EXIT_SEQUENCE
+        }
+        VerifyError::Capture(CaptureError::SensorStatus(code))
+            if *code == status::CAPTURE_PENDING =>
+        {
+            EXIT_CAPTURE_PENDING
+        }
+        VerifyError::Match(MatchError::WrongSequence) => EXIT_SEQUENCE,
+        VerifyError::Match(MatchError::Transport(_)) => EXIT_TRANSPORT,
+        VerifyError::Match(MatchError::SensorStatus(code)) if *code == status::BAD_SEQUENCE => {
+            EXIT_SEQUENCE
+        }
+        VerifyError::Match(MatchError::SensorStatus(code)) if *code == status::CAPTURE_PENDING => {
+            EXIT_CAPTURE_PENDING
+        }
+        _ => EXIT_OTHER,
+    }
+}
+
+/// Opens the session, captures a finger, matches it and reports the verdict.
+fn verify(
+    backend: &mut dyn UsbBackend,
+    shutdown: &dyn Shutdown,
+    record: Option<&str>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let open_iv = match random_iv() {
+        Ok(iv) => iv,
+        Err(error) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            return EXIT_OTHER;
+        }
+    };
+    let capture_iv = match random_iv() {
+        Ok(iv) => iv,
+        Err(error) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            return EXIT_OTHER;
+        }
+    };
+    let match_iv = match random_iv() {
+        Ok(iv) => iv,
+        Err(error) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            return EXIT_OTHER;
+        }
+    };
+    let mut channel = match open_for_command(backend, shutdown) {
+        Ok(channel) => channel,
+        Err(error) => {
+            report(&error, err);
+            return error.exit_code();
+        }
+    };
+    let secrets = match RunSecrets::generate() {
+        Ok(secrets) => secrets,
+        Err(error) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            return EXIT_OTHER;
+        }
+    };
+    let material = SessionMaterial::new(
+        secrets.host_key.secret_bytes(),
+        secrets.client_nonce,
+        secrets.host_nonce,
+        vec![open_iv, capture_iv, match_iv],
+    );
+
+    let (outcome, record_error) = with_transport(
+        &mut channel,
+        "verify",
+        record,
+        Some(material),
+        |transport| verify_over(transport, secrets, open_iv, capture_iv, match_iv),
+    );
+
+    let code = match outcome {
+        Ok((verdict, teardown)) => {
+            print_verdict(&verdict, out);
+            if let Err(error) = teardown {
+                let _ = writeln!(err, "cvctl: {error}");
+            }
+            if verdict.matched {
+                EXIT_OK
+            } else {
+                EXIT_NO_MATCH
+            }
+        }
+        Err(VerifyFailure::Handshake(error)) => {
+            let _ = writeln!(err, "cvctl: handshake failed: {error}");
+            EXIT_OTHER
+        }
+        Err(VerifyFailure::Open(error)) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            if matches!(error, OpenError::WrongSequence) {
+                EXIT_SEQUENCE
+            } else {
+                EXIT_OTHER
+            }
+        }
+        Err(VerifyFailure::Verify(error)) => {
+            let _ = writeln!(err, "cvctl: verification failed: {error}");
+            verify_error_code(&error)
+        }
+    };
+    finish_recording(record_error, err, code)
+}
+
 /// What a replay run produced.
 enum ReplayOutcome {
     Random(RandomError),
+    Message(String),
     Handshake(Result<Session, HandshakeError>),
     Open(Result<(u32, Result<(), CloseError>), OpenFailure>),
     Close(Result<(), CloseFailure>),
+    Verify(Result<(Verdict, Result<(), TeardownError>), VerifyFailure>),
 }
 
 fn replay_handshake(transport: &mut ReplayTransport) -> ReplayOutcome {
@@ -738,6 +937,33 @@ fn replay_close(transport: &mut ReplayTransport) -> ReplayOutcome {
     }
 }
 
+/// Replays a verify recording using the session material it carries.
+///
+/// The recorded host secret and nonces rebuild the same session key, and the recorded IVs rebuild
+/// the same `0x66` and `0x73` frames, so the wrapped no-match reply decrypts exactly as it did on
+/// hardware. A transcript without material cannot be replayed this way.
+fn replay_verify(transport: &mut ReplayTransport, material: &SessionMaterial) -> ReplayOutcome {
+    let host_key = match HostKey::from_bytes(material.host_secret()) {
+        Ok(host_key) => host_key,
+        Err(error) => {
+            return ReplayOutcome::Message(format!("invalid session material: {error}"));
+        }
+    };
+    let secrets = RunSecrets {
+        host_key,
+        client_nonce: *material.client_nonce(),
+        host_nonce: *material.host_nonce(),
+    };
+    let ivs = material.ivs();
+    if ivs.len() < 3 {
+        return ReplayOutcome::Message(format!(
+            "verify session material has {} IV(s), needs three (open, capture, match)",
+            ivs.len()
+        ));
+    }
+    ReplayOutcome::Verify(verify_over(transport, secrets, ivs[0], ivs[1], ivs[2]))
+}
+
 /// Replays a recorded invocation with no hardware.
 fn replay(file: &str, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
     let bytes = match std::fs::read(file) {
@@ -756,16 +982,34 @@ fn replay(file: &str, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
     };
 
     let command = transcript.command().to_owned();
+    let material = transcript.material().cloned();
     let mut transport = ReplayTransport::new(transcript);
     let outcome = match command.as_str() {
         "handshake" => replay_handshake(&mut transport),
         "open" => replay_open(&mut transport),
         "close" => replay_close(&mut transport),
+        "verify" => match material.as_ref() {
+            Some(material) => replay_verify(&mut transport, material),
+            None => {
+                let _ = writeln!(
+                    err,
+                    "cvctl: verify transcript has no session material; only a verify recorded \
+                     with --record can be replayed"
+                );
+                return EXIT_OTHER;
+            }
+        },
         other => {
             let _ = writeln!(err, "cvctl: transcript records unknown command {other:?}");
             return EXIT_OTHER;
         }
     };
+
+    // A pre-run problem with the material is not a divergence: the operation never received a
+    // frame, so leftover records say nothing about its behaviour.
+    if matches!(&outcome, ReplayOutcome::Message(_)) {
+        return report_replay(outcome, out, err);
+    }
 
     // Divergence wins over the operation's own result: the operation ran against bytes that did
     // not match the recording, so its answer is not a replay of anything.
@@ -784,6 +1028,10 @@ fn report_replay(outcome: ReplayOutcome, out: &mut dyn Write, err: &mut dyn Writ
     match outcome {
         ReplayOutcome::Random(error) => {
             let _ = writeln!(err, "cvctl: {error}");
+            EXIT_OTHER
+        }
+        ReplayOutcome::Message(message) => {
+            let _ = writeln!(err, "cvctl: {message}");
             EXIT_OTHER
         }
         ReplayOutcome::Handshake(Ok(session)) => {
@@ -834,6 +1082,33 @@ fn report_replay(outcome: ReplayOutcome, out: &mut dyn Write, err: &mut dyn Writ
             let _ = writeln!(err, "cvctl: {error}");
             EXIT_OTHER
         }
+        ReplayOutcome::Verify(Ok((verdict, teardown))) => {
+            print_verdict(&verdict, out);
+            if let Err(error) = teardown {
+                let _ = writeln!(err, "cvctl: {error}");
+            }
+            if verdict.matched {
+                EXIT_OK
+            } else {
+                EXIT_NO_MATCH
+            }
+        }
+        ReplayOutcome::Verify(Err(VerifyFailure::Handshake(error))) => {
+            let _ = writeln!(err, "cvctl: handshake failed: {error}");
+            EXIT_OTHER
+        }
+        ReplayOutcome::Verify(Err(VerifyFailure::Open(error))) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            if matches!(error, OpenError::WrongSequence) {
+                EXIT_SEQUENCE
+            } else {
+                EXIT_OTHER
+            }
+        }
+        ReplayOutcome::Verify(Err(VerifyFailure::Verify(error))) => {
+            let _ = writeln!(err, "cvctl: verification failed: {error}");
+            verify_error_code(&error)
+        }
     }
 }
 
@@ -866,7 +1141,7 @@ mod tests {
     use crate::discovery::UsbError;
     use crate::layout::{EndpointDescriptor, TransferType};
     use crate::signals::SignalFlag;
-    use crate::testing::{ENROLMENT_ID, FakeUsb, SAMPLE_HASH, TEST_HANDLE, sensor};
+    use crate::testing::{ENROLMENT_ID, FakeUsb, MATCH_VALUE, SAMPLE_HASH, TEST_HANDLE, sensor};
 
     fn run_with(args: &[&str], usb: &mut FakeUsb, shutdown: &dyn Shutdown) -> (u8, String, String) {
         let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
@@ -1847,5 +2122,290 @@ mod tests {
         assert!(err.contains("timed out"), "{err}");
         assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
         assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some());
+    }
+
+    fn match_plaintext(word: u32, value: Option<&[u8; 20]>) -> Vec<u8> {
+        let len = if value.is_some() { 52 } else { 28 };
+        let mut plaintext = vec![0u8; len];
+        plaintext[8..12].copy_from_slice(&word.to_le_bytes());
+        if let Some(value) = value {
+            plaintext[32..52].copy_from_slice(value);
+        }
+        plaintext
+    }
+
+    fn verify_output(
+        verdict: &str,
+        value: Option<&[u8; 20]>,
+        reply: usize,
+        plaintext: usize,
+    ) -> String {
+        let value = match value {
+            Some(value) => format!("value {}", hex(value)),
+            None => "value absent".to_owned(),
+        };
+        format!("{verdict}\n{value}\nreply length {reply}\nplaintext length {plaintext}\n")
+    }
+
+    #[test]
+    fn verify_prints_the_verdict_value_and_lengths_then_tears_down() {
+        let mut usb = FakeUsb::with_sensor();
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(err, "");
+        assert_eq!(
+            out,
+            verify_output("match", Some(&MATCH_VALUE), 108, 52),
+            "the verdict, the value and both lengths"
+        );
+        assert_eq!(
+            sent_commands(&usb),
+            [
+                cmd::CHALLENGE,
+                cmd::CHALLENGE_RESPONSE,
+                cmd::OPEN_SESSION,
+                cmd::ARM_CAPTURE,
+                cmd::MATCH,
+                cmd::CANCEL_CAPTURE,
+                cmd::CLOSE_SESSION,
+            ],
+            "a successful verify tears down with 0x68 then 0x04 before exiting"
+        );
+
+        let match_frame = sent_command(&usb, cmd::MATCH).expect("0x73 was sent");
+        assert_eq!(match_frame[10], attr::CAPTURE);
+        assert_eq!(match_frame[11], 0x02, "the match is wrapped");
+        assert_eq!(le32(&match_frame, 16), TEST_HANDLE);
+        assert_eq!(
+            le32(&match_frame, 40),
+            68,
+            "the firmware-shaped 68-byte TLV"
+        );
+        assert_eq!(match_frame.len(), 172, "112 plaintext bytes plus padding");
+    }
+
+    #[test]
+    fn verify_reports_a_no_match_with_its_own_exit_code_and_the_same_detail() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.match_plaintext = Some(match_plaintext(0, Some(&MATCH_VALUE)));
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_NO_MATCH);
+        assert_ne!(code, EXIT_OTHER);
+        assert_ne!(code, EXIT_TRANSPORT);
+        assert_eq!(err, "");
+        assert_eq!(
+            out,
+            verify_output("no match", Some(&MATCH_VALUE), 108, 52),
+            "a no-match carries the value when the reply supplies it"
+        );
+        assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
+        assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some());
+    }
+
+    #[test]
+    fn verify_reports_a_no_match_without_a_value_as_absent() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.match_plaintext = Some(match_plaintext(0, None));
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_NO_MATCH);
+        assert_eq!(err, "");
+        assert_eq!(out, verify_output("no match", None, 76, 28));
+        assert!(out.contains("value absent"), "{out}");
+    }
+
+    #[test]
+    fn a_short_match_reply_is_malformed_not_a_no_match() {
+        let mut usb = FakeUsb::with_sensor();
+        // Eleven bytes: enough to unwrap, too short for the verdict word at +8.
+        let mut plaintext = vec![0u8; 11];
+        plaintext[8..11].copy_from_slice(&[0, 0, 0]);
+        usb.match_plaintext = Some(plaintext);
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OTHER);
+        assert_eq!(out, "", "a malformed reply is never printed as a no-match");
+        assert!(err.contains("too short for the verdict word"), "{err}");
+        assert!(err.contains("not a no-match"), "{err}");
+        assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
+        assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some());
+    }
+
+    #[test]
+    fn verify_capture_timeout_and_transport_error_are_distinct() {
+        let shutdown = SignalFlag::new();
+
+        let mut timeout = FakeUsb::with_sensor();
+        timeout.finger_event = Some(Err(UsbError::Timeout));
+        let (timeout_code, timeout_out, timeout_err) =
+            run_with(&["verify"], &mut timeout, &shutdown);
+        assert_eq!(timeout_code, EXIT_FINGER_TIMEOUT);
+        assert_eq!(timeout_out, "");
+        assert!(timeout_err.contains("finger timeout"), "{timeout_err}");
+        assert!(sent_command(&timeout, cmd::CANCEL_CAPTURE).is_some());
+        assert!(sent_command(&timeout, cmd::CLOSE_SESSION).is_some());
+
+        let mut transport = FakeUsb::with_sensor();
+        transport.match_command_error = Some(UsbError::Timeout);
+        let (transport_code, transport_out, transport_err) =
+            run_with(&["verify"], &mut transport, &shutdown);
+        assert_eq!(transport_code, EXIT_TRANSPORT);
+        assert_ne!(transport_code, timeout_code);
+        assert_eq!(transport_out, "");
+        assert!(
+            transport_err.contains("transport failed"),
+            "a transport failure names itself: {transport_err}"
+        );
+        assert_ne!(transport_err, timeout_err, "the messages are distinct");
+        assert!(sent_command(&transport, cmd::CANCEL_CAPTURE).is_some());
+        assert!(sent_command(&transport, cmd::CLOSE_SESSION).is_some());
+    }
+
+    #[test]
+    fn verify_with_a_match_transport_error_is_not_a_finger_timeout() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.arm_command_error = Some(UsbError::Disconnected);
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_TRANSPORT);
+        assert_eq!(out, "");
+        assert!(err.contains("transport failed"), "{err}");
+        assert!(err.contains("disconnected"), "{err}");
+        assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
+        assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some());
+    }
+
+    #[test]
+    fn verify_reports_capture_pending_with_its_own_exit_code_and_tears_down() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.arm_status = 0x85;
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_CAPTURE_PENDING);
+        assert_eq!(out, "");
+        assert!(err.contains("already armed"), "{err}");
+        assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
+        assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some());
+    }
+
+    #[test]
+    fn verify_reports_a_match_sequence_failure_with_the_sequence_code() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.match_status = 0x0f;
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_SEQUENCE);
+        assert_eq!(out, "");
+        assert!(err.contains("wrap sequence"), "{err}");
+        assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
+        assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some());
+    }
+
+    #[test]
+    fn a_recorded_no_match_verify_replays_with_the_same_detail_and_no_hardware() {
+        let record = TempRecord::new("verify-replay");
+        let shutdown = SignalFlag::new();
+        let mut usb = FakeUsb::with_sensor();
+        usb.match_plaintext = Some(match_plaintext(0, Some(&MATCH_VALUE)));
+
+        let (record_code, record_out, record_err) =
+            run_with(&["verify", "--record", record.path()], &mut usb, &shutdown);
+        assert_eq!(record_code, EXIT_NO_MATCH, "{record_err}");
+        assert_eq!(record_err, "");
+        assert!(record.exists());
+
+        let bytes = std::fs::read(&record.0).expect("the recording is readable");
+        let transcript = Transcript::from_bytes(&bytes).expect("the recording parses");
+        assert_eq!(transcript.command(), "verify");
+        assert!(
+            transcript.is_sensitive(),
+            "a verify recording carries session material"
+        );
+        assert!(transcript.material().is_some());
+
+        let mut replay_usb = FakeUsb::default();
+        let (code, out, err) = run_with(&["replay", record.path()], &mut replay_usb, &shutdown);
+
+        assert_eq!(code, EXIT_NO_MATCH, "{err}");
+        assert_eq!(err, "");
+        assert_eq!(
+            out, record_out,
+            "the replay reproduces the verdict, value and lengths"
+        );
+        assert!(
+            replay_usb.calls().is_empty(),
+            "replay never touches a USB backend"
+        );
+    }
+
+    #[test]
+    fn replay_rejects_a_verify_transcript_without_session_material() {
+        let record = TempRecord::new("verify-no-material");
+        record.write(&Transcript::new("verify").to_bytes());
+        let mut usb = FakeUsb::default();
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["replay", record.path()], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OTHER);
+        assert_eq!(out, "");
+        assert!(err.contains("session material"), "{err}");
+        assert!(usb.calls().is_empty());
+    }
+
+    #[test]
+    fn replay_rejects_verify_material_that_is_not_a_valid_key() {
+        let record = TempRecord::new("verify-bad-material");
+        let mut transcript = Transcript::new("verify");
+        transcript.set_material(SessionMaterial::new(
+            [0u8; 32],
+            [0u8; 20],
+            [0u8; 20],
+            vec![[0u8; 16]; 3],
+        ));
+        record.write(&transcript.to_bytes());
+        let mut usb = FakeUsb::default();
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["replay", record.path()], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OTHER);
+        assert_eq!(out, "");
+        assert!(err.contains("invalid session material"), "{err}");
+        assert!(usb.calls().is_empty());
+    }
+
+    #[test]
+    fn replay_rejects_an_unknown_transcript_version() {
+        let record = TempRecord::new("unknown-version");
+        let mut bytes = Transcript::new("verify").to_bytes();
+        bytes[8..10].copy_from_slice(&99u16.to_le_bytes());
+        record.write(&bytes);
+        let mut usb = FakeUsb::default();
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["replay", record.path()], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OTHER);
+        assert_eq!(out, "");
+        assert!(err.contains("invalid transcript"), "{err}");
+        assert!(err.contains("version 99"), "{err}");
+        assert!(usb.calls().is_empty());
     }
 }
