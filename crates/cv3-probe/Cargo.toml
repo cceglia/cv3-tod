@@ -16,5 +16,6 @@ path = "src/main.rs"
 
 [dependencies]
 cv3-core = { path = "../cv3-core" }
+getrandom = "=0.2.15"
 nusb = "=0.2.9"
 signal-hook = "=0.4.5"

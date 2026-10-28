@@ -127,6 +127,36 @@ pub fn build_plain(cmd: u16, attr: u8, handle: u32, param: &[u8]) -> Vec<u8> {
     )
 }
 
+/// Builds a plain frame carrying an explicit status word, as a reply does.
+///
+/// Host → sensor commands carry status zero; this constructor exists so fixtures and the scripted
+/// transport build replies through the same codec as the parser, rather than by poking offsets.
+pub fn build_plain_reply(cmd: u16, attr: u8, handle: u32, status: u32, param: &[u8]) -> Vec<u8> {
+    let mut frame = build_plain(cmd, attr, handle, param);
+    put32(&mut frame, STATUS_OFFSET, status);
+    frame
+}
+
+/// Builds the close-session frame that releases a session handle.
+///
+/// `cmd 0x04`, attr `0x40`, encoding `CloseHandle` (0x04), header handle zero, and a 12-byte
+/// parameter block `[u32 0, u32 4, u32 handle]`. This is the frame the sensor needs before the
+/// host forgets a handle it learned during the handshake.
+pub fn build_close_handle(handle: u32) -> Vec<u8> {
+    let mut param = [0u8; 12];
+    put32(&mut param, 0, 0);
+    put32(&mut param, 4, 4);
+    put32(&mut param, 8, handle);
+    build(
+        Encoding::CloseHandle,
+        crate::proto::cmd::CLOSE_SESSION,
+        crate::proto::attr::CLOSE_SESSION,
+        0,
+        12,
+        &param,
+    )
+}
+
 /// Builds a wrapped frame from already-encrypted parameters.
 ///
 /// `declared_len` is the length of the leading parameter block that the MAC covers, not the
@@ -251,6 +281,34 @@ mod tests {
         let header = validate(&frame).expect("frame validates");
         assert_eq!(header.status, 0x85);
         assert_eq!(header.attr, attr::CAPTURE);
+    }
+
+    #[test]
+    fn a_plain_reply_carries_its_status_through_the_codec() {
+        let frame = build_plain_reply(cmd::CHALLENGE, attr::CHALLENGE, 7, 0x8c, &[0u8; 148]);
+
+        assert_eq!(le32(&frame, STATUS_OFFSET), 0x8c);
+        let header = validate(&frame).expect("frame validates");
+        assert_eq!(header.status, 0x8c);
+        assert_eq!(header.handle, 7);
+        assert_eq!(header.total_len as usize, HEADER_LEN + 148);
+    }
+
+    #[test]
+    fn the_close_handle_frame_matches_the_wire_layout() {
+        let frame = build_close_handle(0x1122_3344);
+
+        assert_eq!(frame.len(), 56);
+        assert_eq!(le32(&frame, 0), 1, "magic");
+        assert_eq!(le32(&frame, 4), 56, "total length");
+        assert_eq!(&frame[8..10], &[0x04, 0x00], "close-session command");
+        assert_eq!(frame[10], 0x40, "attribute");
+        assert_eq!(frame[11], Encoding::CloseHandle as u8, "encoding");
+        assert_eq!(le32(&frame, 16), 0, "header handle is zero");
+        assert_eq!(le32(&frame, PARAM_LEN_OFFSET), 12, "declared length");
+        assert_eq!(le32(&frame, HEADER_LEN), 0, "tag");
+        assert_eq!(le32(&frame, HEADER_LEN + 4), 4, "value length");
+        assert_eq!(le32(&frame, HEADER_LEN + 8), 0x1122_3344, "handle");
     }
 
     #[test]

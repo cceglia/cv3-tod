@@ -11,6 +11,7 @@ use core::fmt;
 
 use cv3_core::proto::{PRODUCT_ID, VENDOR_ID};
 
+use crate::exchange::{Exchange, UsbIo};
 use crate::layout::{EndpointLayout, InterfaceDescriptor, LayoutError, SENSOR_INTERFACE, validate};
 use crate::signals::Shutdown;
 pub use crate::usb::UsbError;
@@ -59,6 +60,26 @@ pub trait SensorDevice {
 pub trait UsbBackend {
     fn enumerate(&mut self) -> Result<Vec<FoundSensor>, UsbError>;
     fn open(&mut self, sensor: &FoundSensor) -> Result<Box<dyn SensorDevice>, UsbError>;
+
+    /// Opens the sensor and claims interface 0 for command transfers, returning the transport the
+    /// core drives. Backends that cannot carry commands leave this unimplemented.
+    fn open_command(&mut self, _sensor: &FoundSensor) -> Result<Box<dyn UsbIo>, UsbError> {
+        Err(UsbError::Other(
+            "this USB backend has no command transport".to_owned(),
+        ))
+    }
+}
+
+/// An open, claimed command channel. Dropping it releases the interface.
+pub struct CommandSession {
+    io: Box<dyn UsbIo>,
+}
+
+impl CommandSession {
+    /// The exchange every command goes through.
+    pub fn exchange(&mut self) -> Exchange<'_> {
+        Exchange::new(self.io.as_mut())
+    }
 }
 
 /// The step a failure came from, so the message can say where it happened.
@@ -195,6 +216,30 @@ pub fn probe(
     claimed.release().map_err(ProbeError::Release)?;
 
     Ok(ProbeOutcome { sensor, layout })
+}
+
+/// Finds the sensor, opens it, claims interface 0 and leaves the command channel open.
+///
+/// This is the probe's entry point for every command subcommand. Unlike [`probe`], which releases
+/// the interface after checking the descriptor, the returned [`CommandSession`] owns the claim
+/// until it is dropped, so one session can carry a whole operation.
+pub fn open_for_command(
+    backend: &mut dyn UsbBackend,
+    shutdown: &dyn Shutdown,
+) -> Result<CommandSession, ProbeError> {
+    interrupted(shutdown)?;
+
+    let devices = backend
+        .enumerate()
+        .map_err(|error| stage_error(Stage::Enumerating, error))?;
+    let sensor = select_sensor(devices)?;
+
+    interrupted(shutdown)?;
+    let io = backend
+        .open_command(&sensor)
+        .map_err(|error| stage_error(Stage::Opening, error))?;
+
+    Ok(CommandSession { io })
 }
 
 /// A shutdown request turns into the same unwind as any other failure, so the guard releases.

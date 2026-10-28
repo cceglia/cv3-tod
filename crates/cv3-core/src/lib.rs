@@ -5,9 +5,23 @@
 //! recorded frames and without hardware. See `docs/adr/0001-io-free-core-with-c-shim.md`.
 //!
 //! Two transports drive it: `cvctl`, the development probe, and the libfprint TOD plugin.
+//!
+//! An operation is one object with [`Operation::start`] and [`Operation::step`]; [`handshake`] is
+//! the first. Events and actions are [`Event`] and [`Action`]; the core's transport failure type
+//! is [`TransportError`], never a USB crate's.
 
+#![forbid(unsafe_code)]
+
+pub mod crypto;
+pub mod event;
 pub mod frame;
+pub mod handshake;
+pub mod operation;
 pub mod proto;
+
+pub use event::{Action, Event, TransportError};
+pub use handshake::{Handshake, HandshakeError, Session, SessionKey};
+pub use operation::Operation;
 
 /// Version of the core crate, reported by the probe.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

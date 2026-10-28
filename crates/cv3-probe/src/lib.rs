@@ -2,9 +2,11 @@
 
 pub mod cli;
 pub mod discovery;
+pub mod driver;
 pub mod exchange;
 pub mod layout;
 pub mod nusb_backend;
+pub mod random;
 pub mod signals;
 pub mod usb;
 

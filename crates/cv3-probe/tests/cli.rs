@@ -12,6 +12,6 @@ fn a_bare_invocation_prints_usage_to_stderr_and_exits_one() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "");
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        "usage: cvctl devices\n"
+        "usage: cvctl devices\n       cvctl handshake [--show-key]\n"
     );
 }

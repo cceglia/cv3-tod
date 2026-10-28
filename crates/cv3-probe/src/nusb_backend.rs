@@ -31,6 +31,19 @@ impl NusbBackend {
     pub fn new() -> Self {
         Self
     }
+
+    fn matching_device(sensor: &FoundSensor) -> Result<nusb::DeviceInfo, UsbError> {
+        nusb::list_devices()
+            .wait()
+            .map_err(map_error)?
+            .find(|device| {
+                device.vendor_id() == sensor.vendor
+                    && device.product_id() == sensor.product
+                    && device.busnum() == sensor.bus
+                    && device.port_chain() == sensor.port_chain.as_slice()
+            })
+            .ok_or(UsbError::NotFound)
+    }
 }
 
 impl UsbBackend for NusbBackend {
@@ -47,21 +60,19 @@ impl UsbBackend for NusbBackend {
     }
 
     fn open(&mut self, sensor: &FoundSensor) -> Result<Box<dyn SensorDevice>, UsbError> {
-        let info = nusb::list_devices()
-            .wait()
-            .map_err(map_error)?
-            .find(|device| {
-                device.vendor_id() == sensor.vendor
-                    && device.product_id() == sensor.product
-                    && device.busnum() == sensor.bus
-                    && device.port_chain() == sensor.port_chain.as_slice()
-            })
-            .ok_or(UsbError::NotFound)?;
+        let info = Self::matching_device(sensor)?;
         let device = info.open().wait().map_err(map_error)?;
         Ok(Box::new(NusbDevice {
             device,
             interface: None,
         }))
+    }
+
+    fn open_command(&mut self, sensor: &FoundSensor) -> Result<Box<dyn UsbIo>, UsbError> {
+        let info = Self::matching_device(sensor)?;
+        let device = info.open().wait().map_err(map_error)?;
+        let interface = device.claim_interface(0).wait().map_err(map_error)?;
+        Ok(Box::new(NusbIo::new(interface)))
     }
 }
 
