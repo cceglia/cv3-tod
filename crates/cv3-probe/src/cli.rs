@@ -11,12 +11,14 @@
 use std::io::Write;
 
 use cv3_core::capture::{Capture, CaptureError, CapturedSample, SAMPLE_HASH_LEN};
+use cv3_core::enrol::{Enrol, EnrolError, EnrolledTemplate, MAX_ACCEPTED_SAMPLES, TemplateSource};
 use cv3_core::handshake::{Handshake, HandshakeError};
 use cv3_core::session::{
     CloseError, CloseSession, OpenError, OpenSession, Session, Teardown, TeardownError,
 };
 use cv3_core::transcript::{RecordingTransport, ReplayTransport, Transcript};
 use cv3_core::transport::{Transport, run as drive};
+use cv3_core::{Action, Operation};
 
 use crate::discovery::{CommandSession, ProbeError, UsbBackend, open_for_command, probe};
 use crate::random::{RandomError, RunSecrets, random_iv};
@@ -41,6 +43,7 @@ const USAGE: &str = "usage: cvctl devices
        cvctl open [--bad-sequence] [--record <file>]
        cvctl close [--record <file>]
        cvctl capture
+       cvctl enroll
        cvctl replay <file>";
 
 /// One parsed invocation.
@@ -58,6 +61,7 @@ enum Command<'a> {
         record: Option<&'a str>,
     },
     Capture,
+    Enroll,
     Replay {
         file: &'a str,
     },
@@ -97,6 +101,7 @@ fn parse(args: &[String]) -> Option<Command<'_>> {
             })
         }
         "capture" if rest.is_empty() => Some(Command::Capture),
+        "enroll" if rest.is_empty() => Some(Command::Enroll),
         "replay" => match rest {
             [file] => Some(Command::Replay { file }),
             _ => None,
@@ -155,6 +160,7 @@ pub fn run(
         }) => open(backend, shutdown, bad_sequence, record, out, err),
         Some(Command::Close { record }) => close(backend, shutdown, record, out, err),
         Some(Command::Capture) => capture(backend, shutdown, out, err),
+        Some(Command::Enroll) => enroll(backend, shutdown, out, err),
         Some(Command::Replay { file }) => replay(file, out, err),
         None => {
             let _ = writeln!(err, "{USAGE}");
@@ -544,6 +550,158 @@ fn capture(
     }
 }
 
+/// Where an enrolment run stopped.
+enum EnrolFailure {
+    Handshake(HandshakeError),
+    Open(OpenError),
+    Enrol(EnrolError),
+}
+
+/// The committed identifiers an enrolment run reports.
+struct EnrolReport {
+    template_id: [u8; SAMPLE_HASH_LEN],
+    source: TemplateSource,
+}
+
+/// Opens the secure session, runs a whole enrolment, prints progress as samples are accepted and
+/// tears the session down afterwards.
+///
+/// The operation is driven one event at a time rather than through [`drive`] so its
+/// [`Enrol::progress`] can be read between steps and printed. The core stays callback-free.
+/// A failed enrolment has already torn the session down; a successful one is torn down here,
+/// because the probe does not perform the binding confirmation.
+fn enrol_over(
+    transport: &mut dyn Transport,
+    secrets: RunSecrets,
+    open_iv: [u8; cv3_core::crypto::BLOCK_LEN],
+    base_iv: [u8; cv3_core::crypto::BLOCK_LEN],
+    progress_out: &mut dyn Write,
+) -> Result<(EnrolReport, Result<(), TeardownError>), EnrolFailure> {
+    let run = handshake_over(transport, secrets, true).map_err(EnrolFailure::Handshake)?;
+    let mut open = OpenSession::new(run.session, open_iv);
+    let session = drive(&mut open, transport).map_err(EnrolFailure::Open)?;
+
+    let mut enrol = Enrol::new(session, base_iv);
+    let mut action = enrol.start();
+    let mut shown_accepted = 0usize;
+    let mut shown_rejected = 0usize;
+    let outcome = loop {
+        match action {
+            Action::Send(frame) => action = enrol.step(transport.command(&frame)),
+            Action::WaitFinger => action = enrol.step(transport.wait_finger()),
+            Action::Finish(result) => break result,
+        }
+
+        let progress = enrol.progress();
+        while shown_accepted < progress.accepted_samples {
+            shown_accepted += 1;
+            let _ = writeln!(
+                progress_out,
+                "sample {shown_accepted} accepted ({shown_accepted}/{MAX_ACCEPTED_SAMPLES})"
+            );
+        }
+        while shown_rejected < progress.rejected_samples {
+            shown_rejected += 1;
+            let _ = writeln!(progress_out, "sample rejected; place the finger again");
+        }
+    };
+
+    match outcome {
+        Ok(EnrolledTemplate {
+            template_id,
+            source,
+            session,
+            ..
+        }) => {
+            let mut teardown = Teardown::new(session.handle);
+            drop(session);
+            let closed = drive(&mut teardown, transport);
+            Ok((
+                EnrolReport {
+                    template_id,
+                    source,
+                },
+                closed,
+            ))
+        }
+        Err(error) => Err(EnrolFailure::Enrol(error)),
+    }
+}
+
+/// Runs a whole enrolment and reports the committed template id, or a distinct failure.
+fn enroll(
+    backend: &mut dyn UsbBackend,
+    shutdown: &dyn Shutdown,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let open_iv = match random_iv() {
+        Ok(iv) => iv,
+        Err(error) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            return EXIT_OTHER;
+        }
+    };
+    let base_iv = match random_iv() {
+        Ok(iv) => iv,
+        Err(error) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            return EXIT_OTHER;
+        }
+    };
+    let mut channel = match open_for_command(backend, shutdown) {
+        Ok(channel) => channel,
+        Err(error) => {
+            report(&error, err);
+            return error.exit_code();
+        }
+    };
+    let secrets = match RunSecrets::generate() {
+        Ok(secrets) => secrets,
+        Err(error) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            return EXIT_OTHER;
+        }
+    };
+
+    let mut exchange = channel.exchange();
+    match enrol_over(&mut exchange, secrets, open_iv, base_iv, out) {
+        Ok((report, teardown)) => {
+            let _ = writeln!(
+                out,
+                "template id {} ({})",
+                hex(&report.template_id),
+                report.source
+            );
+            if let Err(error) = teardown {
+                let _ = writeln!(err, "cvctl: {error}");
+            }
+            EXIT_OK
+        }
+        Err(EnrolFailure::Handshake(error)) => {
+            let _ = writeln!(err, "cvctl: handshake failed: {error}");
+            EXIT_OTHER
+        }
+        Err(EnrolFailure::Open(error)) => {
+            let _ = writeln!(err, "cvctl: {error}");
+            if matches!(error, OpenError::WrongSequence) {
+                EXIT_SEQUENCE
+            } else {
+                EXIT_OTHER
+            }
+        }
+        Err(EnrolFailure::Enrol(error)) => {
+            let code = match &error {
+                EnrolError::Capture(CaptureError::FingerTimeout) => EXIT_FINGER_TIMEOUT,
+                EnrolError::Capture(CaptureError::AlreadyPending) => EXIT_CAPTURE_PENDING,
+                _ => EXIT_OTHER,
+            };
+            let _ = writeln!(err, "cvctl: enrolment failed: {error}");
+            code
+        }
+    }
+}
+
 /// What a replay run produced.
 enum ReplayOutcome {
     Random(RandomError),
@@ -708,7 +866,7 @@ mod tests {
     use crate::discovery::UsbError;
     use crate::layout::{EndpointDescriptor, TransferType};
     use crate::signals::SignalFlag;
-    use crate::testing::{FakeUsb, SAMPLE_HASH, TEST_HANDLE, sensor};
+    use crate::testing::{ENROLMENT_ID, FakeUsb, SAMPLE_HASH, TEST_HANDLE, sensor};
 
     fn run_with(args: &[&str], usb: &mut FakeUsb, shutdown: &dyn Shutdown) -> (u8, String, String) {
         let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
@@ -916,7 +1074,7 @@ mod tests {
         let mut usb = FakeUsb::with_sensor();
         let shutdown = SignalFlag::new();
 
-        let (code, out, err) = run_with(&["enrol"], &mut usb, &shutdown);
+        let (code, out, err) = run_with(&["inventory"], &mut usb, &shutdown);
 
         assert_eq!(code, 1);
         assert_eq!(out, "");
@@ -1496,6 +1654,182 @@ mod tests {
         assert_eq!(out, "");
         assert!(err.contains("0x0c"), "{err}");
         assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
+        assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some());
+    }
+
+    #[test]
+    fn enroll_prints_progress_and_the_committed_template_id() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.completion_after = Some(2);
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["enroll"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(err, "");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "sample 1 accepted (1/12)");
+        assert_eq!(lines[1], "sample 2 accepted (2/12)");
+        assert_eq!(
+            lines[2],
+            format!("template id {} (sensor enrolment id)", hex(&ENROLMENT_ID))
+        );
+        assert_eq!(lines.len(), 3, "one progress line per accepted sample");
+        assert_eq!(
+            sent_commands(&usb),
+            [
+                cmd::CHALLENGE,
+                cmd::CHALLENGE_RESPONSE,
+                cmd::OPEN_SESSION,
+                cmd::DISCARD_ENROLMENT,
+                cmd::START_ENROLMENT,
+                cmd::ARM_CAPTURE,
+                cmd::UPDATE_ENROLMENT,
+                cmd::ARM_CAPTURE,
+                cmd::UPDATE_ENROLMENT,
+                cmd::COMMIT_ENROLMENT,
+                cmd::CANCEL_CAPTURE,
+                cmd::CLOSE_SESSION,
+            ],
+            "the probe discards, starts, samples, commits, then tears the session down"
+        );
+
+        let discard = sent_command(&usb, cmd::DISCARD_ENROLMENT).expect("0x6d was sent");
+        assert_eq!(discard[10], attr::SESSION);
+        assert_eq!(discard[11], 0x02, "the discard is wrapped");
+        assert_eq!(le32(&discard, 16), TEST_HANDLE);
+
+        let start = sent_command(&usb, cmd::START_ENROLMENT).expect("0x8a was sent");
+        assert_eq!(start[10], 0x44);
+        assert_eq!(start[11], 0x00, "the start is plain");
+        assert_eq!(le32(&start, 16), 0);
+
+        let update = sent_command(&usb, cmd::UPDATE_ENROLMENT).expect("0x6c was sent");
+        assert_eq!(update[10], attr::SESSION);
+        assert_eq!(update[11], 0x02, "the update is wrapped");
+        assert_eq!(le32(&update, 40), 48, "the 48-byte TLV block");
+
+        let commit = sent_command(&usb, cmd::COMMIT_ENROLMENT).expect("0x6e was sent");
+        assert_eq!(commit[10], attr::SESSION);
+        assert_eq!(commit[11], 0x02, "the commit is wrapped");
+        assert_eq!(le32(&commit, 40), 64, "the 64-byte TLV block");
+    }
+
+    #[test]
+    fn enroll_prints_a_retry_line_when_a_sample_is_rejected() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.update_statuses = vec![0xa4];
+        usb.completion_after = Some(2);
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["enroll"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(err, "");
+        assert!(
+            out.contains("sample rejected; place the finger again"),
+            "the rejected sample is reported: {out}"
+        );
+        assert_eq!(
+            out.lines()
+                .filter(|line| line.starts_with("sample 1 accepted"))
+                .count(),
+            1,
+            "the rejected sample is not counted: {out}"
+        );
+        assert!(out.contains("sample 2 accepted (2/12)"), "{out}");
+        assert!(out.contains("sensor enrolment id"), "{out}");
+        assert_eq!(
+            sent_commands(&usb)
+                .iter()
+                .filter(|command| **command == cmd::ARM_CAPTURE)
+                .count(),
+            3,
+            "the rejected sample is requested again"
+        );
+        assert_eq!(
+            sent_commands(&usb)
+                .iter()
+                .filter(|command| **command == cmd::UPDATE_ENROLMENT)
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn enroll_without_completion_commits_at_twelve_and_labels_the_sample_hash() {
+        let mut usb = FakeUsb::with_sensor();
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["enroll"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(err, "");
+        assert_eq!(
+            out.lines()
+                .filter(|line| line.starts_with("sample ") && line.contains(" accepted "))
+                .count(),
+            12,
+            "one progress line per accepted sample: {out}"
+        );
+        assert!(out.contains("sample 12 accepted (12/12)"), "{out}");
+        assert_eq!(
+            out.lines().last(),
+            Some(format!("template id {} (last sample hash)", hex(&SAMPLE_HASH)).as_str()),
+            "{out}"
+        );
+        assert_eq!(
+            sent_commands(&usb)
+                .iter()
+                .filter(|command| **command == cmd::ARM_CAPTURE)
+                .count(),
+            12,
+            "twelve samples, no extra capture"
+        );
+    }
+
+    #[test]
+    fn a_failed_enrol_prints_the_pending_warning_and_exits_non_zero() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.finger_event = Some(Err(UsbError::Timeout));
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["enroll"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_FINGER_TIMEOUT);
+        assert_eq!(out, "", "no template id is printed");
+        assert!(err.contains("enrolment failed"), "{err}");
+        assert!(err.contains("pending enrolment may remain"), "{err}");
+        assert!(err.contains("next discard"), "{err}");
+        assert!(err.contains("no template was stored"), "{err}");
+        assert!(
+            sent_command(&usb, cmd::CANCEL_CAPTURE).is_some(),
+            "the failure tears down the session"
+        );
+        assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some());
+        assert!(
+            sent_command(&usb, cmd::COMMIT_ENROLMENT).is_none(),
+            "a failure before the commit stores nothing"
+        );
+    }
+
+    #[test]
+    fn a_rejected_commit_is_reported_and_says_a_template_may_exist() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.completion_after = Some(1);
+        usb.commit_status = 0x0c;
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["enroll"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OTHER);
+        assert_eq!(out, "sample 1 accepted (1/12)\n");
+        assert!(err.contains("0x0c"), "{err}");
+        assert!(err.contains("may exist"), "{err}");
+        assert!(
+            sent_command(&usb, cmd::CANCEL_CAPTURE).is_some(),
+            "the failed commit still tears the session down"
+        );
         assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some());
     }
 

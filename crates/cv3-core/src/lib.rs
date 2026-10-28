@@ -19,6 +19,7 @@
 
 pub mod capture;
 pub mod crypto;
+pub mod enrol;
 pub mod event;
 pub mod frame;
 pub mod handshake;
@@ -31,6 +32,12 @@ pub mod transport;
 pub use capture::{
     CAPTURE_PLAINTEXT_LEN, CAPTURE_TLV_LEN, Capture, CaptureError, CapturedSample, SAMPLE_HASH_LEN,
     capture_tlv, find_tlv_value,
+};
+pub use enrol::{
+    COMMIT_PLAINTEXT_LEN, COMMIT_TLV_LEN, DISCARD_PLAINTEXT_LEN, DISCARD_TLV_LEN, Enrol,
+    EnrolError, EnrolProgress, EnrolStage, EnrolledTemplate, MAX_ACCEPTED_SAMPLES,
+    MAX_CAPTURE_ATTEMPTS, START_TLV_LEN, TEMPLATE_ID_LEN, TemplateSource, UPDATE_PLAINTEXT_LEN,
+    UPDATE_TLV_LEN, commit_tlv, discard_tlv, enrol_iv, start_tlv, update_tlv,
 };
 pub use event::{Action, Event, TransportError};
 pub use handshake::{Handshake, HandshakeError};

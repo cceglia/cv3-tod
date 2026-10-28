@@ -182,7 +182,8 @@ pub struct Capture {
 }
 
 impl Capture {
-    /// Builds a capture for a live session. The probe supplies the IV from the operating system.
+    /// Builds a capture for a live session. The caller supplies a fresh IV (the probe draws it
+    /// from the operating system, while enrolment derives one per frame from its base IV).
     pub fn new(session: Session, iv: [u8; crypto::BLOCK_LEN]) -> Self {
         Self {
             handle: session.handle,

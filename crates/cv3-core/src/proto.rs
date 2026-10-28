@@ -44,6 +44,9 @@ pub mod attr {
     pub const CANCEL_SESSION: u8 = 0x40;
     /// Cancel with no session handle in the header.
     pub const CANCEL_SESSIONLESS: u8 = 0x44;
+    /// Start an enrolment: the same attribute byte as the sessionless cancel, but the command is
+    /// `0x8A` and it carries a zero parameter block, not a handle.
+    pub const ENROLMENT_START: u8 = 0x44;
     pub const CLOSE_SESSION: u8 = 0x40;
     pub const INVENTORY: u8 = 0x42;
 }

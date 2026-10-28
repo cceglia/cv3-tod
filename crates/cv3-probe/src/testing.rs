@@ -75,6 +75,26 @@ pub struct FakeUsb {
     pub arm_command_error: Option<UsbError>,
     /// If set, the scripted sensor fails the sessionless `0x68` command in the transport.
     pub cancel_command_error: Option<UsbError>,
+    /// Status the scripted sensor answers the wrapped `0x6d` discard with.
+    pub discard_status: u32,
+    /// If set, the scripted sensor fails the `0x6d` discard in the transport.
+    pub discard_command_error: Option<UsbError>,
+    /// Status the scripted sensor answers the plain `0x8a` start with.
+    pub start_status: u32,
+    /// Status the scripted sensor answers a `0x6c` update with when `update_statuses` is empty.
+    pub update_status: u32,
+    /// Per-update statuses consumed in order before falling back to `update_status`.
+    pub update_statuses: Vec<u32>,
+    /// If set, the scripted sensor fails the `0x6c` update in the transport.
+    pub update_command_error: Option<UsbError>,
+    /// After this many accepted updates, the `0x6c` reply carries `enrolment_id`.
+    pub completion_after: Option<usize>,
+    /// The 20-byte enrolment id the scripted completion carries.
+    pub enrolment_id: [u8; 20],
+    /// Status the scripted sensor answers the wrapped `0x6e` commit with.
+    pub commit_status: u32,
+    /// If set, the scripted sensor fails the `0x6e` commit in the transport.
+    pub commit_command_error: Option<UsbError>,
     /// What the finger wait delivers. `None` is a genuine `0x03` finger event.
     pub finger_event: Option<Result<Vec<u8>, UsbError>>,
     pub sent: Rc<RefCell<Vec<Vec<u8>>>>,
@@ -104,6 +124,16 @@ impl Default for FakeUsb {
             arm_plaintext: None,
             arm_command_error: None,
             cancel_command_error: None,
+            discard_status: 0,
+            discard_command_error: None,
+            start_status: 0,
+            update_status: 0x8f,
+            update_statuses: Vec::new(),
+            update_command_error: None,
+            completion_after: None,
+            enrolment_id: ENROLMENT_ID,
+            commit_status: 0,
+            commit_command_error: None,
             finger_event: None,
             sent: Rc::new(RefCell::new(Vec::new())),
             log: Rc::new(RefCell::new(Vec::new())),
@@ -173,6 +203,17 @@ impl UsbBackend for FakeUsb {
             arm_plaintext: self.arm_plaintext.clone(),
             arm_command_error: self.arm_command_error.clone(),
             cancel_command_error: self.cancel_command_error.clone(),
+            discard_status: self.discard_status,
+            discard_command_error: self.discard_command_error.clone(),
+            start_status: self.start_status,
+            update_status: self.update_status,
+            update_statuses: self.update_statuses.clone(),
+            update_command_error: self.update_command_error.clone(),
+            completion_after: self.completion_after,
+            enrolment_id: self.enrolment_id,
+            commit_status: self.commit_status,
+            commit_command_error: self.commit_command_error.clone(),
+            accepted_updates: 0,
             finger_event: self.finger_event.clone(),
             session_key: None,
             pending: None,
@@ -252,6 +293,12 @@ pub const SAMPLE_HASH: [u8; 20] = [
     0x20, 0x21, 0x22, 0x23,
 ];
 
+/// The 20-byte id the scripted `0x6c` reply carries when it completes the enrolment.
+pub const ENROLMENT_ID: [u8; 20] = [
+    0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
+    0xb0, 0xb1, 0xb2, 0xb3,
+];
+
 /// A scripted sensor that answers the `0x23` / `0x24` / `0x02` / `0x66` / `0x68` / `0x04` frames,
 /// so the probe's whole handshake, secure-session and capture lifecycle run offline. It records
 /// every frame it was sent.
@@ -272,6 +319,17 @@ pub struct HandshakeSensor {
     pub arm_plaintext: Option<Vec<u8>>,
     pub arm_command_error: Option<UsbError>,
     pub cancel_command_error: Option<UsbError>,
+    pub discard_status: u32,
+    pub discard_command_error: Option<UsbError>,
+    pub start_status: u32,
+    pub update_status: u32,
+    pub update_statuses: Vec<u32>,
+    pub update_command_error: Option<UsbError>,
+    pub completion_after: Option<usize>,
+    pub enrolment_id: [u8; 20],
+    pub commit_status: u32,
+    pub commit_command_error: Option<UsbError>,
+    pub accepted_updates: usize,
     pub finger_event: Option<Result<Vec<u8>, UsbError>>,
     pub session_key: Option<[u8; 16]>,
     pending: Option<Reply>,
@@ -297,31 +355,73 @@ impl HandshakeSensor {
         self.session_key = Some(key);
     }
 
-    fn arm_reply(&self) -> Reply {
+    fn wrapped_body(
+        &self,
+        command: u16,
+        attribute: u8,
+        command_status: u32,
+        plaintext: &[u8],
+    ) -> Vec<u8> {
         let key = self
             .session_key
             .expect("the handshake derived a session key");
+        let iv = [0x5au8; 16];
+        let ciphertext = crypto::encrypt_cbc(&key, &iv, plaintext);
+        let mut body = frame::build_wrapped(
+            command,
+            attribute,
+            TEST_HANDLE,
+            &iv,
+            plaintext.len() as u32,
+            &ciphertext,
+        );
+        body[20..24].copy_from_slice(&command_status.to_le_bytes());
+        body
+    }
+
+    fn arm_reply(&self) -> Reply {
         let plaintext = self.arm_plaintext.clone().unwrap_or_else(|| {
             let mut plaintext = vec![0u8; 28];
             plaintext[4..8].copy_from_slice(&20u32.to_le_bytes());
             plaintext[8..].copy_from_slice(&SAMPLE_HASH);
             plaintext
         });
-        let iv = [0x5au8; 16];
-        let ciphertext = crypto::encrypt_cbc(&key, &iv, &plaintext);
-        let mut body = frame::build_wrapped(
-            cmd::ARM_CAPTURE,
-            attr::CAPTURE,
-            TEST_HANDLE,
-            &iv,
-            plaintext.len() as u32,
-            &ciphertext,
-        );
-        body[20..24].copy_from_slice(&self.arm_status.to_le_bytes());
-        Reply { status: 0, body }
+        Reply {
+            status: 0,
+            body: self.wrapped_body(cmd::ARM_CAPTURE, attr::CAPTURE, self.arm_status, &plaintext),
+        }
     }
 
-    fn reply_to(&self, frame: &[u8]) -> Reply {
+    fn update_reply(&mut self) -> Reply {
+        let command_status = if self.update_statuses.is_empty() {
+            self.update_status
+        } else {
+            self.update_statuses.remove(0)
+        };
+        if command_status == 0 || command_status == 0x8f {
+            self.accepted_updates += 1;
+        }
+        let id = match self.completion_after {
+            Some(after) if self.accepted_updates >= after && command_status != 0x8c => {
+                self.enrolment_id
+            }
+            _ => SAMPLE_HASH,
+        };
+        let mut plaintext = vec![0u8; 8 + id.len()];
+        plaintext[4..8].copy_from_slice(&(id.len() as u32).to_le_bytes());
+        plaintext[8..].copy_from_slice(&id);
+        Reply {
+            status: 0,
+            body: self.wrapped_body(
+                cmd::UPDATE_ENROLMENT,
+                attr::SESSION,
+                command_status,
+                &plaintext,
+            ),
+        }
+    }
+
+    fn reply_to(&mut self, frame: &[u8]) -> Reply {
         let command = u16::from_le_bytes([
             frame.get(8).copied().unwrap_or(0),
             frame.get(9).copied().unwrap_or(0),
@@ -363,6 +463,29 @@ impl HandshakeSensor {
                     &[],
                 ),
             },
+            cmd::DISCARD_ENROLMENT => Reply {
+                status: 0,
+                body: self.wrapped_body(
+                    cmd::DISCARD_ENROLMENT,
+                    attr::SESSION,
+                    self.discard_status,
+                    &[],
+                ),
+            },
+            cmd::START_ENROLMENT => Reply {
+                status: self.start_status,
+                body: Vec::new(),
+            },
+            cmd::UPDATE_ENROLMENT => self.update_reply(),
+            cmd::COMMIT_ENROLMENT => Reply {
+                status: 0,
+                body: self.wrapped_body(
+                    cmd::COMMIT_ENROLMENT,
+                    attr::SESSION,
+                    self.commit_status,
+                    &[],
+                ),
+            },
             cmd::ARM_CAPTURE => self.arm_reply(),
             cmd::CANCEL_CAPTURE => Reply {
                 status: 0,
@@ -391,6 +514,21 @@ impl UsbIo for HandshakeSensor {
             cmd::CHALLENGE_RESPONSE => self.derive_session_key(frame),
             cmd::OPEN_SESSION => {
                 if let Some(error) = &self.open_command_error {
+                    return Err(error.clone());
+                }
+            }
+            cmd::DISCARD_ENROLMENT => {
+                if let Some(error) = &self.discard_command_error {
+                    return Err(error.clone());
+                }
+            }
+            cmd::UPDATE_ENROLMENT => {
+                if let Some(error) = &self.update_command_error {
+                    return Err(error.clone());
+                }
+            }
+            cmd::COMMIT_ENROLMENT => {
+                if let Some(error) = &self.commit_command_error {
                     return Err(error.clone());
                 }
             }
