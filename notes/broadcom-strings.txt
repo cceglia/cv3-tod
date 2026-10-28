@@ -1,0 +1,1857 @@
+i5mtQL
+nuC7o:
+ql<VWJ
+PI"Wb 
+2eV62.
+__gmon_start__
+_ITM_deregisterTMCloneTable
+_ITM_registerTMCloneTable
+__cxa_finalize
+g_intern_static_string
+fp_device_get_type
+g_type_register_static_simple
+g_variant_check_format_string
+g_variant_unref
+g_variant_get
+g_variant_get_fixed_array
+g_return_if_fail_warning
+__stack_chk_fail
+cvif_fingerprint_start_enrollment
+cvif_fingerprint_commit_enrollment
+cvif_fingerprint_capture_start
+g_cancellable_is_cancelled
+cvif_process_interrupt
+cvif_fingerprint_update_enrollment
+cv_fingerprint_capture_cancel
+cv_fingerprint_discard_enrollment
+fpi_device_get_identify_data
+strtol
+g_object_get
+fp_print_get_finger
+g_get_monotonic_time
+g_log_structured
+fpi_device_identify_complete
+cvif_fingerprint_identify
+fpi_device_get_verify_data
+fpi_device_retry_new
+fpi_device_verify_complete
+fopen64
+fpi_device_probe_complete
+cvmain
+fpi_device_error_new
+cnslInfo
+g_type_class_peek_parent
+g_type_check_class_cast
+g_type_class_adjust_private_offset
+g_task_get_type
+g_type_check_instance_cast
+g_task_get_task_data
+fpi_device_identify_report
+cvhandle
+cv_close_partial
+fpi_device_verify_report
+fpi_device_report_finger_status_changes
+fpi_device_get_delete_data
+cvif_fingerprint_delete
+fpi_device_delete_complete
+g_free
+cvif_open
+fpi_device_broadcom_get_type
+g_once_init_enter
+g_once_init_leave
+fpi_device_list_complete
+fpi_device_close_complete
+g_cancellable_cancel
+g_object_unref
+g_cancellable_new
+fpi_device_open_complete
+g_task_new
+g_malloc0
+g_task_set_task_data
+g_task_run_in_thread
+fpi_device_get_enroll_data
+fp_print_get_enroll_date
+g_date_valid
+fp_print_get_username
+g_strdup_printf
+strlen
+g_variant_new_fixed_array
+g_variant_new
+fpi_print_set_type
+fpi_print_set_device_stored
+g_object_set
+g_object_ref
+fpi_device_enroll_complete
+fpi_device_enroll_progress
+fpi_device_error_new_msg
+g_date_get_year
+g_date_get_month
+g_date_get_day
+fpi_tod_shared_driver_get_type
+InitParam_List
+calloc
+memcpy
+logErrorMessage
+InitLibrary
+CloseLibrary
+ProcessTransmitCmd
+hUserIfc
+cvhTransmit
+is_valid_command_id
+is_valid_obj_type
+is_valid_persistence
+is_valid_blob_type
+is_valid_enc_op
+is_valid_dec_op
+is_valid_hmac_op
+is_valid_hash_op
+is_valid_sign_op
+is_valid_verify_op
+is_valid_bulk_mode
+is_valid_auth_algorithm
+is_valid_hash_type
+is_valid_key_type
+is_valid_status_type
+is_valid_param_type
+GetValidStatusLen
+is_valid_config_type
+is_valid_protected_config_type
+is_valid_protected_config_mgmt_type
+GetValidConfigLen
+GetValidProtectedConfigLen
+is_valid_otp_mac_type
+is_valid_fingerprint_type
+is_valid_contactless_type
+is_valid_obj_attribute_type
+is_valid_object_auth_flags
+is_valid_handle
+GetSessionOfTheHandle
+GetCVInternalHandle
+cvhGetUniqueHandleNo
+get_SystemOS_ProcessorArchitecture
+GetCVPublicKeyCmd
+malloc
+GetHostEncryptNonceCmd
+GetObjectLenAndData
+ConstructBlob
+memset
+GetCVSecureSessioncmd
+cvhSetUpSecureSession
+GetPromptUserPinCmd
+fncvhUserPromptBIP
+realloc
+GetCommandIndex
+setAntiHammerProtectionDelay
+getAntiHammeringProtectionDelay
+ChangeEndianess
+cvhFindFPAuth
+captureIDLocal
+cvhDoAsyncFPCapture
+cv_fingerprint_capture_start
+usleep
+cv_fingerprint_capture_wait
+capCompletionStatusLegacy
+cvhDoAsyncFPCaptureRaw
+cvhUpdateCaptureIDInAuthList
+is5880
+cvGetDeltaTime
+AddNewSession
+bIsSessionHeadNode
+pSessionTailNode
+pSessionHeadNode
+DeleteSessionHandle
+DeleteAllButSessionHandle
+GetSessionOfTheCVInternalHandle
+IsSessionListEmpty
+cv_open
+cvhManageCVAPICall
+cvhSaveReturnValues
+cv_close
+cv_init
+cv_open_remote
+cv_get_status
+cv_get_feature_status
+cv_set_config
+cv_authenticate_set_features
+cv_get_session_count
+cv_get_ush_ver
+cv_diag_grp_test
+cv_diag_ind_test
+cv_diag_set_rfid_params
+cv_rfid_man_test
+cv_load_rfid_cfg
+fclose
+strchr
+__isoc99_sscanf
+strstr
+cv_sizeof_rfid_config
+cv_set_rfid_params
+cv_rfid_configuration
+cv_diag_get_antenna_status
+cv_diag_hdotp_get_status
+cv_diag_hdotp_set_status
+cv_diag_hdotp_peek
+cv_diag_hdotp_poke
+cv_diag_hdotp_get_skip_list
+cv_diag_hdotp_set_skip_list
+cv_diag_hdotp_get_cv_counter
+cv_diag_hdotp_get_ah_credit_level
+cv_diag_hdotp_get_elapsed_time
+cv_diag_hdotp_get_skip_mono_cntr
+cv_diag_hdotp_get_spec_skip_cntr
+cv_diag_hdotp_set_skip_cntr
+cv_diag_get_rfid_status
+cv_flash_update
+__memcpy_chk
+cv_reboot_to_sbi
+cv_reboot_to_ush
+cv_erase_flash_chip
+cv_firmware_upgrade_tx
+cv_firmware_upgrade
+cv_load_sbi
+cv_access_PBA_code_flash
+cv_pba_access
+cv_pba_update
+memcmp
+cv_diag_get_hid_cnsl
+cv_detect_fp
+cv_ush_console_start
+cv_ush_console_stop
+cv_ush_get_console
+cv_ush_console_put_char
+cv_ush_console_menu
+cv_set_smartcard_present
+cv_send_blockdata
+cv_receive_blockdata
+cv_power_management
+cv_power_management_start
+cv_generic_io_cmd
+cv_get_machine_id
+cv_test_tpm
+cv_enable_function
+cv_upgrade_objects
+cv_register_super
+cv_challenge_super
+cv_response_super
+cv_get_random
+cv_encrypt
+cv_decrypt
+cv_hmac
+cv_hash
+cv_hash_object
+cv_genkey
+cv_sign
+cv_verify
+cv_hotp_unblock
+cv_otp_get_value
+cv_otp_get_mac
+cv_create_object
+cv_delete_object
+cv_set_object
+cv_get_object
+cv_enumerate_objects
+cv_enumerate_objects_direct
+cv_duplicate_object
+cv_import_object
+cv_export_object
+cv_change_auth_object
+cv_manage_config_object
+cv_authorize_session_object
+cv_deauthorize_session_object
+cvhCvHandleRequired
+cvhEncryptCmd
+cvhEncapsulateCmd
+cvhManageCallback
+cvhDecryptCmd
+cvhDecapsulateCmd
+hRemoteBinding
+fncvhUserPrompt
+bKDICertiVerificationDone
+getDateTime
+localtime
+asctime
+strcpy
+_logMessage
+szCVUsrLibLogFileName
+__sprintf_chk
+__printf_chk
+logException
+logError
+getLogDataPath
+LogDataToFile
+enableLogging
+cv_bind
+cv_bind_challenge
+cv_read_contactless_card_id
+cv_enable_radio
+cv_enable_smartcard
+cv_enable_fingerprint
+cv_enable_and_lock_radio
+cv_enable_wbdi
+cv_set_radio_present
+cv_set_cv_only_radio_mode
+cv_set_cv_only_radio_mode_volatile
+cv_identify_user
+is_host_control_running
+cv_fingerprint_enroll
+cv_fingerprint_enroll_dup_check
+cv_do_fingerprint_verify
+cv_fingerprint_verify
+cv_fingerprint_verify_w_hash
+cv_fingerprint_capture
+isCaptureInProgress
+cv_do_fingerprint_identify
+cv_fingerprint_identify
+cv_fingerprint_identify_w_hash
+cv_fingerprint_configure
+cv_fingerprint_test
+cv_fingerprint_test_out
+cv_fingerprint_calibrate
+cv_fingerprint_register_event
+captureIDRestart
+cancelInProgress
+cvFPRestartPending
+cv_fingerprint_capture_get_result
+cv_fingerprint_create_feature_set
+cv_fingerprint_commit_feature_set
+cv_fingerprint_update_enrollment
+cv_fingerprint_commit_enrollment
+cvhDoAsyncFPEnroll
+cv_fingerprint_create_template
+cv_fingerprint_reset
+cv_upgrade_sensor_firmware
+cv_check_sensor_firmware_upgradable
+cv_set_nfc_power_to_max
+cv_generate_ECDSA_key
+cv_cmd_biometric_unit_created
+cv_cmd_enrollment_started
+cv_get_sbl_pid
+cancelAvailable
+internalCancelRequest
+captureCompletionStatus5880
+requestCaptureCancel
+captureIDLocal5880
+fpPersistenceStart
+isTemplateValid
+isFeatureSetValid
+isImageValid
+cvFpPersistence
+is5880Device
+hasDeviceType
+capCompletionStatus
+captureThreadID
+dataInitialized
+isResubmitted
+createSemaphore
+getCommandIndex
+SetCmdState
+appendCommandIndex
+callbackInfo
+saveCallbackInfo
+processCommand
+resultHandlerProc
+releaseSemaphore
+retrieveCommandIndex
+GetCmdState
+DeleteCmdState
+initializeData
+__errno_location
+createThread
+uPrvPromptCode
+bUserCanceledThePrompt
+cvhPromptUserPIN
+__isoc99_scanf
+pPinValue
+promptInfo
+userPromptStatus
+uPreviousPromptCode
+uCommandIndex
+libusb_get_device_descriptor
+libusb_get_config_descriptor
+libusb_free_config_descriptor
+printBuffer
+logBuffer
+__strcat_chk
+sem_open
+cvintfasyncFPCaptureRequest
+isCallbackPresent
+isPINRequired
+interrupt_read
+processInterrupt
+libusb_init
+libusb_set_debug
+libusb_get_device_list
+libusb_open_device_with_vid_pid
+libusb_free_device_list
+libusb_kernel_driver_active
+libusb_claim_interface
+libusb_interrupt_transfer
+libusb_release_interface
+libusb_close
+libusb_exit
+libusb_detach_kernel_driver
+libusb_bulk_transfer
+appendCallback
+cv_callback_status
+cv_abort
+sem_post
+sem_wait
+closeSemaphore
+sem_close
+pthread_create
+semKey
+hSemaphore
+uPreviousCount
+g_pCVCmdState_Head
+bIsCVCmdStateHeadNode
+g_pCVCmdState_Tail
+DeleteAllCmdState
+GetCmdNode
+Statelistobj_init
+Statelistobj_fini
+cvif_display_status_str
+__strcpy_chk
+gCvRetStatus
+cvif_close
+cvif_get_status
+cvif_load_sbi
+BIP_SetVersion
+cvif_get_version
+cvif_load_flash
+cvOpenFile
+cvif_diag_grp_test
+cvif_diag_ind_test
+cvif_fp_test
+cvif_fp_calibrate
+cvif_antenna_check
+cvif_reboot_to_sbi
+cvif_reboot_ush
+cvif_diag_hdotp_get_status
+cvif_diag_hdotp_set_status
+cvif_rfid_man_test
+cvif_get_chip_type
+ushVerBuf
+cvif_IsUshThere
+cvif_CheckAndSaveCVState
+cvif_WasCVInSBLMode
+cvif_WasCVInErrorState
+cvif_IsUshThere_TryAFewTimes
+cnslSleepMS
+cvif_WasCVWorkingInSBIOrAAI
+cvif_UshBootWait
+difftime
+cvif_dev_enable
+cvif_dev_disable
+cvif_IsBcmThere
+cvif_firmware_upgrade
+cvif_AntihammeringOk
+cvif_SecurityCheckBeforeFlashing
+cvif_GetCurrentUshVersion
+gChipIs5882
+cvif_GetCurrentUshSbiVersion
+cvif_GetProposedUshVersion
+cvif_GetProposedUshSbiVersion
+cvif_GetLastError
+gInitBuffer
+clrObjFlags
+cnslGetCnslLevel
+cnsl_info_level
+cnslSetCnslLevel
+cnslCnslLevel
+cnslCloseLogfile
+cnslGetCh
+cnslPrintf
+stdout
+__vfprintf_chk
+fflush
+fillOneScreen
+outputcnt
+cnslDelChar
+cnslDelLine
+cnslPause
+cnslGetStr
+lastCmdIdx
+gInputSrc
+prevCmds
+strcmp
+firstCmdIdx
+cnslFlush
+cnslFillOneScreenOn
+cnslFillOneScreenOff
+date_time_stamp
+strftime
+logStr
+__vsnprintf_chk
+__fprintf_chk
+cnslMemDisplay32
+cnslMemDisplay8
+cnslOpenLogfile
+gCmdLine
+cnslToLower
+__ctype_tolower_loc
+nanosleep
+cnslSleepWTick
+logfilename
+pInputSrcFn
+isTheCurrentVersionUpToDate
+strncmp
+isTheCurrentSBIVersionUpToDate
+cvRetSbiFileName
+sbiFileNames
+cvRetBcmFileName
+bcmFileNames
+cvCalculateChipTypeAfterSBILoadBasedONCIDToUseAndPID
+szFWFolderPath
+cvFilesPresent
+clearScdFileName
+cvLoadSbi
+cvFWUpgradeMain
+bootstrap
+pChipTypeStr
+cidNumbers
+sem_unlink
+remove
+MakeSureThatSensorFirmwareIsUpToDate
+strcasecmp
+broadcomStr
+pbaApp2Fn
+pbaAppFn
+tmpBPAfilename
+unknownStr
+indTestTypeStr
+grpTestTypeStr
+DEFAULT_CID
+GetCIDFromVersionBuffer
+DetermineSensorTypeFromVersionBuffer
+GetSensorFirmwareVersionFromVersionBuffer
+GetInfoFromGetUSHVersion
+IsSensorFWUpgradeCompleted
+ReadContentsOfFirmwareFile
+MAGIC_VALUE
+firmwareFileData
+dumpHex
+VerifyMagicValueAndSignatureOfFirmwareFile
+RSA_new
+PEM_read_RSA_PUBKEY
+SHA256
+RSA_verify
+ERR_get_error
+RSA_free
+ERR_error_string
+QueryIsSensorFwUpgradable
+sensorFirmwareUpgradable
+GetVersionAndImageDataForSensor
+SendSensorFirmwareToCVInChunks
+libfprint-2-tod.so.1
+libcrypto.so.3
+libc.so.6
+OPENSSL_3.0.0
+LIBFPRINT_TOD_1.0.0
+GLIBC_2.4
+GLIBC_2.7
+GLIBC_2.14
+GLIBC_2.34
+GLIBC_2.3
+GLIBC_2.2.5
+GLIBC_2.3.4
+AVAUATUSH
+[]A\A]A^
+t4[]A\
+C4[]A\
+C4[]A\
+AVAUATUSH
+[]A\A]A^A_
+D$HdH+
+ ]A\A]
+D$(dH+
+AWAVAUATI
+[]A\A]A^A_
+]A\A]A^
+[]A\A]
+[]A\A]
+[]A\A]A^A_
+AWAVAUI
+([]A\A]A^A_
+[]A\A]
+[]A\A]A^A_
+D$XdH+
+AWAVAUATUH
+[]A\A]A^A_
+[]A\A]A^A_
+[]A\A]A^A_
+H9+t;H
+AUATUSH
+[]A\A]
+[]A\A]
+AVAUATI
+T$HdH+
+X[]A\A]A^A_
+AWAVAUATU
+[]A\A]A^A_
+[]A\A]A^A_
+T$XdH+
+h[]A\A]A^A_
+D$HdH+
+[]A\A]A^A_
+D$HdH+
+[]A\A]A^A_
+D$hdH+
+[]A\A]A^A_
+D$hdH+
+[]A\A]A^A_
+[]A\A]
+[]A\A]
+[]A\A]
+[]A\A]
+AWAVAUA
+D$(dH+
+[]A\A]A^A_
+D$HdH+
+[]A\A]A^A_
+D$HdH+
+[]A\A]A^A_
+[]A\A]A^A_
+D$HdH+
+[]A\A]A^A_
+AVAUATI
+T$(dH+
+8[]A\A]A^A_
+T$HdH+
+[]A\A]A^A_
+[]A\A]A^A_
+D$8dH+
+[]A\A]A^A_
+D$8dH+
+[]A\A]A^A_
+D$(dH+
+[]A\A]A^A_
+D$HdH+
+[]A\A]A^A_
+D$8dH+
+[]A\A]A^
+D$HdH+
+[]A\A]A^A_
+D$8dH+
+[]A\A]A^A_
+D$8dH+
+[]A\A]A^A_
+D$8dH+
+[]A\A]A^A_
+D$8dH+
+[]A\A]A^A_
+D$8dH+
+[]A\A]A^A_
+D$HdH+
+[]A\A]A^A_
+D$HdH+
+[]A\A]A^A_
+D$8dH+
+[]A\A]A^A_
+AWAVAUATUSH
+T$(dH+
+8[]A\A]A^A_
+[]A\A]
+AWAVAUATUSH
+[]A\A]A^A_
+[]A\A]A^A_
+[]A\A]A^A_
+[]A\A]A^A_
+[]A\A]A^A_
+T$hdH+
+x[]A\A]A^A_
+D$(dH+
+[]A\A]A^A_
+AUATUH
+[]A\A]A^A_
+AVAUATL
+T$HdH+
+[]A\A]A^A_
+[]A\A]
+[]A\A]
+[]A\A]
+T$(dH+
+[]A\A]A^A_
+[]A\A]A^
+[]A\A]A^
+D$(dH+
+[]A\A]A^A_
+D$(dH+
+]A\A]A^A_
+T$xdH+
+[]A\A]A^A_
+[]A\A]A^
+[]A\A]A^
+D$HdH+
+[]A\A]A^A_
+D$8dH+
+[]A\A]A^A_
+D$8dH+
+[]A\A]A^A_
+]A\A]A^
+D$8dH+
+[]A\A]A^A_
+D$8j^L
+T$hdH+
+x[]A\A]A^A_
+D$8dH+
+[]A\A]A^A_
+D$(dH+
+[]A\A]A^A_
+AUATUH
+D$hdH+
+[]A\A]A^A_
+AVAUATI
+[]A\A]A^A_
+AVAUATI
+[]A\A]A^A_
+T$xdH+
+[]A\A]A^A_
+D$HdH+
+[]A\A]A^
+D$HdH+
+AVAUATM
+[]A\A]A^A_
+AVAUATI
+[]A\A]A^A_
+AVAUATI
+[]A\A]A^A_
+T$HdH+
+X[]A\A]A^A_
+[]A\A]A^A_
+AVAUATI
+T$xdH+
+[]A\A]A^A_
+T$XdH+
+[]A\A]A^A_
+AVAUATL
+D$XdH+
+[]A\A]A^A_
+D$HdH+
+[]A\A]A^A_
+T$xdH+
+[]A\A]A^A_
+T$hdH+
+x[]A\A]A^A_
+T$XdH+
+[]A\A]A^A_
+D$8dH+
+[]A\A]A^
+[]A\A]A^
+T$8dH+
+H[]A\A]A^A_
+AWAVAUATI
+T$hdH+
+x[]A\A]A^A_
+H30H3H
+AWAVAUATUSH
+[]A\A]A^A_
+AVAUATUSH
+[]A\A]A^A_
+AVAUATU
+[]A\A]A^
+D$HdH+
+[]A\A]
+D$8dH+
+[]A\A]A^A_
+D$HdH+
+[]A\A]A^A_
+D$HjBA
+[]A\A]A^A_
+D$(dH+
+[]A\A]A^A_
+D$(dH+
+[]A\A]A^A_
+D$(dH+
+[]A\A]A^A_
+D$(dH+
+[]A\A]A^A_
+D$(dH+
+[]A\A]A^A_
+D$(dH+
+[]A\A]A^A_
+D$(dH+
+[]A\A]A^A_
+D$(dH+
+[]A\A]A^A_
+[]A\A]A^A_
+[]A\A]A^A_
+D$Hj A
+[]A\A]A^A_
+D$XjpA
+[]A\A]A^A_
+AVAUATU
+[]A\A]A^A_
+AUATUS
+[]A\A]A^A_
+D$Hj0A
+[]A\A]A^A_
+T$HdH+
+X[]A\A]A^A_
+[]A\A]A^A_
+[]A\A]A^
+AUATUH
+T$XdH+
+h[]A\A]A^A_
+[]A\A]A^A_
+D$xdH+
+[]A\A]A^A_
+D$8dH+
+[]A\A]A^
+D$hdH+
+[]A\A]A^A_
+[]A\A]A^A_
+]A\A]A^
+[]A\A]A^A_
+AUATUSH
+T$xdH+
+[]A\A]A^A_
+[]A\A]A^A_
+]A\A]A^
+D$(dH+
+[]A\A]A^A_
+[]A\A]A^A_
+]A\A]A^
+]A\A]A^
+]A\A]A^
+]A\A]A^
+]A\A]A^
+D$8dH+
+D$8dH+
+uf[]A\
+T$HdH+
+T$8dH+
+H[]A\A]
+[]A\A]A^A_
+[]A\A]A^A_
+AVAUATUSH
+[]A\A]A^A_
+AWAVAUATUSH
+D$XdH+
+[]A\A]A^A_
+AWAVAUATUSH
+HcD$,I;E
+D$hdH+
+[]A\A]A^A_
+HcT$,L
+D$HdH+
+]A\A]A^
+]A\A]A^
+]A\A]A^
+AUATUH
+AUATUSH
+[]A\A]
+[]A\A]
+[]A\A]
+[]A\A]
+[]A\A]
+[]A\A]A^
+AWAVAUATUSH
+[]A\A]A^A_
+AUATUSH
+([]A\A]
+AUATUSH
+T$XdH+
+h[]A\A]
+AVAUATUH
+[]A\A]A^A_
+D$(dH+
+[]A\A]
+D$(dH+
+AUATUH
+[]A\A]
+AWAVAUATUSH
+<Htg<P
+[]A\A]A^A_
+[]A\A]A^A_
+[]A\A]A^A_
+[]A\A]A^A_
+[]A\A]A^A_
+[]A\A]
+]A\A]A^
+]A\A]A^
+[]A\A]A^A_
+AWAVAUATUSH
+D$@???
+D$`???
+[]A\A]A^A_
+D$8dH+
+[]A\A]
+]A\A]A^
+]A\A]A^
+]A\A]A^
+AVAUATUSH
+[]A\A]A^
+AUATUSH
+[]A\A]A^A_
+T$8dH+
+AVAUATUSH
+[]A\A]A^
+AWAVAUATUSH
+[]A\A]A^A_
+[]A\A]A^A_
+[]A\A]A^A_
+]A\A]A^
+]A\A]A^
+]A\A]A^
+FpiDeviceBroadcom
+(y@ay)
+data != NULL
+Start the enrollment
+Update the enrollment
+Commit the enrollment
+fpi-data
+data is %p
+CODE_LINE
+../broadcom.c
+CODE_FILE
+../broadcom.c:518
+%li: %s
+MESSAGE
+CODE_FUNC
+user_id: %s, finger: %d
+templateHandle is %d
+../broadcom.c:389
+dev_probe() called
+/tmp/bcm_fw_status.txt
+%s cvmain returned error: %x
+broadcom
+Broadcom Sensors
+Identification successful!
+Identification failed!
+Verify was successful!
+Verify failed!
+delete_print() called
+myUserID
+myAppID
+list() called
+dev_close() called
+cancel() called
+dev_open() called
+verify() called
+identify() called
+enroll() called
+nobody
+Enrollment is %d %% 
+FP1-%04d%02d%02d-%X-%08d-%s
+description
+Enrollment was successful!
+fpi_device_broadcom_init() called
+cv_fingerprint_capture_cancel failed %x : 
+%s Check firmware upgrade is pending
+%s fw_status file creation returned error: %x
+fpi_device_broadcom_class_init() called
+Identification failed due to unforeseen error!
+close_session: cv_close_partial failed, status=0x%x
+open_session: cvif_open failed, status=0x%x 
+Successfully deleted enrolled user
+Enrollment failed : Device status = (%d)
+dev_probe
+verify_task
+identify_task
+parse_print_data
+../CVUsrLib/HelperFunctions.c
+Memory Allocation Failed
+InitLibrary() failed
+Invalid CommandId
+Invalid Object Type
+Invalid PERSISTENT Type
+Invalid BLOB Type
+Invalid ENC_OP Type
+Invalid DEC_OP Type
+Invalid HMAC Type
+Invalid HASH_OP Type
+Invalid Sign Type
+Invalid Verify Type
+Invalid Bulk Mode Type
+Invalid Auth Alg Type
+Invalid Hash Type
+Invalid Key Type
+Invalid Status Type
+Invalid Config Type
+Invalid Protected Config Type
+Invalid MAC Type
+Invalid FingerPrint Type
+Invalid Authorization Type
+Memory Allocation is fail 
+Memory Allocation is fail
+Inside cvhInitParam_List
+Exiting cvhInitParam_List
+Memory Allocation is Fail 
+cvhPromptUserPin is Fail 
+Unable to allocate memory 
+Invalid auth list
+Invalid Protected Config Mgmt Type with ENTER
+Invalid Protected Config Mgmt Type with EXIT
+Invalid Protected Config Mgmt Type with others
+Invalid Object Attributes Type
+cvhFindFPAuth
+GetPromptUserPinCmd
+ConstructBlob
+GetObjectLenAndData
+GetHostEncryptNonceCmd
+GetCVPublicKeyCmd
+is_valid_object_auth_flags
+is_valid_obj_attribute_type
+is_valid_contactless_type
+is_valid_fingerprint_type
+is_valid_otp_mac_type
+GetValidProtectedConfigLen
+GetValidConfigLen
+is_valid_protected_config_mgmt_type
+is_valid_protected_config_type
+is_valid_config_type
+GetValidStatusLen
+is_valid_param_type
+is_valid_status_type
+is_valid_key_type
+is_valid_hash_type
+is_valid_auth_algorithm
+is_valid_bulk_mode
+is_valid_verify_op
+is_valid_sign_op
+is_valid_hash_op
+is_valid_hmac_op
+is_valid_dec_op
+is_valid_enc_op
+is_valid_blob_type
+is_valid_persistence
+is_valid_obj_type
+is_valid_command_id
+ProcessTransmitCmd
+InitParam_List
+../CVUsrLib/CVUtil.c
+cv_option Parameter is null
+Invalid CV Handle Value
+Invalid Handle Value
+Enter in CV_INIT
+Exit in CV_INIT
+Enter in CV_OPEN_REMOTE
+Option Parameter is null
+IPAddr is null
+Exit in CV_OPEN_REMOTE
+Inside cv_get_status
+Invalid CV Handle
+Exiting cv_get_status
+Inside cv_get_feature_status
+Exiting cv_get_feature_status
+Enter in cv_set_config
+Invalid Config type
+Exiting cv_set_config
+Enter in cv_get_session_count
+Session Handle not found
+Exit in cv_get_session_count
+Inside cv_diag_grp_test
+Exiting cv_diag_grp_test
+Inside cv_diag_ind_test
+Exiting cv_diag_ind_test
+Inside cv_rfid_man_test
+Exiting cv_rfid_man_test
+Inside cv_load_rfid_cfg
+Invalid cfgPath Value
+Can not open cfgPath
+cfgPath file is empty
+u32_aux_osc_ctrl
+u16_phase
+u16_polarity_non14b
+u16_invert_non14b
+u16_tx_current_0
+u16_tx_current_1
+u16_tx_current_2
+u16_tx_current_3
+u16_tx_current_4
+u16_tx_current_5
+u16_mod_depth_0
+u16_mod_depth_1
+u16_mod_depth_2
+u16_mod_depth_3
+u16_mod_depth_4
+u16_mod_depth_5
+u16_vga_gain
+u16_noise_floor
+u16_agc_threshold
+u16_agc_ctrl0
+u16_polarity_14b
+u16_invert_14b
+u16_rx_sof_coarse_low
+u16_rx_sof_coarse_high
+u16_rx_eof_coarse_low
+u16_rx_sof_fine_low_min
+u16_rx_eof_fine_low_min
+u16_egt
+u16_rx_preamble_upper
+u12_reg_offset
+u4_protocol
+u4_speed
+u6_reg_start_msk
+u6_reg_end_msk
+u32_reg_value
+Unknown RFID parameter
+Exiting cv_load_rfid_cfg
+Inside cv_rfid_configuration
+Exiting cv_rfid_configuration
+Inside cv_diag_hdotp_peek
+Exiting cv_diag_hdotp_peek
+Inside cv_diag_hdotp_poke
+Exiting cv_diag_hdotp_poke
+Invalid flashPath Value
+Can not open flashPath
+flashPath file is empty
+Inside cv_erase_flash_chip
+Exiting cv_erase_flash_chip
+Invalid fwPath value
+Can not open fwPath
+fwPath file is empty
+Error transmitting SBI data
+Inside cv_load_sbi
+Invalid sbiPath Value
+Can not open sbiPath
+sbiPath file is empty
+Exiting cv_load_sbi
+Exiting cv_pba_access
+Inside cv_pba_access
+Inside cv_pba_update
+Invalid pbaPath Value
+Can not open pbaPath
+pbaPath file is empty
+Error while writting to PBA
+Error while reading from PBA
+Exiting cv_pba_update
+Inside cv_diag_get_hid_cnsl
+Exiting cv_diag_get_hid_cnsl
+Inside cv_detect_fp
+Exiting cv_detect_fp
+Inside cv_ush_console_start
+Exiting cv_ush_console_start
+Inside cv_ush_console_stop
+Exiting cv_ush_console_stop
+Inside cv_ush_get_console
+Exiting cv_ush_get_console
+Inside cv_ush_console_menu
+Exiting cv_ush_console_menu
+Inside cv_send_blockdata
+Inside cv_power_management
+Exiting cv_power_management
+Inside cv_generic_cmd
+Exiting cv_generic_cmd
+Inside cv_get_machine_id
+Exiting cv_get_machine_id
+Inside cv_test_tpm
+Exiting cv_test_tpm
+Inside cv_enable_function
+Inside cv_upgrade_objects
+Exiting cv_upgrade_objects
+Enter in cv_register_super
+Exiting cv_register_super
+Inside cv_challenge_super
+Exiting cv_challenge_super
+Inside cv_response_super
+Exiting cv_response_super
+Enable suiteB for secure sessions
+Error while copying the Outbound List into Param Blob
+Error while copying the Inbound List into Param Blob
+Error while copying the Object Auth parameter into Param Blob
+Error while copying the cv_handle paramter into Object Blob
+cv_open: detected CV_UI_FAILED_COMMAND_PROCESS
+cv_open: detected CV_INVALID_HANDLE or CV_PARAM_BLOB_AUTH_FAIL
+Error returned by cvhManageCVAPICall
+Error returned by cvhSaveReturnValue
+Error while copying the Not copying the values to cvh_Param_List entry
+cv_close: detected CV_UI_FAILED_COMMAND_PROCESS
+Error returned by DeleteSessionHandle
+calling cvhManageCVAPIcall is fail
+Error while copying pIPAddr into Param Blob
+Invalid Status Type is being passed
+Error while copying the cv handle into Param Blobl
+Error while copying status type parameter into Param Blob
+Error while getting the size of valid status type
+Error while copying out parameter into Param Blob
+Error returned by cvhManageCVAPIcall
+Error returned by by cvhSaveReturnValue
+Invalid Status in cvhManageCVAPIcall
+Enter in cv_authenticate_set_features
+Exiting cv_authenticate_set_features
+Error while copying the version parameter into Param Blob
+Error while copying in parameter into Param Blob
+Error while copying the diag test type into Param Blob
+Error while copying diag test grp type parameter into Param Blob
+Error while copying diag test ind type parameter into Param Blob
+Error while copying diag test parameter into Param Blob
+Inside cv_diag_set_rfid_params
+Error while copying diag test rfid 14a parameter into Param Blob
+Error while copying diag test rfid 14b parameter into Param Blob
+Error while copying diag test rfid 15 parameter into Param Blob
+Error while copying diag test rfid general parameter into Param Blob
+Error while copying diag test rfid general agc into Param Blob
+Error while copying diag test rfid general auxclk into Param Blob
+Error while copying diag test rfid general agcThresh into Param Blob
+Error while copying diag test rfid rdr ctrl5 into Param Blob
+Error while copying diag test rfid vga gain into Param Blob
+Error while copying diag test rfid bb gain into Param Blob
+Error while copying diag test rfid volt mode into Param Blob
+Exiting cv_diag_set_rfid_params
+Error while copying the diag test subcommand into Param Blob
+Error while copying the rfid test num into Param Blob
+Cannot allocate memory for flashPath
+No u4_protocol entry for regSet entry
+No u4_speed entry for regSet entry
+No u6_reg_start_msk entry for regSet entry
+No u6_reg_end_msk entry for regSet entry
+No u32_reg_value entry for regSet entry
+Error while copying the cvhandle into Param Blob
+Error while copying the system id into Param Blob
+Not copying the RFID parameters to Param Blob 
+Error while copying the clr rfid user config into Param Blob
+Could not allocate memory for RFID Configu data.
+Could not load RFID configuration data.
+Inside cv_diag_get_antenna_status
+Exiting cv_diag_get_antenna_status
+Inside cv_diag_hdotp_get_status
+Error while copying diag test type into Param Blob
+Error while copying hdotp status parameter into Param Blob
+Exiting cv_diag_hdotp_get_status
+Inside cv_diag_hdotp_set_status
+Exiting cv_diag_hdotp_set_status
+Error while copying address into Param Blob
+Error while copying return value parameter into Param Blob
+Error while copying value into Param Blob
+Inside cv_diag_hdotp_get_skip_list
+Error while copying buffer length into Param Blob
+Inside cv_diag_hdotp_set_skip_list
+Error while copying array list parameter into Param Blob
+Exiting cv_diag_hdotp_set_skip_list
+Inside cv_diag_hdotp_get_cv_counter
+Error while copying return pValue parameter into Param Blob
+Exiting cv_diag_hdotp_get_cv_counter
+Inside cv_diag_hdotp_get_ah_credit_level
+Exiting cv_diag_hdotp_get_ah_credit_level
+Inside cv_diag_hdotp_get_elapsed_time
+Exiting cv_diag_hdotp_get_elapsed_time
+Inside cv_diag_hdotp_get_skip_mono_cntr
+Exiting cv_diag_hdotp_get_skip_mono_cntr
+Inside cv_diag_hdotp_get_spec_skip_cntr
+Error while copying old skip count parameter into Param Blob
+Exiting cv_diag_hdotp_get_spec_skip_cntr
+Inside cv_diag_hdotp_set_skip_cntr
+Exiting cv_diag_hdotp_set_skip_cntr
+Inside cv_diag_get_rfid_status
+Exiting cv_diag_get_rfid_status
+Cannot allocate memory for tx buffer
+Error while copying the outbound data into Param Blob
+Error unexpected firmware upgrade command
+Invalid offset value (must be either 0 or 0x10000 or 0x20000)
+Cannot allocate memory for fwPath
+fwPath file SBI segment is not large enough (<0x10000B)
+fwPath file USH segment is not large enough (<0x3b0)
+Error transmitting Firmware Upgrade Start
+Error transmitting Firmware Upgrade Update
+Error transmitting Firmware Upgrade Complete
+Cannot allocate memory for sbiPath
+Error while copying the SBI data into Param Blob
+Inside cv_access_PBA_code_flash....
+Access beyond the APP size limits
+Null pointers passed for buffer 
+Not copying the auth list length values to cvh_Param_List entry 
+Error while copying the offset into Object Blob
+Initilizing the parameter pDataLength and pData are failed
+Error while copying read flag into Object Blob
+Not copying the values to cvh_Param_List entry 
+Exiting from cv_access_PBA_code_flash
+Cannot allocate memory for buffer
+Error returned by cv_access_PBA_code_flash
+Cannot allocate memory for output buffer
+Cannot allocate memory for input buffer
+Error PBA data read doesn't match PBA data written
+Inside cv_ush_console_put_char
+Exiting cv_ush_console_put_char
+Inside cv_set_smartcard_present
+Exiting from cv_set_radio_present
+Error while cvh_Param_List entry
+Error while copying the cv handle into Param Blob
+Error while copying power management parameter into Param Blob
+Inside cv_power_management_start
+Exiting cv_power_management_start
+Exiting from cv_enable_function
+Error while copying cvHandle parameter into Param Blo
+Error while copying num Obj Handles parameter into Param Blob
+Error while copying num CV Object handles parameter into Param Blob
+cv_response_super
+cv_challenge_super
+cv_register_super
+cv_upgrade_objects
+cv_enable_function
+cv_test_tpm
+cv_get_machine_id
+cv_generic_io_cmd
+cv_power_management_start
+cv_power_management
+cv_receive_blockdata
+cv_send_blockdata
+cv_set_smartcard_present
+cv_ush_console_menu
+cv_ush_console_put_char
+cv_ush_get_console
+cv_ush_console_stop
+cv_ush_console_start
+cv_detect_fp
+cv_diag_get_hid_cnsl
+cv_access_PBA_code_flash
+cv_pba_update
+cv_pba_access
+cv_load_sbi
+cv_firmware_upgrade
+cv_firmware_upgrade_tx
+cv_erase_flash_chip
+cv_reboot_to_ush
+cv_reboot_to_sbi
+cv_flash_update
+cv_diag_get_rfid_status
+cv_diag_hdotp_set_skip_cntr
+cv_diag_hdotp_get_spec_skip_cntr
+cv_diag_hdotp_get_skip_mono_cntr
+cv_diag_hdotp_get_elapsed_time
+cv_diag_hdotp_get_ah_credit_level
+cv_diag_hdotp_get_cv_counter
+cv_diag_hdotp_set_skip_list
+cv_diag_hdotp_get_skip_list
+cv_diag_hdotp_poke
+cv_diag_hdotp_peek
+cv_diag_hdotp_set_status
+cv_diag_hdotp_get_status
+cv_diag_get_antenna_status
+cv_rfid_configuration
+cv_set_rfid_params
+cv_load_rfid_cfg
+cv_rfid_man_test
+cv_diag_set_rfid_params
+cv_diag_ind_test
+cv_diag_grp_test
+cv_get_ush_ver
+cv_get_session_count
+cv_authenticate_set_features
+cv_set_config
+cv_get_feature_status
+cv_get_status
+cv_open_remote
+cv_init
+cv_close_partial
+cv_close
+cv_open
+../CVUsrLib/CVCrypt.c
+cv_obj_handle is Fail
+Invalid enc op 
+Invaild Bulk mode
+Invalid auth algorithm
+Invalid dec op 
+Invalid hmac op
+Invalid Hash_op
+Invalid hash op 
+Invalid cv_obj_type 
+Invalid cv_key_type 
+Invalid cv_obj_attribute_type
+Invalid cv_sign_op 
+Invalid Verify_op
+Enter in CV_HOTP_UNBLOCK
+Exit in CV_HOTP_UNBLOCK
+Invalid cv_otp_mac_type
+Invalid Status in cvhSaveReturnValue
+Error while copying the Outbound List for cvHandle
+Error while copying the Outbound List for hotpObjectHandle
+Error while copying the Outbound List for unblockAuth
+Error while copying the bIsBlockedNow paramter into Object Blob
+cv_otp_get_mac
+cv_otp_get_value
+cv_hotp_unblock
+cv_verify
+cv_sign
+cv_genkey
+cv_hash_object
+cv_hash
+cv_hmac
+cv_decrypt
+cv_encrypt
+cv_get_random
+../CVUsrLib/CVObjMgmt.c
+Inside cv_delete_object
+cv_obj_handle is null
+Exiting from cv_delete_object
+cv_set_object Not implemented
+cv_get_object Not implemented
+Inside cv_enumerate_objects
+Invalid cv_obj_type
+Inside cv_change_auth_object
+Invalid Mgmt type
+Invalid cv_auth_flags
+cv_create_object Not implemented
+cv_enumerate_objects: detected CV_UI_FAILED_COMMAND_PROCESS
+Exiting from cv_enumerate_objects
+Inside cv_enumerate_objects_direct
+Exiting from cv_enumerate_objects_direct
+cv_duplicate_object Not implemented
+cv_import_object Not implemented
+cv_export_object Not implemented
+Exiting from cv_change_auth_object
+Inside cv_manage_config_object
+Not copying the values to cvh_Param_List entry for cvHandle
+Not copying the values to cvh_Param_List entry for mgmtTypes
+Not copying the values to cvh_Param_List entry for currAuthList 
+Not copying the values to cvh_Param_List entry for newAuthList 
+Exiting from cv_manage_config_object
+Inside cv_authorize_session_object
+Exiting from cv_authorize_session_object
+Inside cv_deauthorize_session_object
+Exiting from cv_deauthorize_session_object
+cv_deauthorize_session_object
+cv_authorize_session_object
+cv_manage_config_object
+cv_change_auth_object
+cv_export_object
+cv_import_object
+cv_duplicate_object
+cv_enumerate_objects_direct
+cv_enumerate_objects
+cv_get_object
+cv_set_object
+cv_delete_object
+cv_create_object
+../CVUsrLib/CVUsrLib.c
+Memory Allocation is Fail
+Invalid status cvhEncryptpCmd
+ Invalid status cvhDecryptCmd
+ Verification of HMAC failed
+CVSession Could not be found
+ProcessTransmitCmd Failed
+GetCommandIndex Failed 
+cvhEncapsulateCmd Failed 
+ProcessTransmitCmd Failed 
+GetPromptUserPinCmd Failed 
+auth_list_idx is not proper 
+Decapsulatecmd Failed 
+Save Return Values Failed 
+Duplicate session found 
+cvhDecapsulateCmd is Fail
+ Error while allocating memory
+Invalid System OS and Processor Architecture 
+Error while setting the Anit Hammering Delays from Registry
+Unable to delete duplicate session 
+CV_CMD_OPEN or CV_CMD_OPEN_REMOTE failed.
+Error returned by DeleteSessionHandle(0)
+cvhManageCallback
+cvhDecryptCmd
+cvhDecapsulateCmd
+cvhEncryptCmd
+cvhEncapsulateCmd
+cvhManageCVAPICall
+/var/log
+%s: %s
+Failed to open log file: %s
+_logMessage: %s
+../CVUsrLib/CVPreBoot.c
+Inside cv_bind
+Exiting from CV_BIND
+Inside cv_bind_challenge....
+Inside cv_read_iclass_card
+Inside cv_enable_radio
+Exiting from cv_enable_radio
+Inside cv_enable_smartcard
+Inside cv_enable_fingerprint
+Inside cv_enable_wbdi
+Exiting from cv_enable_wbdi
+Inside cv_identify_user....
+Exiting from cv_identify_user
+Null pointers passed for nonce 
+Error while copying the bind challenge paramter into Object Blob
+Error while copying bindResponse into Object Blob
+Exiting from cv_bind_challenge
+Exiting from cv_read_iclass_card
+Inside cv_enable_and_lock_radio
+Exiting from cv_enable_and_lock_radio
+Inside cv_set_cv_only_radio_mode
+Exiting from cv_set_cv_only_radio_mode
+Inside cv_set_cv_only_radio_mode_volatile
+Exiting from cv_set_cv_only_radio_mode_volatile
+no of templates passed exceeds the MAX user limit
+Null pointers passed for Indentify buffer 
+Not copying the template handle list length values to cvh_Param_List entry 
+Error while copying Identify type into Object Blob
+cv_identify_user
+cv_set_cv_only_radio_mode_volatile
+cv_set_cv_only_radio_mode
+cv_set_radio_present
+cv_enable_wbdi
+cv_enable_and_lock_radio
+cv_enable_fingerprint
+cv_enable_smartcard
+cv_enable_radio
+cv_read_contactless_card_id
+cv_bind_challenge
+cv_bind
+../CVUsrLib/CVDevCtrl.c
+Found duplicate fingerprint
+Enter in cv_fingerprint_test
+Exiting cv_fingerprint_test
+Enter cv_fingerprint_reset
+Exiting cv_fingerprint_reset
+Enter cv_set_nfc_power_to_max
+Enter cv_generate_ECDSA_key
+Exiting cv_generate_ECDSA_key
+Enter cv_get_sbl_pid
+Exiting cv_get_sbl_pid
+cv_fingerprint_verify: detected CV_UI_FAILED_COMMAND_PROCESS
+Enter in cv_fingerprint_test_out
+Exiting cv_fingerprint_test_out
+Enter in cv_fingerprint_calibrate
+Exiting cv_fingerprint_calibrate
+Enter in cv_fingerprint_register_event
+Exiting cv_fingerprint_register_event
+Error while copying the captureID paramter into cvh_Param_List entry
+cv_fingerprint_capture_start: detected CV_UI_FAILED_COMMAND_PROCESS
+Error returned by cvhManageCVAPICall status
+cv_fingerprint_capture_cancel: detected CV_UI_FAILED_COMMAND_PROCESS
+Enter cv_fingerprint_create_feature_set
+Exiting cv_fingerprint_create_feature_set
+Enter cv_fingerprint_commit_feature_set
+Exiting cv_fingerprint_commit_feature_set
+Enter cv_fingerprint_update_enrollment
+Exiting cv_fingerprint_update_enrollment
+Enter cv_fingerprint_discard_enrollment
+Exiting cv_fingerprint_discard_enrollment
+Enter cv_fingerprint_commit_enrollment
+Exiting cv_fingerprint_commit_enrollment
+Enter cv_fingerprint_create_template
+Exiting cv_fingerprint_create_template
+Enter cv_upgrade_sensor_firmware
+Exiting cv_upgrade_sensor_firmware
+Enter cv_check_sensor_firmware_upgradable
+Exiting cv_check_sensor_firmware_upgradable
+Exiting cv_set_nfc_power_to_max
+Enter cv_cmd_biometric_unit_created
+Exiting cv_cmd_biometric_unit_created
+Enter cv_cmd_enrollment_started
+Exiting cv_cmd_enrollment_started
+cv_get_sbl_pid
+cv_cmd_enrollment_started
+cv_cmd_biometric_unit_created
+cv_generate_ECDSA_key
+cv_set_nfc_power_to_max
+cv_check_sensor_firmware_upgradable
+cv_upgrade_sensor_firmware
+cv_fingerprint_reset
+cv_fingerprint_create_template
+cv_fingerprint_commit_enrollment
+cv_fingerprint_discard_enrollment
+cv_fingerprint_update_enrollment
+cv_fingerprint_commit_feature_set
+cv_fingerprint_create_feature_set
+cv_fingerprint_capture_get_result
+cv_fingerprint_capture_cancel
+cv_fingerprint_capture_start
+cv_fingerprint_register_event
+cv_fingerprint_calibrate
+cv_fingerprint_test_out
+cv_fingerprint_test
+cv_fingerprint_configure
+cv_do_fingerprint_identify
+cv_fingerprint_capture
+cv_do_fingerprint_verify
+cv_fingerprint_enroll_dup_check
+cv_fingerprint_enroll
+../CVUserInterface/CVUserInterface.c
+Please swipe your contactless card.
+Please place finger on sensor again.
+Please place finger on sensor (4 of 4).
+Please place finger on sensor (3 of 4).
+Please place finger on sensor (2 of 4).
+Please place finger on sensor (1 of 4).
+Please swipe your finger (4 of 4).
+Please swipe your finger (3 of 4).
+Please swipe your finger (2 of 4).
+Please swipe your finger (1 of 4).
+Please place finger on sensor.
+************************************************
+Please insert smart card and enter the PIN.
+An internal error occurred.
+Please reswipe your finger.
+Please insert Smart Card.
+Please swipe your finger.
+Prompt code (0x%x)
+Remove prompt
+Please enter the PIN.
+UNKNOWN prompt.
+cvhTransmit
+Buffer length: 0x%x, only printing 0x100
+../CVUserInterface/CVuserInterfaceUtils.c
+Failed to abort command processing
+Failed to get callback status
+cv_abort
+cv_callback_status
+../CVUserInterface/CVUIThreadHandlers.c
+resultHandlerProc
+Error: Antihammering protection triggered
+cv_open() return status: 0x%x
+cv_close() return status: 0x%x
+cv_get_status() return status: 0x%x
+Error: 0x%x from cv_get_ush_ver()
+cv_load_flash filename is null
+Error: 0x%x from cv_flash_update()
+Error: cv_diag_grp_test() returned error 0x%x
+Error: cv_diag_ind_test() returned error 0x%x
+Error: cv_fingerprint_test() returned error 0x%x
+Error: cv_fingerprint_calibrate() returned error 0x%x
+Error: cv_get_antenna_status() returned error 0x%x
+Could not reset to SBI (0x%x)
+Could not reset to USH (0x%x)
+Error: cv_diag_hdotp_get_status() returned error 0x%x
+Error: cv_diag_hdotp_set_status() returned error 0x%x
+Unknown RFID Manufacturing Test
+ERROR: error returned by cv_rfid_man_test() (0x%x)
+Citadel A0 CID1 Chip Found....
+Citadel A0 CID7 Chip Found....
+Citadel A0 Unassigned Chip Found....
+Citadel A0 CIDFE Chip Found....
+In cvif_IsUshThere(), cv_get_ush_ver() status: (0x%x)
+Citadel A0 Chip Found and it is SBL mode....
+Error returned by cv_enable_radio (0x%x)
+Error returned by cv_enable_fingerprint (0x%x)
+Error: FINGERPRINT NOT PRESENT
+Error returned by cv_set_cv_only_radio_mode (0x%x)
+Error returned by cv_enable_and_lock_radio (0x%x)
+Error returned by cv_enable_wbdi (0x%x)
+Error returned by cv_enable_wbdi() (0x%x)
+Invalid offset value: 0x%x (must be either 0 or 0x20000 for Lynx/Citadel)
+BCM is running. Will reboot to sbi
+Error: 0x%x from cvif_reboot_to_sbi()
+Feature not supported, TPM is enabled
+Going to update the %s with %s
+Please wait, this takes about one minute
+Error: 0x%x from cv_firmware_upgrade()
+SecurityCheckBeforeFlashing: Error getting version %d
+Security check before flashing passed
+%s %d filereadcnt != filelen 
+Capture Initiated, Please place your finger now on the sensor now
+detected failure due to resume, do retry
+cv_fingerprint_capture_start failed %x : Retry
+Update enrollment is successful
+Enrollment procedure successfully completed
+CV_FP_SENSOR_ROLLBACK_REQUIRED or NO VALID FP Image was grabbed, ignore and continue to grab more samples
+Update enrollment failed : cancel capture
+call cv_fingerprint_commit_enrollment
+Commit enrollment failed (status=0x%x) : cancel capture
+cv_fingerprint_identify failed %x : 
+cv_load_sbi returned 0x%x
+Can not open flash file (%s)
+Writing %s to flash
+cv_flash_update() successful
+Error: no tests specified
+USH_CHIPID:05820201
+USH_CHIPID:00000000
+USH_CUST_ID:60000002
+USH_CUST_ID:60000001
+USH_CUST_ID:00000000
+USH_CUST_ID:600ffffe
+USH_SBL_MODE: 00000001
+Error: SMARTCARD NOT PRESENT
+Error: RADIO NOT PRESENT
+Inside cvif_firmware_upgrade
+Invalid firmware filename
+Can not open firmware file
+Firmware file is empty
+Firmware Upgrade Complete
+Exiting cvif_flash_update
+USH_REBOOT_CNT:
+USH_FLSHWR_CNT:
+USH_REBOOT_CNT:00000000
+USH_FLSHWR_CNT:00000000
+USH_SBI_MODE:00000001
+REPROGRAM_SUCCESS:00000001
+ERROR: Reprogramming failure
+Not SBI mode
+USH_AES_KEY_VALID:00000001
+ERROR: AES key is NOT valid
+USH_REL_UPGRADE_VER:
+USH_REL_UPGRADE_VER:%x
+USH_REL_BUILD_VER:
+USH_REL_BUILD_VER:%x
+USH_CHIPID:5882
+%x.%x.%x.%x
+USH_SBI_MINOR_VER:
+USH_SBI_MINOR_VER:%x
+bcm_cv_current_version.txt
+%x_%x_%x
+SBI_VERSION: %x
+More fingers needed
+cvif_GetProposedUshVersion
+Hit any key to continue
+Hit any key to continue...
+%A %B %d, %Y %X
+ 0x%08x
+logfile already open %s
+Could not open logfile %s
+%s: Command - %s
+cnsToLower() called with null string pointer
+AAI version matches - it is up do date
+SBI version matches - it is up do date
+Combined FW folder and file path too long
+Can not find Clear SCD file (%s)
+Using CID1 firmware in SBL mode
+Using CID 7 firmware in SBL mode
+Using Unassigned firmware in SBL mode
+bcmsbiCitadelA0_Unassigned.otp
+cvif_load_sbi() returns status: %d
+cv_get_ush_ver did not return CV_SUCCESS. Error: 0x%x
+Control Vault getting chip type
+Could not determine chip type
+Missing files necessary for complete firmware update
+Cannot detect the version of the firmware to be updated. Check firmware files.
+AAI version available for upgrade = %s 
+Cannot detect the version of the sbi to be updated. Check sbi files.
+SBI version available for upgrade = %s 
+Current CV SBI ver: %s, SBI file ver: %s, AAI ver: %s, AAI file ver: %s
+Updating ControlVault firmware from %s to %s
+Control Vault executing from Boot Strap - Loading SBI
+Upgrade the SBI from %s to %s, first clear SCD 
+ERROR: Failed to clear SCD, status: 0x%x
+Reset to SBI to update the SBI....
+ERROR: Control Vault did not comeback from reset to SBI 
+Found ControlVault Chip Type: %s
+ERROR: Failed to update SBI, status: 0x%x
+ERROR: Failed to reset Control Vault, status: 0x%x
+Waiting for Control Vault to comeback from reset
+ERROR: Control Vault did not comeback after rebooting to SBI
+ERROR: Security check before flashing failed
+Firmware upgrade command submission failed - will not be retried
+ERROR: Failed to upgrade firmware, status: 0x%x; try: %d 
+ERROR: Control Vault did not comeback after rebooting
+ERROR: Invalid chip type read after FW upgrade: %d
+ERROR: CV Open failed, status: 0x%x
+Control Vault firmware upgrade successful
+ERROR: Failed to upgrade firmware
+Check ControlVault firmware and package firmware versions: sudo CVFWUpgrade -v
+Upgrade ControlVault firmware: sudo CVFWUpgrade
+Force upgrading ControlVault firmware even if versions match: sudo CVFWUpgrade -f
+Input parameter not supported, for usage help, enter: CVFWUpgrade -h
+Wrong number of arguments, for usage help, enter: CVFWUpgrade -h
+		FwUpgradeError. Check Firmware Files or CID used or Hardware etc. Error: 0x%x
+Verified FW file %s exists
+Can not find SBI file (%s)
+Can not find BCM file (%s)
+Detected chipType 0x%x
+bcmsbiCitadelA0_1.otp
+Could not find SBI file %s
+bcmsbiCitadelA0_7.otp
+Unknown CHIP 
+Going to load SBI (%s)
+Could NOT detect USH.
+Current AAI Version = %s 
+Current SBI Version = %s 
+Forced firmware update
+Event: FwUpgradeStarted
+ERROR: Failed to load SBI
+Event: FwUpgradeInProgress 1
+Going to update SBI (%s)
+BCM Update attempt %d
+Event: FwUpgradeInProgress 2
+Going to clear SCD
+Going to Reset to SBI
+Event: FwUpgradeInProgress 3
+Going to update BCM (%s)
+Event: FwUpgradeInProgress 4
+Opening CV session
+Event: FwUpgradeInProgress 6
+CV Handle: 0x%x
+Going to Reset Control Vault
+Event: FwUpgradeInProgress 5
+Reboot USH
+Usage:
+Get help: CVFWUpgrade -h
+/dev/shm/sem.cvUshSem
+bcm_cv_clearscd.bin
+bcmCitadel_1.otp
+bcmCitadel_7.otp
+bcmsbiCitadelA0_FE.otp
+Unknown
+CITADEL A0 CID1
+CITADEL A0 CID7
+CITADEL A0 Unassigned
+CITADEL A0 CIDFE
+pbaapp2.bin
+pbaapp.bin
+SmartCard
+FingerPrint
+SmartCard Java Card
+/var/lib/fprint/USH_FP_DP_SENSOR:00000001
+USH_FP_GOODIX_SENSOR:00000001
+USH_FP_GOODIX_SENSOR:00000010
+USH_FP_GOODIX_SENSOR:00000100
+USH_FP_ELAN_SENSOR:00000001
+USH_FP_FPC_SENSOR:00000001
+USH_FP_FPC_SENSOR:00000010
+FP_VERSION:
+fps:%s
+SensorFWUpgradeIsRunningNow
+Data read incorrect from file
+Ptr: %p: 
+key.pem
+err code:[%lu](%s)
+Sensor Version length: %d 
+Sensor Version: %s
+block_sf_upgrade
+Upgrading sensor firmware
+bcmSensorFirmwar
+USH_FP_SYNAPTICS_SENSOR:00000001
+Failed to get CID from get_ush_version
+No sensor type in get_ush_version result
+No sensor-firmware version in get_ush_version result
+Sensor firmware upgrade is running
+bcmDeviceFirmwareCitadel_1.bin
+ReadContentsOfFirmwareFile Cannot read CID1 sensor-firmware file
+bcmDeviceFirmwareCitadel_7.bin
+ReadContentsOfFirmwareFile Cannot read CID7 sensor-firmware file
+ReadContentsOfFirmwareFile Incorrect CID %d
+Sensor-firmware file digest computation is failed
+Sensor-firmware file signature verification failed
+Sensor-firmware file signature verification is valid
+cv_check_sensor_firmware_upgradable: Skipping 
+ERROR Sensor Version length is too long. %d 
+cv_check_sensor_firmware_upgradable: TRUE 
+SensorSubID: 0x%x. FirmwareUpgradable: TRUE
+cv_check_sensor_firmware_upgradable: FALSE 
+Couldn't find UPDATABLE sensor-firmware for this sensor
+cv_upgrade_sensor_firmware returned status: 0x%x
+cv_upgrade_sensor_firmware returned status: 0x%x while sending signature
+Sensor firmware upgrade completed
+No sensor-firmware info from get_ush_version
+Sensor type  : %d Sensor firmware version on device: %s length: %d
+Cannot read contents of sensor-firmware file
+Failed while verifying magic value and signature of firmware file
+Couldn't get UPDATABLE firmware image data for sensor
+Sensor firmware version in file(sensor %d): %s length: %d
+Sensor firmware versions in file and on device match
+Sensor Firmware Upgrade(for sensor %d) blocked for this version: %s. So, do not upgrade Sensor FW 
+Sensor Firmware Upgrade blocked for Goodix sensor %d. So, do not upgrade Sensor FW 
+Starting sensor-firmware upgrade
+Image for sensor too small: %d
+Image for sensor: %hhx %hhx %hhx . . length - %d 
+Signature for sensor: %hhx %hhx %hhx . . length - %d 
+Couldn't send sensor firmware to CV
+CVUsrLibLog.txt
+CVFWUpgrade
+tmppbafl.bin
+.shstrtab
+.note.gnu.property
+.note.gnu.build-id
+.gnu.hash
+.dynsym
+.dynstr
+.gnu.version
+.gnu.version_r
+.rela.dyn
+.rela.plt
+.plt.got
+.plt.sec
+.rodata
+.eh_frame_hdr
+.eh_frame
+.init_array
+.fini_array
+.dynamic
+.got.plt

@@ -1,0 +1,9 @@
+[package]
+name = "cv3-core"
+description = "I/O-free protocol core for the Broadcom ControlVault 3 fingerprint sensor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]

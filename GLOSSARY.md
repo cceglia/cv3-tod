@@ -1,0 +1,76 @@
+# ControlVault 3 fingerprint driver
+
+Driving the Broadcom BCM58200 ControlVault 3 fingerprint sensor from Linux: speaking its
+encrypted command protocol and presenting the sensor to `fprintd` as a fingerprint reader.
+
+## Language
+
+### Hardware and transport
+
+**Sensor**:
+The Broadcom BCM58200 ControlVault 3 module on USB `0a5c:5843`, a match-on-chip fingerprint
+reader that also carries smartcard and RFID functions.
+_Avoid_: device, reader, reader chip
+
+**Secure session**:
+The per-connection encrypted channel that must be open before the sensor accepts any fingerprint
+command. It has a handle and a key schedule derived during the handshake; it is not TLS.
+_Avoid_: channel, tunnel
+
+**Wrap sequence**:
+The counter that both sides advance once per encrypted command accepted within a session. A
+mismatched counter makes the sensor reject the command.
+_Avoid_: nonce, sequence number, counter
+
+**Light wedge** / **Deep wedge**:
+A wedged sensor still enumerates on USB but refuses commands. A light wedge clears with a USB
+`authorized` toggle; a deep wedge survives until the machine loses power.
+_Avoid_: hang, lockup, bricked
+
+### Protocol values
+
+**Sample hash**:
+The 20-byte value identifying one captured fingerprint image during enrolment.
+_Avoid_: capture hash, image hash
+
+**Enrolment id**:
+The 20-byte identifier the sensor returns when an enrolment completes, naming the template it
+just stored.
+_Avoid_: template id, print id
+
+**Match id**:
+The 20-byte identifier the sensor returns alongside a positive match, derived from the biometric
+rather than from the enrolment. It is not comparable with an enrolment id.
+_Avoid_: template id, matched id
+
+**Device-stored print**:
+A fingerprint whose template lives on the sensor, the host keeping only its identifier and
+metadata. Deleting one is a sensor operation.
+_Avoid_: chip print, stored print, on-chip print
+
+**Host-stored print**:
+A fingerprint whose record lives in fprintd's storage while the sensor holds the template and
+answers only yes or no. Deleting one leaves the template in place.
+_Avoid_: local print, fprintd print
+
+**Store diff**:
+The comparison of the sensor's template inventory before and after an enrolment, used to learn
+which id the sensor assigned to the new template.
+_Avoid_: store scan, inventory dump
+
+### Our design
+
+**Probe** (`cvctl`):
+Our command-line tool that drives the sensor directly, one command at a time, to establish
+protocol facts without installing a driver.
+_Avoid_: test tool, debug tool
+
+**Shim**:
+Our thin C layer that turns libfprint's driver callbacks into events for the Rust core and
+performs the actions the core returns. It holds no protocol logic.
+_Avoid_: wrapper, glue, adapter
+
+**Core**:
+The Rust library that owns the protocol: framing, cryptography, session state and the enrol and
+verify state machines. It performs no I/O.
+_Avoid_: library, engine, backend

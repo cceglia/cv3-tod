@@ -1,0 +1,15 @@
+controlvault3
+Copyright (c) 2026 Cristiano
+
+The protocol implemented here was reverse-engineered by the author of
+https://github.com/japananimetime/controlvault3-linux-fingerprint, released under the MIT licence.
+Their write-up (docs/secure-channel.md) and reference implementation documented the secure channel,
+the frame layout and the command sequences; the constants in
+crates/cv3-core/src/proto.rs derive from that work, and this project exists because it was
+published.
+
+That project's code is not vendored here. It is kept locally, outside version control, as the
+reference this implementation is checked against.
+
+No vendor code, firmware or key material from Broadcom, Dell or Canonical is included or
+redistributed.

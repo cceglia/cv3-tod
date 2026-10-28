@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["crates/cv3-core", "crates/cv3-probe"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT"

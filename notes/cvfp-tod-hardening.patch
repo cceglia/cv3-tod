@@ -1,0 +1,77 @@
+diff --git a/driver/cvfp-tod.c b/driver/cvfp-tod.c
+index 6bca19b..2f3cd52 100644
+--- a/driver/cvfp-tod.c
++++ b/driver/cvfp-tod.c
+@@ -108,11 +108,17 @@ static int cvfp_build_wrapped (FpiDeviceCvfp *self, guint8 *out, guint cmd, guin
+   guint8 macKey[32]; SHA256 (MAC_SEED,23,macKey);
+   guint8 iv[16]; RAND_bytes (iv,16);
+   int ctlen = ((ptlen/16)+1)*16, total = 44+ctlen;
++  guint8 macin[256]; guint8 token[32]; guint8 pt[256]; guint8 ct[512];
++  /* All callers pass constant lengths that fit; assert it anyway so a future caller with a
++     variable tlv cannot silently smash macin/pt/out. */
++  if (tlvlen < 0 || ptlen < 1 || tlvlen + 32 > ptlen || ptlen > (int) sizeof pt ||
++      44 + tlvlen + 4 > (int) sizeof macin || ctlen > (int) sizeof ct || total > 256)
++    return -1;
+   cvfp_hdr (out,cmd,attr,0x02,handle,total); memcpy (out+24,iv,16); p32 (out+40,tlvlen);
+-  guint8 macin[256]; memcpy (macin,out,44); memcpy (macin+44,tlv,tlvlen); p32 (macin+44+tlvlen,suffix);
+-  guint8 token[32]; guint tl; HMAC (EVP_sha256(),macKey,32,macin,44+tlvlen+4,token,&tl);
+-  guint8 pt[256]; memset (pt,0,ptlen); memcpy (pt,tlv,tlvlen); memcpy (pt+tlvlen,token,32);
+-  guint8 ct[512]; int clen = cvfp_aes (self,1,iv,pt,ptlen,ct); if (clen<0) return -1;
++  memcpy (macin,out,44); memcpy (macin+44,tlv,tlvlen); p32 (macin+44+tlvlen,suffix);
++  guint tl; HMAC (EVP_sha256(),macKey,32,macin,44+tlvlen+4,token,&tl);
++  memset (pt,0,ptlen); memcpy (pt,tlv,tlvlen); memcpy (pt+tlvlen,token,32);
++  int clen = cvfp_aes (self,1,iv,pt,ptlen,ct); if (clen<0) return -1;
+   memcpy (out+44,ct,clen); return total;
+ }
+ /* build an UNWRAPPED session frame (0x8A, 0x04, 0x68) into f; returns its length */
+@@ -122,8 +128,12 @@ static int cvfp_build_plain (guint8 *f, guint cmd, guint attr, guint32 hdr_handl
+ }
+ 
+ /* --- decrypt a wrapped reply; find a TLV value of a given size ------------------------------- */
++/* CVFP_MAX_PT bounds the plaintext: every caller passes a 512-byte stack buffer and rlen is
++   only capped at sizeof self->rb (8192), so a long device frame would otherwise overflow it. */
++#define CVFP_MAX_PT 512
+ static int cvfp_unwrap (FpiDeviceCvfp *self, guint8 *pt){
+   if (self->rlen < 44+16) return -1; int cl = self->rlen - 44; if (cl % 16) return -1;
++  if (cl > CVFP_MAX_PT) return -1;
+   return cvfp_aes (self, 0, self->rb+24, self->rb+44, cl, pt);
+ }
+ static gboolean cvfp_find_param (const guint8 *pt, int pl, int want, guint8 *out){
+@@ -214,7 +224,9 @@ static int build_68_final (FpiDeviceCvfp *self, guint8 *f){
+   return cvfp_build_plain (f,0x68,0x44,0,t,12);
+ }
+ static int build_04_close (FpiDeviceCvfp *self, guint8 *f){
+-  cvfp_hdr (f,0x04,0x40,0x04,0,56); p32 (f+40,12); p32 (f+48,4); p32 (f+52,self->handle); return 56;
++  /* +44 is the TLV tag; without this it stayed stack garbage on the open-failure teardown path
++     (TD_CANCEL is skipped there, so nothing else writes f) and was sent to the chip. */
++  cvfp_hdr (f,0x04,0x40,0x04,0,56); p32 (f+40,12); p32 (f+44,0); p32 (f+48,4); p32 (f+52,self->handle); return 56;
+ }
+ 
+ static void fail_wrap (FpiSsm *ssm){
+diff --git a/pam/cvfp-verify.c b/pam/cvfp-verify.c
+index 809dbc9..b4308d4 100644
+--- a/pam/cvfp-verify.c
++++ b/pam/cvfp-verify.c
+@@ -106,7 +106,9 @@ static int build_wrapped(unsigned char*out,unsigned cmd,unsigned attr,unsigned h
+     unsigned char ct[512]; int clen=aescbc(1,iv,pt,ptlen,ct); if(clen<0) return -1;
+     memcpy(out+44,ct,clen); return total;
+ }
+-static int unwrap(unsigned char*pt){ if(rlen<44+16) return -1; int cl=rlen-44; if(cl%16) return -1; return aescbc(0,rb+24,rb+44,cl,pt); }
++// Callers pass a 512-byte buffer while rlen is only bounded by sizeof rb (8192): clamp, or a long
++// device reply is a stack overflow in this setuid-root helper.
++static int unwrap(unsigned char*pt){ if(rlen<44+16) return -1; int cl=rlen-44; if(cl%16) return -1; if(cl>512) return -1; return aescbc(0,rb+24,rb+44,cl,pt); }
+ 
+ // --- teardown + recovery ---------------------------------------------------------------------
+ static void tear_down(void){          // cancel a pending capture and close the session, quickly
+diff --git a/tools/cvchan.c b/tools/cvchan.c
+index 730b951..cd35869 100644
+--- a/tools/cvchan.c
++++ b/tools/cvchan.c
+@@ -220,6 +220,7 @@ static int unwrap_reply(unsigned char *pt){
+     if(rlen < 44+16) return -1;
+     int clen = rlen - 44;                 // ciphertext = everything after the header
+     if(clen <= 0 || clen % 16) return -1;
++    if(clen > 512) return -1;             // callers pass pt[512]; rlen is only bounded by sizeof rb
+     return aes_cbc(0, rb+24, rb+44, clen, pt);   // aes_cbc strips PKCS7
+ }
+ 

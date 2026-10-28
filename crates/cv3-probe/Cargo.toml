@@ -1,0 +1,14 @@
+[package]
+name = "cv3-probe"
+description = "cvctl: drives the ControlVault 3 sensor directly, one command at a time"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cvctl"
+path = "src/main.rs"
+
+[dependencies]
+cv3-core = { path = "../cv3-core" }
