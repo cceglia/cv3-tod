@@ -117,7 +117,14 @@ pub fn validate(buf: &[u8]) -> Result<Header, FrameError> {
 
 /// Builds an unwrapped frame: the declared parameter length is the parameter length.
 pub fn build_plain(cmd: u16, attr: u8, handle: u32, param: &[u8]) -> Vec<u8> {
-    build(Encoding::Plain, cmd, attr, handle, param.len() as u32, param)
+    build(
+        Encoding::Plain,
+        cmd,
+        attr,
+        handle,
+        param.len() as u32,
+        param,
+    )
 }
 
 /// Builds a wrapped frame from already-encrypted parameters.
@@ -250,10 +257,7 @@ mod tests {
     fn short_and_bad_magic_are_rejected() {
         assert!(matches!(
             Header::parse(&[0u8; HEADER_LEN - 1]),
-            Err(FrameError::Short {
-                got: 43,
-                need: 44
-            })
+            Err(FrameError::Short { got: 43, need: 44 })
         ));
 
         let mut frame = build_plain(cmd::CHALLENGE, attr::CHALLENGE, 0, &[0u8; 24]);

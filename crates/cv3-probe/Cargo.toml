@@ -6,9 +6,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "cv3_probe"
+path = "src/lib.rs"
+
 [[bin]]
 name = "cvctl"
 path = "src/main.rs"
 
 [dependencies]
 cv3-core = { path = "../cv3-core" }
+nusb = "=0.2.9"
+signal-hook = "=0.4.5"
