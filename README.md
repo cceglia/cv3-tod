@@ -88,11 +88,12 @@ exiting. `verify` prints the raw verdict word with its meaning (`verdict 1 (matc
 length and the decrypted plaintext length, then runs the same teardown. The value's meaning is not
 established, and `verify` does not yet compare it with anything: ticket 10 owns id binding.
 
-`cvctl cancel-then-verify` owns one session and runs the sequence that settles the wrap-sequence
+`cvctl cancel-then-verify` owns one session and runs the sequence that can settle the wrap-sequence
 question: it arms a capture, cancels it with the mid-session `0x68` before any finger, then runs a
 full verification in the same session and prints its verdict the way `verify` does. An arm that
 answers `0x85` is consumed, cancelled and re-armed, which is the case the two readings of the rule
-disagree about. See `docs/protocol-notes.md`.
+disagree about; the current reading is still unmeasured, and the run settles it only when that
+`0x85` case actually occurs. See `docs/protocol-notes.md`.
 
 `handshake --show-key` adds the derived session key to the ordinary report. Without the flag only
 its short fingerprint is printed, because the key is freshly generated for the run and sensitive.
