@@ -20,12 +20,12 @@
 //!
 //! # What the verdict is not
 //!
-//! The 20-byte value at `+32` is reported as [`Verdict::value`] and is **not** an id, an enrolment
-//! id, or a binding. The reference calls it a biometric-derived hash; the SPEC says the driver
-//! assumes nothing about it until ticket 09 measures it. The id comparison that makes a match
-//! belong to a specific print is ticket 10's work and is not implemented here: [`Verdict::matched`]
-//! is derived from the verdict word alone, and a later ticket must not mistake the value for a
-//! binding.
+//! The 20-byte value at `+32` is reported as [`Verdict::value`]; its meaning is unestablished and
+//! it is not interpreted here as an id or a binding. The reference calls it a biometric-derived
+//! hash; the SPEC says the driver assumes nothing about it until ticket 09 measures it. The id
+//! comparison that makes a match belong to a specific print is ticket 10's work and is not
+//! implemented here: [`Verdict::matched`] is derived from the verdict word alone, and a later
+//! ticket must not mistake the value for a binding.
 //!
 //! # Teardown
 //!

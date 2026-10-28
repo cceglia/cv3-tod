@@ -20,7 +20,7 @@ this is a probe, not a login driver.
 | `capture` | Arms `0x66`, waits for the finger, reads the sample hash and tears the session down. |
 | `enroll` | Discards, starts, captures, submits, commits and prints the template id it now holds. |
 | `verify` | Captures and matches `0x73`, printing the raw verdict word, the 20-byte value and the reply lengths. |
-| `cancel-then-verify` | Cancels a capture mid-session and verifies in the same session; it settles the wrap-sequence question. |
+| `cancel-then-verify` | Cancels a capture mid-session and verifies in the same session; it is the run that can settle the wrap-sequence question when the first arm answers `0x85`, and the current reading is unmeasured. |
 | `handshake`/`open`/`close --record` | Writes a wire-only transcript; `cvctl replay <file>` reproduces it without hardware. |
 
 ## Layout
@@ -36,9 +36,10 @@ this is a probe, not a login driver.
 
 ## Reference material (not part of the build)
 
-`extracted/`, `*.deb`, `tmp/` and `notes/` hold the vendor blob, the downloaded packages, an audited
-third-party C implementation and the audit of it. They are reference only: never built, never
-installed, excluded from the crates and from git.
+`extracted/`, `*.deb` and `tmp/` hold the vendor blob, the downloaded packages and an audited
+third-party C implementation; they are reference only, never built, never installed, and excluded
+from the crates and from git. `notes/` is tracked reference material — the audit of that
+implementation and extracted strings — and is likewise not part of the build.
 
 `*.cvrec` files written by `cvctl ... --record` are local recordings of one real session. They
 are **wire-only**: handshake, open and close only, storing the frames as they went on the wire but

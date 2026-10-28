@@ -45,9 +45,9 @@ accepted sample; the enrolment records which of the two it used.
 _Avoid_: template name, print id
 
 **Match id**:
-The 20-byte value the sensor returns alongside a positive match. It is not the enrolment id and the two
-are not comparable; what it is derived from, and whether it is stable across sessions, is not
-established.
+The 20-byte value the sensor returns alongside a positive match. The reference claims it is not the
+enrolment id and that the two are not comparable; that claim is unestablished. What it is derived
+from, and whether it is stable across sessions, is likewise unestablished.
 _Avoid_: matched id
 
 **Bound print**:

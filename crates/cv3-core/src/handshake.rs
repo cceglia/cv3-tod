@@ -40,7 +40,11 @@ pub use crate::session::{Session, SessionKey};
 pub const NONCE_LEN: usize = 20;
 /// Length of the device's P-256 public key (`X || Y`).
 pub const DEVICE_PUBLIC_LEN: usize = 64;
-/// Length of the whole `0x23` reply body: 44-byte header plus 148 parameter bytes.
+/// The shortest `0x23` reply body the handshake reads: 44-byte header plus 148 parameter bytes.
+///
+/// A genuine reply may be longer — the reference describes a 24-byte device nonce after the 128
+/// static bytes — so a longer body is accepted and the fixed offsets below still decide what is
+/// read. The transport caps the announcement at its own maximum.
 pub const CHALLENGE_REPLY_LEN: usize = HEADER_LEN + 148;
 /// Length of the derived AES-128 session key.
 pub const SESSION_KEY_LEN: usize = crypto::SESSION_KEY_LEN;
@@ -60,8 +64,6 @@ pub enum HandshakeError {
     RejectedResponse(u32),
     /// A reply is too short to carry what the handshake reads.
     ShortReply { got: usize, need: usize },
-    /// A reply is longer than the fixed handshake body.
-    OversizedReply { got: usize, max: usize },
     /// A reply's header does not validate.
     MalformedFrame(FrameError),
     /// The device's public key is not a valid P-256 point.
@@ -88,9 +90,6 @@ impl fmt::Display for HandshakeError {
                 "sensor rejected the 0x24 response with status {status:#04x}"
             ),
             Self::ShortReply { got, need } => write!(f, "reply is {got} bytes, needs {need}"),
-            Self::OversizedReply { got, max } => {
-                write!(f, "reply is {got} bytes, more than the {max} allowed")
-            }
             Self::MalformedFrame(error) => write!(f, "malformed reply frame: {error}"),
             Self::InvalidDeviceKey => f.write_str("device public key is not a valid P-256 point"),
             Self::Transport(error) => write!(f, "transport failed: {error}"),
@@ -205,12 +204,6 @@ impl Handshake {
             return self.finish(Err(HandshakeError::ShortReply {
                 got: body.len(),
                 need: CHALLENGE_REPLY_LEN,
-            }));
-        }
-        if body.len() > CHALLENGE_REPLY_LEN {
-            return self.finish(Err(HandshakeError::OversizedReply {
-                got: body.len(),
-                max: CHALLENGE_REPLY_LEN,
             }));
         }
 
@@ -390,10 +383,15 @@ mod tests {
     }
 
     fn challenge_reply(status: u32) -> Vec<u8> {
-        let mut param = [0u8; 148];
+        challenge_reply_with_trailing(status, 0)
+    }
+
+    /// A `0x23` reply with `trailing` extra parameter bytes after the 148 the handshake reads.
+    fn challenge_reply_with_trailing(status: u32, trailing: usize) -> Vec<u8> {
+        let mut param = vec![0u8; 148 + trailing];
         param[..DEVICE_PUBLIC_LEN].copy_from_slice(&device_public());
         param[DEVICE_PUBLIC_LEN..DEVICE_PUBLIC_LEN + 64].fill(0xcc);
-        param[128..].copy_from_slice(&device_nonce());
+        param[128..128 + NONCE_LEN].copy_from_slice(&device_nonce());
         frame::build_plain_reply(cmd::CHALLENGE, attr::CHALLENGE, HANDLE, status, &param)
     }
 
@@ -593,17 +591,40 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_challenge_reply_is_rejected() {
+    fn a_challenge_reply_past_the_fixed_body_derives_the_same_key() {
         let mut operation = handshake(client_nonce());
         let _ = operation.start();
-        let body = frame::build_plain(cmd::CHALLENGE, attr::CHALLENGE, HANDLE, &[0u8; 149]);
 
+        // The reference describes a 24-byte device nonce after the 128 static bytes, so a genuine
+        // reply can run past the 192 the fixed offsets cover. Extra bytes must not stop the
+        // handshake nor move what it reads.
+        let response = expect_send(operation.step(Event::Reply {
+            status: 0,
+            body: challenge_reply_with_trailing(0, 4),
+        }));
+        let mut expected_response = [0u8; 84];
+        expected_response[..NONCE_LEN].copy_from_slice(&host_nonce());
+        expected_response[NONCE_LEN..].copy_from_slice(&host_public());
         assert_eq!(
-            expect_finish(operation.step(Event::Reply { status: 0, body })),
-            Err(HandshakeError::OversizedReply {
-                got: CHALLENGE_REPLY_LEN + 1,
-                max: CHALLENGE_REPLY_LEN,
-            })
+            response,
+            frame::build_plain(
+                cmd::CHALLENGE_RESPONSE,
+                attr::CHALLENGE_RESPONSE,
+                HANDLE,
+                &expected_response
+            )
+        );
+
+        let _ = expect_send(operation.step(Event::Reply {
+            status: 0,
+            body: response_reply(0),
+        }));
+        let session = expect_finish(operation.step(Event::ReplyWithoutBody)).expect("success");
+
+        // The same vector key as the 192-byte reply: the trailing bytes are not in the schedule.
+        assert_eq!(
+            session.key().as_bytes(),
+            &unhex::<16>("6352f380005c4ebf33ce5ae1aad71e6f")
         );
     }
 

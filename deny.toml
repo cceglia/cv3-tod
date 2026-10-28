@@ -1,9 +1,10 @@
-# `cargo-deny`: RustSec advisories and the licence set of the pinned dependencies.
+# `cargo-deny`: RustSec advisories, the licence set of the pinned dependencies, and the crate bans.
 #
 # The SPEC's "Dependencies" section promises that the pinned set is audited in CI for advisories
-# and licences. The workflow runs this file through `EmbarkStudios/cargo-deny-action`; the
-# per-crate rule that no transport crate may reach the core stays in `./scripts/check-core.sh`,
-# because `[bans]` applies to the whole graph and `cv3-probe` legitimately depends on `nusb`.
+# and licences. The workflow runs this file through `EmbarkStudios/cargo-deny-action` with
+# `check advisories bans licenses`; the per-crate rule that no transport crate may reach the core
+# stays in `./scripts/check-core.sh`, because `[bans]` applies to the whole graph and `cv3-probe`
+# legitimately depends on `nusb`.
 
 [graph]
 all-features = true

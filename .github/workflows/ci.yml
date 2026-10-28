@@ -22,6 +22,6 @@ jobs:
       - name: Advisories and licences
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check advisories licenses
+          command: check advisories bans licenses
       - name: Core dependency and unsafe checks
         run: ./scripts/check-core.sh
