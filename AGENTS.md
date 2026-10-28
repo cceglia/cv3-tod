@@ -1,3 +1,9 @@
+## Response style
+
+Be concise. No walls of text. Prefer short paragraphs and a few bullets; use a table only when it
+carries real structure. No preamble, no restating the question, no summarising work that the diff or
+the files already show. If a reply needs more than roughly a screen, cut it or ask.
+
 ## Agent skills
 
 ### Issue tracker
