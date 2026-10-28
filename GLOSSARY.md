@@ -18,8 +18,8 @@ command. It has a handle and a key schedule derived during the handshake; it is 
 _Avoid_: channel, tunnel
 
 **Wrap sequence**:
-The counter that both sides advance once per encrypted command accepted within a session. A
-mismatched counter makes the sensor reject the command.
+The counter that the driver and the sensor keep in step while a session is open. A command carrying a
+mismatched counter is rejected.
 _Avoid_: nonce, sequence number, counter
 
 **Light wedge** / **Deep wedge**:
