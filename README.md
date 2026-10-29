@@ -72,15 +72,35 @@ formatting, clippy, the workspace tests, and `cargo-deny` for RustSec advisories
 ## The TOD plugin
 
 `crates/cv3-tod` builds `libcv3_tod.so`, a libfprint TOD driver. At this milestone it only makes
-the sensor appear to `fprintd` as a reader: the class id is `cv3`, the full name names the
-Dell/Broadcom ControlVault 3, the id table matches `0a5c:5843`, the scan type is press, and the
+the sensor appear to `fprintd` as a reader: the class id is `cv3`, the class full name names the
+Dell/Broadcom ControlVault 3, the device name — the one `fprintd-list` prints — is
+`Dell/Broadcom ControlVault 3`, the id table matches `0a5c:5843`, the scan type is press, and the
 probe completes without touching USB. No session, enrol or verify exists yet and the device
-advertises no feature, so clients list the reader but cannot claim or open it: `fp_device_open`
-fails with `NOT_SUPPORTED` and `fprintd` stays up. Claiming and the operations arrive with
-ticket 12.
+advertises no feature, so clients list the reader but cannot claim or open it. Claiming and the
+operations arrive with ticket 12.
+
+`fp_device_open` fails with `NOT_SUPPORTED` from the plugin's `open` vfunc. libfprint opens the
+GUsb handle *before* calling that vfunc and only `fpi_device_close_complete` closes it, and
+`fprintd` does not close a device whose open failed, so the vfunc first releases the handle: a leak
+there would leave the sensor open in the root daemon and make the next Claim fail with "Device is
+already open".
+
+`fprintd` 1.94 maps every open failure to `net.reactivated.Fprint.Error.Internal`, so the
+`NOT_SUPPORTED` libfprint reports is not surfaced under that name. A failed Claim looks like this:
+
+```console
+$ fprintd-enroll "$USER"
+Using device Dell/Broadcom ControlVault 3
+failed to claim device: Open failed with error: cv3: opening the sensor needs the session (ticket 12)
+```
+
+`fprintd-enroll` exits non-zero. The daemon keeps running with the same `MainPID`, a second
+`fprintd-enroll` prints the same open error rather than "Device is already open", and
+`fprintd-list "$USER"` still lists `Dell/Broadcom ControlVault 3` (the device name; it never prints
+the driver id `cv3`).
 
 ```sh
-./scripts/build-plugin.sh      # cargo build, then a check of the TOD symbol versions
+./scripts/build-plugin.sh      # cargo build, the TOD version check, and the class/open check
 ./scripts/install-plugin.sh    # build, then copy one .so into the TOD drivers directory
 ./scripts/uninstall-plugin.sh  # delete that one file
 ```
@@ -94,15 +114,22 @@ can own the reader; that is also a single file. A relative `CV3_TOD_DIR` is reso
 directory you run the script from.
 
 `./scripts/check-tod-link.sh` (run by `build-plugin.sh`) inspects the built object with
-`readelf -sW` and fails when a `fpi_*` import is unversioned or binds a version older than the
-library's default. That is the trap where `fpi_ssm_new_full` silently binds the legacy 4-argument
-`@LIBFPRINT_TOD_1.0.0` thunk and crashes `fprintd` inside `fp_device_open`.
+`readelf -sW` and fails when a `fpi_*` import is unversioned or binds any version other than the
+library's default, older or newer. That is the trap where `fpi_ssm_new_full` silently binds the
+legacy 4-argument `@LIBFPRINT_TOD_1.0.0` thunk and crashes `fprintd` inside `fp_device_open`.
+
+`./scripts/check-tod-class.sh` (also run by `build-plugin.sh`, so CI runs it) checks what the link
+check cannot. It `g_module_open`s the built object, reads the class, and requires `open`, `close`
+and `enroll` to be non-NULL — libfprint calls those three through the class pointer without a NULL
+check — then, under an `LD_PRELOAD` fake for gusb's `g_usb_device_open`/`g_usb_device_close`, calls
+`fp_device_open_sync` twice: both must report `NOT_SUPPORTED`, and neither may say "already open".
+It needs no root, no sensor and no USB.
 
 Verify, after installing and restarting the daemon (`sudo systemctl restart fprintd`):
 
 ```sh
-fprintd-list "$USER"     # reports the cv3 reader (with no prints enrolled)
-fprintd-enroll "$USER"   # must fail cleanly with NOT_SUPPORTED and leave fprintd running
+fprintd-list "$USER"     # lists Dell/Broadcom ControlVault 3 (with no prints enrolled)
+fprintd-enroll "$USER"   # exits non-zero with the claim error shown above; fprintd keeps running
 ```
 
 Uninstall by deleting the one file (`./scripts/uninstall-plugin.sh`, or `sudo rm` with the path it

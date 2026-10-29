@@ -10,25 +10,20 @@
 
 set -eu
 
-tod_dir=${CV3_TOD_DIR:-"$(pkg-config --variable=libdir libfprint-2-tod-1)/libfprint-2/tod-1"}
-case $tod_dir in
-/*) ;;
-*) tod_dir=$(pwd)/$tod_dir ;;
-esac
-installed=$tod_dir/libfprint-2-tod-1-cv3.so
+caller_dir=$(pwd)
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$script_dir/tod-lib.sh"
 
-# Prints an argument shell-quoted, for a command the reader pastes into a root shell.
-quote() {
-    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
-}
+driver_dir=$(tod_dir)
+installed=$driver_dir/$tod_plugin_name
 
 if [ ! -e "$installed" ]; then
     echo "not installed: $installed"
     exit 0
 fi
 
-if [ ! -w "$tod_dir" ]; then
-    echo "error: $tod_dir is not writable; remove it as root:" >&2
+if [ ! -w "$driver_dir" ]; then
+    echo "error: $driver_dir is not writable; remove it as root:" >&2
     printf '  sudo rm -f %s\n' "$(quote "$installed")" >&2
     exit 1
 fi

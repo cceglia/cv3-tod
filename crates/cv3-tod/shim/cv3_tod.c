@@ -45,7 +45,7 @@ cv3_tod_probe (FpDevice *device)
    * about a reader that supports nothing yet, instead of being offered a capture that cannot run.
    */
   fpi_device_update_features (device, FP_DEVICE_FEATURE_CAPTURE, FP_DEVICE_FEATURE_NONE);
-  fpi_device_probe_complete (device, NULL, "Dell/Broadcom ControlVault 3", NULL);
+  fpi_device_probe_complete (device, NULL, CV3_TOD_DEVICE_NAME, NULL);
 }
 
 static void
@@ -55,7 +55,20 @@ cv3_tod_open (FpDevice *device)
    * fprintd's Claim takes. Without a body here that dereference is NULL and fprintd dies as root;
    * failing the open cleanly reports the error to the client and leaves fprintd and the reader
    * listed. The session, and with it a successful open, arrives with ticket 12.
+   *
+   * fp_device_open calls g_usb_device_open itself, before this vfunc, and
+   * fpi_device_open_complete does not undo that; only fpi_device_close_complete closes the handle.
+   * fprintd does not close a device whose open failed, so a failure that leaves the handle open
+   * makes every later Claim fail with "Device is already open" and keeps the sensor claimed by the
+   * root daemon. The failure path therefore releases the handle here. Nothing else is held: this
+   * milestone claims no interface and starts no transfer, so there is nothing else to undo. A
+   * second close is harmless — gusb reports it as not open and the error is dropped.
    */
+  GUsbDevice *usb = fpi_device_get_usb_device (device);
+
+  if (usb != NULL)
+    g_usb_device_close (usb, NULL);
+
   fpi_device_open_complete (device,
                             fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
                                                       "cv3: opening the sensor needs the session (ticket 12)"));

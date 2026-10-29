@@ -23,9 +23,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
         run: cargo test --workspace
-      # Builds the cdylib and checks with readelf that every fpi_* import bound the library's
-      # default version rather than the legacy thunk.
-      - name: TOD plugin build and link check
+      # Builds the cdylib, checks with readelf that every fpi_* import bound the library's default
+      # version rather than the legacy thunk, and loads the built object to check the class and the
+      # two failed opens under a fake GUsb handle (scripts/check-tod-class.sh).
+      - name: TOD plugin build, link and class checks
         run: ./scripts/build-plugin.sh
       - name: Advisories and licences
         uses: EmbarkStudios/cargo-deny-action@v2
