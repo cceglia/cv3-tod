@@ -566,13 +566,33 @@ impl HandshakeSensor {
         }
     }
 
+    /// The first `u32` in the type-2 array of the most recent match request, if it named one.
+    fn requested_handle(&self) -> Option<u32> {
+        let tlvs = self.match_tlvs.borrow();
+        let tlv = tlvs.last()?;
+        let scan = cv3_core::tlv::scan_tlv(tlv);
+        let entry = scan.entries.iter().find(|entry| entry.tag == 2)?;
+        if entry.value.len() < 4 {
+            return None;
+        }
+        Some(u32::from_le_bytes([
+            entry.value[0],
+            entry.value[1],
+            entry.value[2],
+            entry.value[3],
+        ]))
+    }
+
     fn match_reply(&self, command: u16) -> Reply {
         let plaintext = self.match_plaintext.clone().unwrap_or_else(|| {
+            // A sensor answers with the template it matched; the fake echoes one of the handles
+            // the request named so a binding test exercises the id it asked about.
+            let handle = self.requested_handle().unwrap_or(MATCHED_HANDLE);
             let mut plaintext = vec![0u8; 56];
             plaintext[4..8].copy_from_slice(&4u32.to_le_bytes());
             plaintext[8..12].copy_from_slice(&1u32.to_le_bytes());
             plaintext[16..20].copy_from_slice(&4u32.to_le_bytes());
-            plaintext[20..24].copy_from_slice(&MATCHED_HANDLE.to_le_bytes());
+            plaintext[20..24].copy_from_slice(&handle.to_le_bytes());
             plaintext
         });
         Reply {

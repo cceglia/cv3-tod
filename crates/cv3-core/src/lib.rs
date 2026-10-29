@@ -26,6 +26,7 @@ pub mod frame;
 pub mod handshake;
 pub mod inventory;
 pub mod operation;
+pub mod print;
 pub mod proto;
 pub mod session;
 pub mod tlv;
@@ -51,6 +52,10 @@ pub use inventory::{
     TLV_ALIGNMENT, TLV_HEADER_LEN, TlvEntry, TlvScan, inventory_tlv, scan_tlv,
 };
 pub use operation::Operation;
+pub use print::{
+    MATCH_REPLY_PLAINTEXT_LEN, PRINT_MAGIC, PRINT_PAYLOAD_LEN, PRINT_VERSION, PayloadError,
+    PrintPayload, PrintSource,
+};
 pub use session::{
     CloseError, CloseSession, OpenError, OpenSession, SequenceRule, Session, SessionKey, Teardown,
     TeardownError, UnwrapError, WrapError,

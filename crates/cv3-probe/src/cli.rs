@@ -28,7 +28,7 @@ use cv3_core::verify::{
     MATCHED_HANDLE_OFFSET, MatchError, VERDICT_MATCH, VERDICT_NO_MATCH, VERDICT_OFFSET, Verdict,
     Verification, Verify, VerifyError,
 };
-use cv3_core::{Action, Operation};
+use cv3_core::{Action, Operation, PrintPayload, PrintSource};
 
 use crate::discovery::{CommandSession, ProbeError, UsbBackend, open_for_command, probe};
 use crate::hexdump::HexTransport;
@@ -1325,7 +1325,7 @@ fn enroll_then_verify_over(
     secrets: RunSecrets,
     options: EnrollThenVerifyOptions<'_>,
     out: &mut dyn Write,
-) -> Result<(Verdict, Result<(), TeardownError>), EnrollThenVerifyFailure> {
+) -> Result<Confirmation, EnrollThenVerifyFailure> {
     let EnrollThenVerifyOptions {
         open_iv,
         enrol_iv,
@@ -1364,6 +1364,7 @@ fn enroll_then_verify_over(
     }
     // The commit reply names the handle identify matches on. Use it unless the caller named
     // handles or a command themselves; the hash form stays the fallback when the reply has none.
+    let template_id_for_payload = template_id;
     let (match_command, handles, template_id) = match (command_explicit, handles, handle) {
         (false, [], Some(handle)) => {
             let _ = writeln!(out, "commit handle {handle:#010x}");
@@ -1387,10 +1388,33 @@ fn enroll_then_verify_over(
         Ok(Verification { verdict, session }) => {
             let mut teardown = Teardown::new(session.handle);
             drop(session);
-            Ok((verdict, drive(&mut teardown, transport)))
+            let payload = handles.first().map(|handle| {
+                let source = match source {
+                    TemplateSource::SampleHash | TemplateSource::ForcedSampleHash => {
+                        PrintSource::SampleHash
+                    }
+                    TemplateSource::EnrolmentId => PrintSource::EnrolmentId,
+                };
+                PrintPayload::bound(template_id_for_payload, source, *handle)
+            });
+            Ok(Confirmation {
+                verdict,
+                handles,
+                payload,
+                teardown: drive(&mut teardown, transport),
+            })
         }
         Err(error) => Err(EnrollThenVerifyFailure::Verify(error)),
     }
+}
+
+/// One enrol-then-verify confirmation: the verdict, the handles it was asked about and, when the
+/// commit named one, the print record the confirmation would store.
+struct Confirmation {
+    verdict: Verdict,
+    handles: Vec<u32>,
+    payload: Option<PrintPayload>,
+    teardown: Result<(), TeardownError>,
 }
 
 /// Runs the ticket-09 measurement: enrol, commit, confirmation touch and match in one session.
@@ -1450,16 +1474,35 @@ fn enroll_then_verify(
     );
 
     let code = match outcome {
-        Ok((verdict, teardown)) => {
-            print_verdict(&verdict, out);
+        Ok(confirmation) => {
+            let Confirmation {
+                verdict,
+                handles,
+                payload,
+                teardown,
+            } = confirmation;
+            print_verdict(&verdict, &handles, out);
+            let accepted = match &payload {
+                Some(payload) => {
+                    let _ = writeln!(out, "print payload {}", hex(&payload.encode()));
+                    let accepted = payload.accepts(&verdict);
+                    let _ = writeln!(
+                        out,
+                        "print {}",
+                        if accepted {
+                            "accepted: the confirmation matched its recorded id"
+                        } else {
+                            "rejected: the confirmation did not match its recorded id"
+                        }
+                    );
+                    accepted
+                }
+                None => binding_accepts(&verdict, &handles),
+            };
             if let Err(error) = teardown {
                 let _ = writeln!(err, "cvctl: {error}");
             }
-            if verdict.matched {
-                EXIT_OK
-            } else {
-                EXIT_NO_MATCH
-            }
+            if accepted { EXIT_OK } else { EXIT_NO_MATCH }
         }
         Err(EnrollThenVerifyFailure::Handshake(error)) => {
             let _ = writeln!(err, "cvctl: handshake failed: {error}");
@@ -1661,7 +1704,7 @@ fn print_match_failure(error: &VerifyError, out: &mut dyn Write) {
 /// caller meant to send. The status is printed raw because it is the measurement: `0x00` and the
 /// vendor-special-cased `0x89` are both answered, and only a hardware run settles which one a match
 /// carries.
-fn print_verdict(verdict: &Verdict, out: &mut dyn Write) {
+fn print_verdict(verdict: &Verdict, handles: &[u32], out: &mut dyn Write) {
     let _ = writeln!(out, "command 0x{:02x}", verdict.command);
     let _ = writeln!(out, "status 0x{:02x}", verdict.status);
     let _ = writeln!(out, "{}", verdict_line(verdict.word));
@@ -1675,8 +1718,41 @@ fn print_verdict(verdict: &Verdict, out: &mut dyn Write) {
     }
     let _ = writeln!(out, "reply length {}", verdict.reply_len);
     let _ = writeln!(out, "plaintext length {}", verdict.plaintext_len);
+    if !handles.is_empty() {
+        let _ = writeln!(out, "{}", binding_line(verdict, handles));
+    }
     if let Some(plaintext) = &verdict.plaintext {
         print_plaintext_dump(plaintext, out);
+    }
+}
+
+/// Whether the caller may treat `verdict` as a match for the handles it named.
+///
+/// Without a named handle there is nothing to bind to, so the sensor's own flag is all there is.
+/// With one, the flag is not enough: the reply must carry that exact match id.
+fn binding_accepts(verdict: &Verdict, handles: &[u32]) -> bool {
+    if !verdict.matched {
+        return false;
+    }
+    if handles.is_empty() {
+        return true;
+    }
+    verdict
+        .matched_handle
+        .is_some_and(|id| handles.contains(&id))
+}
+
+/// The `binding` line the probe prints after a verdict.
+fn binding_line(verdict: &Verdict, handles: &[u32]) -> String {
+    if handles.is_empty() {
+        return "binding not checked (no handle named)".to_owned();
+    }
+    match verdict.matched_handle {
+        Some(id) if binding_accepts(verdict, handles) => {
+            format!("binding accepted (match id {id:#010x})")
+        }
+        Some(id) => format!("binding rejected (match id {id:#010x} is not the named handle)"),
+        None => "binding rejected (the reply carries no match id)".to_owned(),
     }
 }
 
@@ -1863,15 +1939,12 @@ fn verify(
             if let Some(template_id) = flags.template {
                 let _ = writeln!(out, "match template id {}", hex(&template_id));
             }
-            print_verdict(&verdict, out);
+            print_verdict(&verdict, flags.handles, out);
+            let accepted = binding_accepts(&verdict, flags.handles);
             if let Err(error) = teardown {
                 let _ = writeln!(err, "cvctl: {error}");
             }
-            if verdict.matched {
-                EXIT_OK
-            } else {
-                EXIT_NO_MATCH
-            }
+            if accepted { EXIT_OK } else { EXIT_NO_MATCH }
         }
         Err(VerifyFailure::Handshake(error)) => {
             let _ = writeln!(err, "cvctl: handshake failed: {error}");
@@ -2020,7 +2093,7 @@ fn cancel_then_verify(
 
     let code = match outcome {
         Ok((verdict, teardown)) => {
-            print_verdict(&verdict, out);
+            print_verdict(&verdict, &[], out);
             if let Err(error) = teardown {
                 let _ = writeln!(err, "cvctl: {error}");
             }
@@ -4143,6 +4216,62 @@ mod tests {
         assert_eq!(out, "");
         assert_eq!(err, format!("{USAGE}\n"));
         assert!(usb.calls().is_empty());
+    }
+
+    #[test]
+    fn verify_binds_a_match_to_the_handle_it_named() {
+        let mut usb = FakeUsb::with_sensor();
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["verify", "--handle", "7"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert!(
+            out.contains("binding accepted (match id 0x00000007)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_match_flag_for_another_handle_is_exit_no_match() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.match_plaintext = Some(match_plaintext(1, Some(0x002f_1a08)));
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["verify", "--handle", "7"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_NO_MATCH, "{err}");
+        assert!(
+            out.contains("binding rejected (match id 0x002f1a08 is not the named handle)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn enroll_then_verify_records_a_bound_print_payload() {
+        let mut usb = FakeUsb::with_sensor();
+        usb.completion_after = Some(2);
+        usb.commit_plaintext = Some(vec![
+            3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+            4, 0, 0, 0, 0x44, 0x33, 0x22, 0x11,
+        ]);
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["enroll-then-verify"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        let payload = out
+            .lines()
+            .find_map(|line| line.strip_prefix("print payload "))
+            .expect("the payload is printed");
+        let bytes: Vec<u8> = (0..payload.len() / 2)
+            .map(|i| u8::from_str_radix(&payload[i * 2..i * 2 + 2], 16).expect("hex"))
+            .collect();
+        let print = PrintPayload::decode(&bytes).expect("the payload decodes");
+        assert_eq!(print.source(), PrintSource::EnrolmentId);
+        assert_eq!(print.enrolment_id(), &ENROLMENT_ID);
+        assert_eq!(print.match_id(), 0x1122_3344, "the commit reply's handle");
+        assert!(out.contains("print accepted: the confirmation matched its recorded id"));
     }
 
     #[test]

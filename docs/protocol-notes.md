@@ -256,9 +256,15 @@ Also measured: **a capture and a match immediately after a commit, in the same s
 `enroll-then-verify` committed handle `0x007069a9` and the confirmation touch answered `status 0x00`,
 `verdict 1`, `matched handle 0x007069a9`.
 
-Ticket 09 still owes the same-finger-twice and second-finger comparisons, which show whether the
-handle is per-enrolment (it is expected to be) and that a different finger's template cannot
-satisfy another print's handle.
+A second finger was enrolled as `0x002f1a08`. Against it, `verify --handle 0x007069a9` answered
+`verdict 0, matched handle 0`, and the first template still matched `0x007069a9` afterwards: a
+print's handle is not satisfied by another finger's template, and a second enrolment does not move
+the first handle.
+
+The driver now stores that binding in the versioned print payload (`crates/cv3-core/src/print.rs`):
+magic `CV3P`, version 1, flags, the enrolment id, and the match id. A verification is accepted only
+when the print is bound, the reply has the measured shape, the verdict is `1` and the id equals the
+recorded one. Unknown versions, foreign payloads and unbound records are typed errors.
 
 ## Inventory
 
