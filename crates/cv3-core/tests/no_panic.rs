@@ -16,7 +16,21 @@ fn exercise(bytes: &[u8]) {
     let _ = key.unwrap(bytes);
     let _ = cv3_core::capture::find_tlv_value(bytes, 20);
     let _ = cv3_core::inventory::scan_tlv(bytes);
+    let _ = cv3_core::tlv::scan_tlv(bytes);
     let _ = Transcript::from_bytes(bytes);
+}
+
+#[test]
+fn an_empty_or_lying_plaintext_scan_never_panics() {
+    for length in 0..=16 {
+        let mut plaintext = vec![0xff; length];
+        let _ = cv3_core::tlv::scan_tlv(&plaintext);
+        if length >= 8 {
+            plaintext[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+            let scan = cv3_core::tlv::scan_tlv(&plaintext);
+            assert!(scan.truncated, "a length past the end is reported");
+        }
+    }
 }
 
 fn next(state: &mut u64) -> u64 {

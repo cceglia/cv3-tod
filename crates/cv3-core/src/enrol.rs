@@ -161,6 +161,13 @@ pub struct EnrolledTemplate {
     pub source: TemplateSource,
     /// Samples the sensor accepted.
     pub accepted_samples: usize,
+    /// The decrypted `0x6E` reply body, for the probe's `--show-commit` dump.
+    ///
+    /// This is reply data, not key material, and recordings stay wire-only. It is empty when the
+    /// reply decrypted to an empty body, which is what the sensor answered on 2026-10-28.
+    pub commit_plaintext: Vec<u8>,
+    /// The raw wrapped `0x6E` reply body length, header included.
+    pub commit_reply_len: usize,
     /// The live session, with the wrap sequence already advanced by the commit reply.
     pub session: Session,
 }
@@ -686,11 +693,29 @@ impl Enrol {
                         error,
                     });
                 }
+                let unwrapped = match self.session.as_ref() {
+                    Some(session) => session.key().unwrap(&body),
+                    None => return self.finish(Err(EnrolError::AlreadyFinished)),
+                };
+                // The commit reply's plaintext is the diagnostic ticket 06 needs: the vendor's
+                // output list is a type-3 blob and the type-0 u32 that identify later names.
+                let commit_plaintext = match unwrapped {
+                    Ok(reply) => reply.plaintext,
+                    Err(error) => {
+                        return self.begin_teardown(EnrolError::MalformedReply {
+                            stage: EnrolStage::Commit,
+                            error,
+                        });
+                    }
+                };
+                let commit_reply_len = body.len();
                 match self.session.take() {
                     Some(session) => self.finish(Ok(EnrolledTemplate {
                         template_id,
                         source,
                         accepted_samples: self.progress.accepted_samples,
+                        commit_plaintext,
+                        commit_reply_len,
                         session,
                     })),
                     None => self.finish(Err(EnrolError::AlreadyFinished)),

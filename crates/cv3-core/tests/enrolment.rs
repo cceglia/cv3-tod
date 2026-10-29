@@ -995,6 +995,46 @@ fn a_bodyless_or_malformed_commit_reply_says_a_template_may_exist() {
 }
 
 #[test]
+fn the_commit_reply_plaintext_is_kept_for_the_probe() {
+    // The vendor's commit out-list is `(3, blob)(0,4,u32)`: `cvhSaveReturnValues` confirms the
+    // reply carries a type-3 blob and the type-0 u32 that identify later names.
+    let mut plaintext = Vec::new();
+    plaintext.extend_from_slice(&3u32.to_le_bytes());
+    plaintext.extend_from_slice(&8u32.to_le_bytes());
+    plaintext.extend_from_slice(&[0xaa; 8]);
+    plaintext.extend_from_slice(&0u32.to_le_bytes());
+    plaintext.extend_from_slice(&4u32.to_le_bytes());
+    plaintext.extend_from_slice(&0x1122_3344u32.to_le_bytes());
+
+    let mut transport = ScriptedTransport::default();
+    let session = opened_session(&mut transport);
+    push_discard_reply(&mut transport, &session);
+    push_start_reply(&mut transport);
+    push_arm(&mut transport, &session);
+    push_completion(&mut transport, &session);
+    let body = wrapped_reply(
+        &session,
+        cmd::COMMIT_ENROLMENT,
+        attr::SESSION,
+        0,
+        &plaintext,
+    );
+    let reply_len = body.len();
+    transport.push(ScriptedOutcome::Reply { status: 0, body });
+
+    let (outcome, _) = enrol_and_drive(&mut transport, session);
+    let template = outcome.expect("the enrolment completes");
+
+    assert_eq!(template.commit_plaintext, plaintext);
+    assert_eq!(template.commit_reply_len, reply_len);
+    assert_eq!(
+        template.commit_plaintext.len(),
+        28,
+        "the type-3 blob plus the type-0 u32"
+    );
+}
+
+#[test]
 fn a_finished_enrolment_is_inert_and_does_not_panic() {
     let mut transport = ScriptedTransport::default();
     let session = opened_session(&mut transport);

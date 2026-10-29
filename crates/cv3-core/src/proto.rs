@@ -25,11 +25,10 @@ pub mod cmd {
     pub const UPDATE_ENROLMENT: u16 = 0x6C;
     /// Commit the enrolment, storing the template.
     pub const COMMIT_ENROLMENT: u16 = 0x6E;
-    /// Verify one captured finger against one template: the vendor's `cv_do_fingerprint_verify`
-    /// sends this, and its request carries the optional template id.
+    /// Verify one captured finger against one template: the vendor's `cv_do_fingerprint_verify`.
     pub const VERIFY: u16 = 0x72;
-    /// Identify the captured finger against the sensor's store: the vendor's
-    /// `cv_do_fingerprint_identify` sends this one-to-many request, which ticket 20 owns.
+    /// Identify the captured finger against the sensor's store: the vendor's one-to-many
+    /// `cv_do_fingerprint_identify`, whose request carries `u32` template handles.
     pub const IDENTIFY: u16 = 0x73;
     /// Query the sensor's template inventory (reply format not yet decoded).
     pub const INVENTORY: u16 = 0x2F;

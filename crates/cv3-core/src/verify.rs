@@ -1,35 +1,51 @@
-//! Verification: the wrapped `0x72` request, and the capture-then-verify composition.
+//! Verification: the wrapped match request, and the capture-then-match composition.
 //!
 //! ```text
 //! host → sensor  0x66 wrapped, attr 0x47   arm a capture (a [`Capture`])
 //! sensor → host                             the finger event
-//! host → sensor  0x72 wrapped, attr 0x47   TLV 88 bytes, plaintext 128 bytes
+//! host → sensor  0x73 wrapped, attr 0x47   identify (or 0x72 for the one-to-one verify)
 //! sensor → host  wrapped reply             status 0x00 or 0x89,
 //!                                          verdict word at plaintext +8,
 //!                                          20-byte value at plaintext +32 when long enough
 //! ```
 //!
-//! `0x72` is the one-to-one verify the vendor's `cv_do_fingerprint_verify` sends. `0x73` is
-//! `cv_do_fingerprint_identify`, the one-to-many request ticket 20 owns; [`request_frame`] builds
-//! both from the same 88-byte TLV and 128-byte plaintext, so the request body is identical and
-//! only the command word changes. [`Match::with_command`] selects `0x73` for a hardware probe.
+//! # The request
 //!
-//! [`Match`] sends the five entries the audited reference sends and completes the last one:
-//! `(3, 20, template_id)`. The reference's block stops at that entry's eight-byte header, so its
-//! request is 68 bytes; on 2026-10-28 this sensor answered that truncated request with `0x59` for
-//! both an enrolled and an unenrolled finger. The sensor exposes `cv_fingerprint_verify_w_hash`,
-//! which takes a template id, so the driver supplies one (twenty zero bytes when the caller has
-//! none). **The completed 88-byte request has not been measured yet.**
+//! Disassembly of the vendor's ControlVault 3 blob shows two commands:
+//!
+//! - **`0x73` identify** (`cv_do_fingerprint_identify`) is the vendor's one-to-many match. Its
+//!   Linux path (`cvif_fingerprint_identify`) calls `cv_fingerprint_identify(handle, 0x48, 0x53e2,
+//!   0, count, ids, …)`, so the request names an array of **`u32` template handles**.
+//! - **`0x72` verify** (`cv_do_fingerprint_verify`) is the one-to-one variant.
+//!
+//! `cv_do_fingerprint_identify` builds its parameter list as
+//!
+//! ```text
+//! (0, 4, handle) (0, 4, 0x48) (0, 4, 0x53e2) (0, 4, 0)
+//! (2, 4 * count, count × u32 handle)
+//! (3, 20, hash)                     only when a hash pointer is supplied
+//! ```
+//!
+//! and each wire entry is `u32 type | u32 size | value bytes` (confirmed by `InitParam_List` and
+//! `cvhDecapsulateCmd`). [`request_tlv`] builds exactly that list. The vendor always adds the
+//! type-2 entry, so it is present even when the caller names no handle; what a zero-size entry
+//! asks the sensor to do is not established, and the next hardware run measures it.
+//!
+//! The constants this driver used before (`0x148` and `0x7b0ad3`) do not exist in the blob at all.
+//! They came from the audited reference, which targets ControlVault 2; `0x53e2` occurs exactly
+//! once in the blob, as the argument above. **The corrected request has not been measured on this
+//! sensor yet.** The 2026-10-28 runs only established that the old CV2-shaped request was refused
+//! (`0x59`), and that completing its last entry changed the status to `0x0E`.
 //!
 //! The vendor's verify special-cases status `0x89` next to `0x00`, so the driver accepts both as
 //! "the sensor answered" and decodes the body. That is all `0x89` is taken to mean: the verdict
 //! still comes from the plaintext, and [`Verdict::status`] reports the raw status so a hardware run
 //! shows which one the sensor used.
 //!
-//! The reply is wrapped and carries no MAC. Its plaintext is read at fixed offsets, never by
-//! scanning: the verdict word is the `u32` at `+8` and the value is the twenty bytes at `+32`
-//! when the plaintext is at least 52 bytes long. A reply too short for the verdict word is
-//! [`MatchError::MissingVerdict`], deliberately not a no-match.
+//! The reply is wrapped and carries no MAC. Its plaintext is read at fixed offsets for the verdict
+//! word and value, never by scanning for them; the whole plaintext is also kept for the probe's
+//! diagnostic dump. A reply too short for the verdict word is [`MatchError::MissingVerdict`],
+//! deliberately not a no-match.
 //!
 //! # What the verdict is not
 //!
@@ -55,14 +71,9 @@ use crate::crypto;
 use crate::event::{Action, Event, TransportError};
 use crate::operation::Operation;
 use crate::proto::{self, attr, cmd};
-use crate::session::{Session, Teardown, UnwrapError, WrapError};
+use crate::session::{Session, TOKEN_LEN, Teardown, UnwrapError, WrapError};
 
-/// Length of the verify request's parameter block: five full entries plus
-/// `(3, 20, template_id)`.
-pub const MATCH_TLV_LEN: usize = 88;
-/// Plaintext length the driver sends: 88 TLV bytes, the 32-byte token, zero-padded.
-pub const MATCH_PLAINTEXT_LEN: usize = 128;
-/// Length of the value at plaintext `+32`, and of the template id in the request.
+/// Length of the 20-byte value at plaintext `+32`, and of the optional hash entry in the request.
 pub const MATCH_VALUE_LEN: usize = 20;
 /// Offset of the little-endian verdict word inside the decrypted plaintext.
 pub const VERDICT_OFFSET: usize = 8;
@@ -73,54 +84,63 @@ pub const VERDICT_MATCH: u32 = 1;
 /// The verdict word that means "no match".
 pub const VERDICT_NO_MATCH: u32 = 0;
 
-/// The 88-byte verify parameter block.
+/// Length of the request's fixed part: the four `(0, 4, …)` entries and the type-2 header.
+const REQUEST_TLV_BASE_LEN: usize = 56;
+
+/// The identify request's parameter list.
 ///
-/// Five `(tag, 4, value)` entries then `(3, 20, template_id)`. The audited reference ends the
-/// block at the final entry's eight-byte header, leaving the declared value bytes absent; that
-/// 68-byte request was measured to be refused with `0x59`. Here the value is the caller's
-/// template id, or twenty zero bytes when none is supplied.
-pub fn match_tlv(handle: u32, template_id: Option<&[u8; MATCH_VALUE_LEN]>) -> [u8; MATCH_TLV_LEN] {
-    let mut tlv = [0u8; MATCH_TLV_LEN];
-    let entries: [(usize, u32, u32); 5] = [
-        (0, 0, handle),
-        (12, 0, 0x148),
-        (24, 0, 0x53e2),
-        (36, 0, 0),
-        (48, 2, 0x007b_0ad3),
-    ];
-    for (at, tag, value) in entries {
-        tlv[at..at + 4].copy_from_slice(&tag.to_le_bytes());
-        tlv[at + 4..at + 8].copy_from_slice(&4u32.to_le_bytes());
-        tlv[at + 8..at + 12].copy_from_slice(&value.to_le_bytes());
+/// Four `(0, 4, value)` entries with `handle`, `0x48`, `0x53e2` and zero; one
+/// `(2, 4 * handles.len(), handles…)` entry whose values are little-endian `u32` template handles
+/// (the entry is present with size zero when the caller names none); and, only when `hash` is
+/// `Some`, one `(3, 20, hash)` entry. There is no padding beyond the value bytes, so the length is
+/// `56 + 4 * handles.len() + if hash.is_some() { 28 } else { 0 }`.
+pub fn request_tlv(handle: u32, handles: &[u32], hash: Option<&[u8; MATCH_VALUE_LEN]>) -> Vec<u8> {
+    let mut tlv = Vec::with_capacity(
+        REQUEST_TLV_BASE_LEN + 4 * handles.len() + if hash.is_some() { 28 } else { 0 },
+    );
+    for (tag, value) in [(0u32, handle), (0, 0x48), (0, 0x53e2), (0, 0)] {
+        tlv.extend_from_slice(&tag.to_le_bytes());
+        tlv.extend_from_slice(&4u32.to_le_bytes());
+        tlv.extend_from_slice(&value.to_le_bytes());
     }
-    tlv[60..64].copy_from_slice(&3u32.to_le_bytes());
-    tlv[64..68].copy_from_slice(&(MATCH_VALUE_LEN as u32).to_le_bytes());
-    if let Some(template_id) = template_id {
-        tlv[68..88].copy_from_slice(template_id);
+    tlv.extend_from_slice(&2u32.to_le_bytes());
+    tlv.extend_from_slice(&((4 * handles.len()) as u32).to_le_bytes());
+    for handle in handles {
+        tlv.extend_from_slice(&handle.to_le_bytes());
+    }
+    if let Some(hash) = hash {
+        tlv.extend_from_slice(&3u32.to_le_bytes());
+        tlv.extend_from_slice(&(MATCH_VALUE_LEN as u32).to_le_bytes());
+        tlv.extend_from_slice(hash);
     }
     tlv
 }
 
-/// One wrapped verify request: `command`, the 88-byte TLV and a 128-byte plaintext.
+/// The wrapped plaintext length for a `tlv_len`-byte request.
 ///
-/// This is the one request builder. Verification sends [`cmd::VERIFY`] (`0x72`); [`cmd::IDENTIFY`]
-/// (`0x73`) is the one-to-many request ticket 20 owns and builds the same request body with the
-/// other command word, which is what the probe's `--command 73` measures.
+/// The TLV is followed by the 32-byte token and rounded up to a whole AES block; [`Session::wrap`]
+/// then applies PKCS#7, which always adds at least one more block. For the four request shapes this
+/// gives 96 bytes for a 56- or 60-byte TLV and 128 for an 84- or 88-byte one.
+fn request_plaintext_len(tlv_len: usize) -> usize {
+    let unpadded = tlv_len + TOKEN_LEN;
+    unpadded.div_ceil(crypto::BLOCK_LEN) * crypto::BLOCK_LEN
+}
+
+/// One wrapped match request: `command`, the vendor's parameter list and its computed plaintext.
+///
+/// This is the one request builder and it never chooses the command. The probe sends `0x73`
+/// identify by default and `0x72` verify when asked; [`Match::with_command`] is the only selector.
 pub fn request_frame(
     session: &Session,
     command: u16,
-    template_id: Option<&[u8; MATCH_VALUE_LEN]>,
+    handles: &[u32],
+    hash: Option<&[u8; MATCH_VALUE_LEN]>,
     iv: &[u8; crypto::BLOCK_LEN],
     sequence: u32,
 ) -> Result<Vec<u8>, WrapError> {
-    session.wrap(
-        command,
-        attr::CAPTURE,
-        &match_tlv(session.handle, template_id),
-        MATCH_PLAINTEXT_LEN,
-        iv,
-        sequence,
-    )
+    let tlv = request_tlv(session.handle, handles, hash);
+    let plaintext_len = request_plaintext_len(tlv.len());
+    session.wrap(command, attr::CAPTURE, &tlv, plaintext_len, iv, sequence)
 }
 
 /// A decoded verify reply.
@@ -132,7 +152,7 @@ pub fn request_frame(
 /// **unestablished** and it is not an id or a binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
-    /// The command the request carried: [`cmd::VERIFY`] normally, [`cmd::IDENTIFY`] on a probe.
+    /// The command the request carried: [`cmd::IDENTIFY`] normally, [`cmd::VERIFY`] on a probe.
     pub command: u16,
     /// The raw status the sensor answered with: `0x00`, or the `0x89` the vendor special-cases.
     pub status: u32,
@@ -142,6 +162,11 @@ pub struct Verdict {
     pub matched: bool,
     /// The twenty bytes at plaintext `+32`, when the plaintext carries them.
     pub value: Option<[u8; MATCH_VALUE_LEN]>,
+    /// The full decrypted plaintext, for the probe's diagnostic dump.
+    ///
+    /// Success always carries it; the type is optional so a caller can build a verdict-shaped
+    /// value without a body. It is reply data, not key material.
+    pub plaintext: Option<Vec<u8>>,
     /// The full decrypted plaintext length, before any interpretation.
     pub plaintext_len: usize,
     /// The raw wrapped reply body length, header included.
@@ -273,41 +298,54 @@ pub struct Match {
     session: Option<Session>,
     handle: u32,
     iv: [u8; crypto::BLOCK_LEN],
-    template_id: Option<[u8; MATCH_VALUE_LEN]>,
+    handles: Vec<u32>,
+    hash: Option<[u8; MATCH_VALUE_LEN]>,
     command: u16,
     state: MatchState,
 }
 
 impl Match {
-    /// Builds a verify for a live session that has already captured a finger.
+    /// Builds a match for a live session that has already captured a finger.
     ///
-    /// The request is the vendor's `0x72` verify. The last TLV entry carries twenty zero bytes
-    /// unless [`Self::with_template_id`] supplies the template id the enrolment committed with.
+    /// The request is the vendor's parameter list from [`request_tlv`] with no handles and no
+    /// hash, which asks for a one-to-many match against every stored template. The default command
+    /// is [`cmd::VERIFY`]; the probe always selects its command with [`Self::with_command`].
     pub fn new(session: Session, iv: [u8; crypto::BLOCK_LEN]) -> Self {
         Self {
             handle: session.handle,
             session: Some(session),
             iv,
-            template_id: None,
+            handles: Vec::new(),
+            hash: None,
             command: cmd::VERIFY,
             state: MatchState::NotStarted,
         }
     }
 
-    /// Supplies the 20-byte template id the request names.
+    /// Adds one `u32` template handle to the request's type-2 array.
     ///
-    /// `None` sends twenty zero bytes, which is the request the driver sent before the template id
-    /// was known to be part of the block. The caller that has an enrolment id should pass it.
+    /// Repeatable: each call appends one entry. The vendor's identify request matches the captured
+    /// finger against these handles, in the order supplied. No call sends the type-2 entry with
+    /// size zero, which asks the sensor to try every stored template.
+    pub fn with_template_handle(mut self, handle: u32) -> Self {
+        self.handles.push(handle);
+        self
+    }
+
+    /// Adds the optional `(3, 20, hash)` entry to the request.
+    ///
+    /// `None` omits the entry entirely, which is what the vendor builds when it has no hash
+    /// pointer. The caller that has a 20-byte hash from an enrolment should pass it.
     pub fn with_template_id(mut self, template_id: Option<[u8; MATCH_VALUE_LEN]>) -> Self {
-        self.template_id = template_id;
+        self.hash = template_id;
         self
     }
 
     /// Sends `command` instead of the default [`cmd::VERIFY`].
     ///
-    /// This exists for one measurement: [`cmd::IDENTIFY`] (`0x73`) is the one-to-many request the
-    /// audited reference called a match, and the probe compares the two frames on hardware. The
-    /// request body is identical, so the caller supplies only the command word.
+    /// [`cmd::IDENTIFY`] (`0x73`) is the vendor's one-to-many match; [`cmd::VERIFY`] (`0x72`) is
+    /// the one-to-one variant. The request body is built the same way, so the caller supplies only
+    /// the command word.
     pub fn with_command(mut self, command: u16) -> Self {
         self.command = command;
         self
@@ -373,7 +411,8 @@ impl Match {
             Ok(reply) => reply,
             Err(error) => return self.begin_teardown(MatchError::MalformedReply(error)),
         };
-        let plaintext_len = reply.plaintext.len();
+        let plaintext = reply.plaintext;
+        let plaintext_len = plaintext.len();
         let reply_len = body.len();
         if plaintext_len < VERDICT_OFFSET + 4 {
             return self.begin_teardown(MatchError::MissingVerdict {
@@ -382,10 +421,10 @@ impl Match {
             });
         }
 
-        let word = le32(&reply.plaintext, VERDICT_OFFSET);
+        let word = le32(&plaintext, VERDICT_OFFSET);
         let value = if plaintext_len >= VALUE_OFFSET + MATCH_VALUE_LEN {
             let mut value = [0u8; MATCH_VALUE_LEN];
-            value.copy_from_slice(&reply.plaintext[VALUE_OFFSET..VALUE_OFFSET + MATCH_VALUE_LEN]);
+            value.copy_from_slice(&plaintext[VALUE_OFFSET..VALUE_OFFSET + MATCH_VALUE_LEN]);
             Some(value)
         } else {
             None
@@ -396,6 +435,7 @@ impl Match {
             word,
             matched: word == VERDICT_MATCH,
             value,
+            plaintext: Some(plaintext),
             plaintext_len,
             reply_len,
         };
@@ -447,7 +487,8 @@ impl Operation for Match {
             Some(session) => request_frame(
                 session,
                 self.command,
-                self.template_id.as_ref(),
+                &self.handles,
+                self.hash.as_ref(),
                 &self.iv,
                 session.next_sequence(),
             ),
@@ -541,6 +582,7 @@ pub struct Verify {
     session: Option<Session>,
     capture_iv: [u8; crypto::BLOCK_LEN],
     match_iv: [u8; crypto::BLOCK_LEN],
+    handles: Vec<u32>,
     template_id: Option<[u8; MATCH_VALUE_LEN]>,
     command: u16,
     state: VerifyState,
@@ -549,10 +591,10 @@ pub struct Verify {
 impl Verify {
     /// Builds a verification for a live session.
     ///
-    /// `capture_iv` is the IV for the `0x66` arm and `match_iv` the IV for the verify request.
-    /// They must differ; the caller draws both from the operating system. The verify sends twenty
-    /// zero bytes as its template id unless [`Self::with_template_id`] supplies one, and the
-    /// vendor's `0x72` unless [`Self::with_command`] selects another command.
+    /// `capture_iv` is the IV for the `0x66` arm and `match_iv` the IV for the match request.
+    /// They must differ; the caller draws both from the operating system. The match request names
+    /// no handles and no hash unless the caller adds them, and sends the vendor's `0x72` unless
+    /// [`Self::with_command`] selects another command.
     pub fn new(
         session: Session,
         capture_iv: [u8; crypto::BLOCK_LEN],
@@ -562,13 +604,20 @@ impl Verify {
             session: Some(session),
             capture_iv,
             match_iv,
+            handles: Vec::new(),
             template_id: None,
             command: cmd::VERIFY,
             state: VerifyState::NotStarted,
         }
     }
 
-    /// Supplies the 20-byte template id the composed [`Match`] request names.
+    /// Adds one `u32` template handle to the composed [`Match`] request. Repeatable.
+    pub fn with_template_handle(mut self, handle: u32) -> Self {
+        self.handles.push(handle);
+        self
+    }
+
+    /// Adds the optional 20-byte hash entry to the composed [`Match`] request.
     pub fn with_template_id(mut self, template_id: Option<[u8; MATCH_VALUE_LEN]>) -> Self {
         self.template_id = template_id;
         self
@@ -620,6 +669,9 @@ impl Verify {
                 let mut matching = Match::new(session, self.match_iv)
                     .with_template_id(self.template_id)
                     .with_command(self.command);
+                for handle in &self.handles {
+                    matching = matching.with_template_handle(*handle);
+                }
                 self.advance_match(matching.start(), matching)
             }
             // The capture already ran its own teardown; repeating it would send a second
@@ -692,51 +744,96 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_match_tlv_is_the_reference_block_plus_the_template_id() {
-        let template = [0xa5u8; MATCH_VALUE_LEN];
-        let tlv = match_tlv(0x1122_3344, Some(&template));
+    fn the_request_is_the_vendors_parameter_list_without_a_hash() {
+        let tlv = request_tlv(0x1122_3344, &[], None);
 
-        assert_eq!(tlv.len(), 88);
-        assert_eq!(&tlv[0..4], &0u32.to_le_bytes(), "tag 0");
-        assert_eq!(&tlv[4..8], &4u32.to_le_bytes(), "length 4");
-        assert_eq!(&tlv[8..12], &0x1122_3344u32.to_le_bytes(), "handle");
-
-        assert_eq!(&tlv[12..16], &0u32.to_le_bytes(), "tag 0");
-        assert_eq!(&tlv[16..20], &4u32.to_le_bytes(), "length 4");
-        assert_eq!(&tlv[20..24], &0x148u32.to_le_bytes(), "0x148");
-
-        assert_eq!(&tlv[24..28], &0u32.to_le_bytes(), "tag 0");
-        assert_eq!(&tlv[28..32], &4u32.to_le_bytes(), "length 4");
-        assert_eq!(&tlv[32..36], &0x53e2u32.to_le_bytes(), "0x53e2");
-
-        assert_eq!(&tlv[36..40], &0u32.to_le_bytes(), "tag 0");
-        assert_eq!(&tlv[40..44], &4u32.to_le_bytes(), "length 4");
-        assert_eq!(&tlv[44..48], &0u32.to_le_bytes(), "zero");
-
-        assert_eq!(&tlv[48..52], &2u32.to_le_bytes(), "tag 2");
-        assert_eq!(&tlv[52..56], &4u32.to_le_bytes(), "length 4");
-        assert_eq!(&tlv[56..60], &0x007b_0ad3u32.to_le_bytes(), "0x007b0ad3");
-
-        assert_eq!(&tlv[60..64], &3u32.to_le_bytes(), "tag 3");
-        assert_eq!(&tlv[64..68], &20u32.to_le_bytes(), "declares 20 bytes");
-        assert_eq!(&tlv[68..88], &template, "the caller's template id");
+        assert_eq!(tlv.len(), 56);
+        assert_eq!(
+            tlv,
+            [
+                0u8, 0, 0, 0, 4, 0, 0, 0, 0x44, 0x33, 0x22, 0x11, // (0,4,handle)
+                0, 0, 0, 0, 4, 0, 0, 0, 0x48, 0, 0, 0, // (0,4,0x48)
+                0, 0, 0, 0, 4, 0, 0, 0, 0xe2, 0x53, 0, 0, // (0,4,0x53e2)
+                0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, // (0,4,0)
+                2, 0, 0, 0, 0, 0, 0, 0, // (2, 0)
+            ],
+            "four fixed entries and an empty type-2 array"
+        );
     }
 
     #[test]
-    fn a_match_without_a_template_id_sends_twenty_zero_bytes() {
-        let tlv = match_tlv(1, None);
-        assert_eq!(
-            tlv.len(),
-            88,
-            "five full entries plus a complete last entry"
-        );
-        assert!(
-            tlv[68..88].iter().all(|byte| *byte == 0),
-            "no id means zeros"
-        );
+    fn one_handle_adds_four_little_endian_value_bytes() {
+        let tlv = request_tlv(0x1122_3344, &[0x1122_3344], None);
 
-        let explicit = [0u8; MATCH_VALUE_LEN];
-        assert_eq!(tlv, match_tlv(1, Some(&explicit)));
+        assert_eq!(tlv.len(), 60);
+        assert_eq!(&tlv[48..56], &[2, 0, 0, 0, 4, 0, 0, 0], "type 2, size 4");
+        assert_eq!(&tlv[56..60], &0x1122_3344u32.to_le_bytes());
+        assert_eq!(&tlv[..48], &request_tlv(0x1122_3344, &[], None)[..48]);
+    }
+
+    #[test]
+    fn a_hash_alone_adds_a_twenty_byte_type_three_entry() {
+        let hash = [0xa5u8; MATCH_VALUE_LEN];
+        let tlv = request_tlv(1, &[], Some(&hash));
+
+        assert_eq!(tlv.len(), 84);
+        assert_eq!(
+            &tlv[48..56],
+            &[2, 0, 0, 0, 0, 0, 0, 0],
+            "empty type-2 array"
+        );
+        assert_eq!(&tlv[56..60], &3u32.to_le_bytes(), "type 3");
+        assert_eq!(&tlv[60..64], &20u32.to_le_bytes(), "length 20");
+        assert_eq!(&tlv[64..84], &hash);
+    }
+
+    #[test]
+    fn handles_and_a_hash_are_emitted_in_the_vendors_order() {
+        let hash = [0x5au8; MATCH_VALUE_LEN];
+        let tlv = request_tlv(1, &[0x0102_0304], Some(&hash));
+
+        assert_eq!(tlv.len(), 88);
+        assert_eq!(
+            &tlv[48..52],
+            &2u32.to_le_bytes(),
+            "the type-2 entry comes first"
+        );
+        assert_eq!(
+            &tlv[52..56],
+            &4u32.to_le_bytes(),
+            "one handle is four bytes"
+        );
+        assert_eq!(&tlv[56..60], &0x0102_0304u32.to_le_bytes());
+        assert_eq!(&tlv[60..64], &3u32.to_le_bytes(), "then the hash entry");
+        assert_eq!(&tlv[64..68], &20u32.to_le_bytes());
+        assert_eq!(&tlv[68..88], &hash);
+
+        assert_eq!(tlv.len(), 56 + 4 + 28);
+    }
+
+    #[test]
+    fn the_plaintext_is_rounded_up_from_the_tlv_plus_the_token() {
+        assert_eq!(request_plaintext_len(56), 96);
+        assert_eq!(request_plaintext_len(60), 96);
+        assert_eq!(request_plaintext_len(84), 128);
+        assert_eq!(request_plaintext_len(88), 128);
+        assert_eq!(
+            request_plaintext_len(56),
+            (56 + TOKEN_LEN).div_ceil(crypto::BLOCK_LEN) * crypto::BLOCK_LEN
+        );
+    }
+
+    #[test]
+    fn the_request_shapes_are_56_60_84_and_88_bytes() {
+        let hash = [0u8; MATCH_VALUE_LEN];
+        for (handles, hash, expected) in [
+            (&[][..], None, 56),
+            (&[7][..], None, 60),
+            (&[][..], Some(&hash), 84),
+            (&[7][..], Some(&hash), 88),
+        ] {
+            assert_eq!(request_tlv(1, handles, hash).len(), expected);
+        }
     }
 
     #[test]

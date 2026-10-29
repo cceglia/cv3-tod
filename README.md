@@ -19,9 +19,9 @@ this is a probe, not a login driver.
 | `open` / `close` | Opens the wrapped `0x02` session and releases it with plain `0x04`. |
 | `capture` | Arms `0x66`, waits for the finger, reads the sample hash and tears the session down. |
 | `inventory` | Sends the wrapped `0x2F` inventory query and dumps its reply: the raw and plaintext lengths, the plaintext in 16-byte rows and a best-effort TLV scan. It is the ticket-16 measurement tool and does not yet decode the reply. |
-| `enroll` | Discards, starts, captures, submits, commits and prints the template id it now holds. `--commit-sample-hash` forces the last sample hash into the commit. |
-| `enroll-then-verify` | Enrols and commits, then takes one confirmation touch and matches it in the **same session**. It is the ticket-09 measurement tool: it reports whether a match immediately after a commit works and what value comes back, and it is **not** a binding check. `--commit-sample-hash` forces the last sample hash into the commit and the confirmation match. |
-| `verify` | Captures and sends the vendor-confirmed `0x72` verify, printing the command sent, the raw status, the verdict word, the 20-byte value and the reply lengths. `--command 73` sends the identify request instead, for comparison. |
+| `enroll` | Discards, starts, captures, submits, commits and prints the template id it now holds. `--commit-sample-hash` forces the last sample hash into the commit; `--show-commit` prints the decrypted `0x6E` reply, its lengths and TLV scan. |
+| `enroll-then-verify` | Enrols and commits, then takes one confirmation touch and matches it in the **same session**. It is the ticket-09 measurement tool: it reports whether a match immediately after a commit works and what value comes back, and it is **not** a binding check. `--commit-sample-hash` forces the last sample hash into the commit and the confirmation match; `--show-commit` dumps the commit reply; `--handle` adds `u32` template handles. |
+| `verify` | Captures and sends the vendor's `0x73` identify by default, printing the command sent, the raw status, the verdict word, the 20-byte value, the reply lengths and the decrypted plaintext with a TLV scan. `--template <40 hex>` adds the optional `(3,20,hash)` entry; `--handle` adds `u32` template handles to the one-to-many array; `--command 72` sends the one-to-one verify instead. |
 | `cancel-then-verify` | Cancels a capture mid-session and verifies in the same session; it is the run that can settle the wrap-sequence question when the first arm answers `0x85`, and the current reading is unmeasured. |
 | `handshake`/`open`/`close --record` | Writes a wire-only transcript; `cvctl replay <file>` reproduces it without hardware. |
 
@@ -85,25 +85,34 @@ formatting, clippy, the workspace tests, and `cargo-deny` for RustSec advisories
 | 128 + signal | interrupted by a catchable signal (for example 130 for `SIGINT`) |
 
 `capture` prints the sample hash on success and always runs the cancel-then-close teardown before
-exiting. `verify` sends `0x72`, the command the vendor's `cv_do_fingerprint_verify` uses: one captured finger
-against one template, with the template id supplied by `--template` (twenty zero bytes otherwise).
-`0x73` is `cv_do_fingerprint_identify`, the one-to-many request ticket 20 owns; `--command 73` sends
-it with the identical 88-byte TLV and 128-byte plaintext so a hardware run can compare the two. The
-decode prints the command actually sent and the raw reply status (`0x00` or the `0x89` the vendor
-special-cases), then the verdict word with its meaning (`verdict 1 (match)`,
-`verdict 2 (no match, unexpected word)`), the 20-byte value (or `value absent`), the raw reply
-length and the decrypted plaintext length, and then runs the same teardown. The verdict still comes
-from the decoded body, whatever the status: what `0x89` means is left for a hardware run to settle.
-The value's meaning is not established, and `verify` does not yet compare it with anything: ticket
-10 owns id binding.
+exiting. `verify` sends `0x73`, the vendor's one-to-many identify: the request is the parameter
+list measured from `cv_do_fingerprint_identify` — `(0,4,handle)`, `(0,4,0x48)`, `(0,4,0x53e2)`,
+`(0,4,0)`, `(2,4*count,handles…)` and, only with `--template`, `(3,20,hash)`. `--handle` supplies
+`u32` template handles (decimal or `0x` hex, repeatable or comma-separated); with no handle the
+type-2 entry is size zero and the sensor matches every stored template. `--command 72` sends the
+one-to-one `cv_do_fingerprint_verify` instead. The decode prints the command actually sent and the
+raw reply status (`0x00` or the `0x89` the vendor special-cases), then the verdict word with its
+meaning (`verdict 1 (match)`, `verdict 2 (no match, unexpected word)`), the 20-byte value (or
+`value absent`), the raw reply length and the decrypted plaintext length, and then the decrypted
+plaintext in 16-byte hex rows with a `type=… len=… value=…` TLV scan. A refused request prints the
+same command/status/length dump so a `0x0E` that still carried a body is visible. The verdict still
+comes from the decoded body, whatever the status. The value's meaning is not established, and
+`verify` does not yet compare it with anything: ticket 10 owns id binding.
 
 `cvctl enroll-then-verify` is the ticket-09 measurement tool: it enrols and commits, prints the
-template id and its source, then takes one more touch and sends the `0x72` verify in the **same
-secure session**, printing the command, status and verdict the way `verify` does. `--command 73`
-swaps in the identify request. It answers whether a capture and verify immediately after a commit
+template id and its source, then takes one more touch and sends the match request in the **same
+secure session**, printing the command, status, verdict and plaintext dump the way `verify` does.
+Its default is `0x73`; `--command 72` swaps in the one-to-one verify. `--handle` adds template
+handles to the composed match. It answers whether a capture and match immediately after a commit
 are accepted and what value that reply carries. It deliberately does not compare the value with the
 enrolment id — ticket 10 owns binding — so a match here proves only that the sensor matched some
 enrolled template.
+
+`--show-commit` on `enroll` and `enroll-then-verify` prints the decrypted `0x6E` commit reply: the
+raw reply length, the plaintext length, 16-byte hex rows and the TLV scan. The vendor's commit
+saves its reply through an out list of a type-3 blob and a type-0 `u32`; that `u32` is the template
+handle identify later names, so this is the measurement tickets 06/07/09/20 need. Recordings stay
+wire-only: the plaintext is printed, never recorded.
 
 `cvctl inventory` is ticket 16's first step: it reports the two lengths, the decrypted plaintext
 and a best-effort TLV scan of the `0x2F` reply, without assuming the reply lists stored templates.
@@ -114,7 +123,9 @@ measurement tool, not shipping behaviour.
 hash even when the sensor's `0x6C` reply carried an enrolment id, and labels the source as forced.
 Ticket 06 has not established which id the sensor wants in the `0x6E` commit, so this is a
 measurement variant, not shipping behaviour; without the flag the commit uses the sensor's
-enrolment id as before. Both tools exist to settle tickets 06, 09 and 16.
+enrolment id as before. `--show-commit`, `--handle` and `--command` are measurement tools for
+tickets 06, 07, 09 and 20; they change what the probe sends and prints, not what the driver will
+ship.
 
 `cvctl cancel-then-verify` owns one session and runs the sequence that can settle the wrap-sequence
 question: it arms a capture, cancels it with the mid-session `0x68` before any finger, then runs a

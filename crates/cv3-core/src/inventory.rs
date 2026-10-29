@@ -35,10 +35,10 @@ use crate::session::{Session, Teardown, UnwrapError, WrapError};
 pub const INVENTORY_TLV_LEN: usize = 56;
 /// Plaintext length the reference sends with `0x2F`: the TLV, the 32-byte token, zero padding.
 pub const INVENTORY_PLAINTEXT_LEN: usize = 88;
-/// Length of a TLV entry header: a little-endian `u32 tag` and `u32 declared length`.
-pub const TLV_HEADER_LEN: usize = 8;
-/// The alignment the TLV scan advances by after each entry.
-pub const TLV_ALIGNMENT: usize = 4;
+
+// The reply scanner is shared with the verify and commit diagnostics. It is re-exported here so
+// the ticket-16 paths that already depend on `inventory::scan_tlv` keep working unchanged.
+pub use crate::tlv::{TLV_ALIGNMENT, TLV_HEADER_LEN, TlvEntry, TlvScan, scan_tlv};
 
 /// The 56-byte `0x2F` parameter block:
 /// `(0,4,handle) (0,4,0x48) (0,4,0x53e2) (0,4,0) (2,0)`.
@@ -54,108 +54,6 @@ pub fn inventory_tlv(handle: u32) -> [u8; INVENTORY_TLV_LEN] {
     tlv[48..52].copy_from_slice(&2u32.to_le_bytes());
     tlv[52..56].copy_from_slice(&0u32.to_le_bytes());
     tlv
-}
-
-/// One entry the scan found.
-///
-/// `value` is the bytes that are actually present, which is shorter than [`Self::declared_len`]
-/// when the device's length ran past the end of the plaintext.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TlvEntry<'a> {
-    /// Offset of the entry's eight-byte header in the plaintext.
-    pub offset: usize,
-    /// The little-endian tag at the start of the header.
-    pub tag: u32,
-    /// The little-endian length the header declares.
-    pub declared_len: u32,
-    /// The value bytes present in the plaintext, at most `declared_len` long.
-    pub value: &'a [u8],
-}
-
-impl TlvEntry<'_> {
-    /// Whether the header declared more value bytes than the plaintext holds.
-    pub fn is_truncated(&self) -> bool {
-        self.value.len() < self.declared_len as usize
-    }
-}
-
-/// The result of [`scan_tlv`]: every entry found, plus what could not be read.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TlvScan<'a> {
-    /// The entries, in plaintext order.
-    pub entries: Vec<TlvEntry<'a>>,
-    /// Bytes after the last entry that are too short for an eight-byte header.
-    pub trailing: usize,
-    /// Whether an entry's declared value ran past the end of the plaintext.
-    pub truncated: bool,
-}
-
-/// Scans a decrypted reply as a sequence of 4-byte-aligned TLVs.
-///
-/// The scan starts at offset zero and, after each entry, advances by `8 + declared length`
-/// rounded up to the next four-byte boundary. Every read is bounded by the plaintext length, so
-/// empty, short, arbitrary and lying input returns a report instead of panicking. An entry whose
-/// value does not fit is recorded with the bytes that are present and sets
-/// [`TlvScan::truncated`]; the scan then stops.
-pub fn scan_tlv(plaintext: &[u8]) -> TlvScan<'_> {
-    let mut entries = Vec::new();
-    let mut truncated = false;
-    let mut at = 0usize;
-
-    while at + TLV_HEADER_LEN <= plaintext.len() {
-        let tag = le32(plaintext, at);
-        let declared_len = le32(plaintext, at + 4);
-        let value_start = at + TLV_HEADER_LEN;
-        let available = plaintext.len() - value_start;
-        let declared = declared_len as usize;
-        let take = declared.min(available);
-
-        entries.push(TlvEntry {
-            offset: at,
-            tag,
-            declared_len,
-            value: &plaintext[value_start..value_start + take],
-        });
-
-        if declared > available {
-            truncated = true;
-            at = plaintext.len();
-            break;
-        }
-
-        let Some(advance) = TLV_HEADER_LEN.checked_add(declared) else {
-            truncated = true;
-            at = plaintext.len();
-            break;
-        };
-        let Some(next) = at.checked_add(advance) else {
-            truncated = true;
-            at = plaintext.len();
-            break;
-        };
-        let padded = next + (TLV_ALIGNMENT - next % TLV_ALIGNMENT) % TLV_ALIGNMENT;
-        if padded > plaintext.len() {
-            // The last entry's value ends the plaintext; any alignment padding is absent.
-            at = plaintext.len();
-            break;
-        }
-        at = padded;
-    }
-
-    TlvScan {
-        entries,
-        trailing: plaintext.len().saturating_sub(at),
-        truncated,
-    }
-}
-
-fn le32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-    ])
 }
 
 /// A decoded `0x2F` reply: both lengths, the full plaintext, and the still-open session.

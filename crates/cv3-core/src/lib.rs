@@ -28,6 +28,7 @@ pub mod inventory;
 pub mod operation;
 pub mod proto;
 pub mod session;
+pub mod tlv;
 pub mod transcript;
 pub mod transport;
 pub mod verify;
@@ -60,9 +61,8 @@ pub use transcript::{
 };
 pub use transport::{FailingTransport, ScriptedOutcome, ScriptedTransport, Transport};
 pub use verify::{
-    MATCH_PLAINTEXT_LEN, MATCH_TLV_LEN, MATCH_VALUE_LEN, Match, MatchError, VALUE_OFFSET,
-    VERDICT_MATCH, VERDICT_NO_MATCH, VERDICT_OFFSET, Verdict, Verification, Verify, VerifyError,
-    match_tlv,
+    MATCH_VALUE_LEN, Match, MatchError, VALUE_OFFSET, VERDICT_MATCH, VERDICT_NO_MATCH,
+    VERDICT_OFFSET, Verdict, Verification, Verify, VerifyError, request_tlv,
 };
 
 /// Version of the core crate, reported by the probe.

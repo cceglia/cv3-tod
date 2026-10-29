@@ -186,36 +186,37 @@ pub const MATCH_VALUE: [u8; 20] = [
     0xd0, 0xd1, 0xd2, 0xd3,
 ];
 
-/// Length of the verify request's parameter block: five entries plus `(3, 20, template_id)`.
-pub const MATCH_TLV_LEN: usize = 88;
-/// Plaintext length the driver sends with the verify request.
-pub const MATCH_PLAINTEXT_LEN: usize = 128;
+/// Length of the identify request's fixed part: four `(0,4,…)` entries and the type-2 header.
+pub const MATCH_TLV_BASE_LEN: usize = 56;
 
-/// The documented 88-byte verify parameter block, built independently of the implementation.
+/// The vendor's identify parameter list, built independently of the implementation.
 ///
-/// Five `(tag, 4, value)` entries followed by `(3, 20, template_id)`. The audited reference stops
-/// after the final entry's eight-byte header; that 68-byte request was refused with `0x59` on
-/// 2026-10-28, so the driver completes the value. `None` supplies twenty zero bytes.
-pub fn match_tlv(handle: u32, template_id: Option<&[u8; 20]>) -> [u8; MATCH_TLV_LEN] {
-    let mut tlv = [0u8; MATCH_TLV_LEN];
-    let entries: [(usize, u32, u32); 5] = [
-        (0, 0, handle),
-        (12, 0, 0x148),
-        (24, 0, 0x53e2),
-        (36, 0, 0),
-        (48, 2, 0x007b_0ad3),
-    ];
-    for (at, tag, value) in entries {
-        tlv[at..at + 4].copy_from_slice(&tag.to_le_bytes());
-        tlv[at + 4..at + 8].copy_from_slice(&4u32.to_le_bytes());
-        tlv[at + 8..at + 12].copy_from_slice(&value.to_le_bytes());
+/// Four `(0,4,value)` entries with `handle`, `0x48`, `0x53e2` and zero; one
+/// `(2, 4 * handles.len(), handles…)` entry, present with size zero when no handle is named; and,
+/// when `hash` is `Some`, one `(3, 20, hash)` entry. No padding beyond the value bytes.
+pub fn match_tlv(handle: u32, handles: &[u32], hash: Option<&[u8; 20]>) -> Vec<u8> {
+    let mut tlv = Vec::new();
+    for (tag, value) in [(0u32, handle), (0, 0x48), (0, 0x53e2), (0, 0)] {
+        tlv.extend_from_slice(&tag.to_le_bytes());
+        tlv.extend_from_slice(&4u32.to_le_bytes());
+        tlv.extend_from_slice(&value.to_le_bytes());
     }
-    tlv[60..64].copy_from_slice(&3u32.to_le_bytes());
-    tlv[64..68].copy_from_slice(&20u32.to_le_bytes());
-    if let Some(template_id) = template_id {
-        tlv[68..88].copy_from_slice(template_id);
+    tlv.extend_from_slice(&2u32.to_le_bytes());
+    tlv.extend_from_slice(&((4 * handles.len()) as u32).to_le_bytes());
+    for handle in handles {
+        tlv.extend_from_slice(&handle.to_le_bytes());
+    }
+    if let Some(hash) = hash {
+        tlv.extend_from_slice(&3u32.to_le_bytes());
+        tlv.extend_from_slice(&20u32.to_le_bytes());
+        tlv.extend_from_slice(hash);
     }
     tlv
+}
+
+/// The wrapped plaintext length: the TLV, the 32-byte token, rounded up to a whole AES block.
+pub fn match_plaintext_len(tlv_len: usize) -> usize {
+    (tlv_len + 32).div_ceil(16) * 16
 }
 
 /// The exact wrapped verify frame a `0x72` request must send for `session` at its next sequence.
@@ -223,7 +224,7 @@ pub fn match_frame(session: &Session, iv: &[u8; 16]) -> Vec<u8> {
     match_frame_with(session, iv, None)
 }
 
-/// The exact wrapped verify frame for `session` at its next sequence with a template id.
+/// The exact wrapped verify frame for `session` at its next sequence with a hash entry.
 pub fn match_frame_with(
     session: &Session,
     iv: &[u8; 16],
@@ -237,7 +238,7 @@ pub fn match_frame_at(session: &Session, iv: &[u8; 16], sequence: u32) -> Vec<u8
     match_frame_at_with(session, iv, sequence, None)
 }
 
-/// The exact wrapped verify frame at an explicit sequence with a template id.
+/// The exact wrapped verify frame at an explicit sequence with a hash entry.
 pub fn match_frame_at_with(
     session: &Session,
     iv: &[u8; 16],
@@ -255,16 +256,23 @@ pub fn command_frame_at_with(
     sequence: u32,
     template_id: Option<&[u8; 20]>,
 ) -> Vec<u8> {
+    command_frame_at_with_handles(session, command, iv, sequence, &[], template_id)
+}
+
+/// The same request with an explicit command and type-2 handle array.
+pub fn command_frame_at_with_handles(
+    session: &Session,
+    command: u16,
+    iv: &[u8; 16],
+    sequence: u32,
+    handles: &[u32],
+    template_id: Option<&[u8; 20]>,
+) -> Vec<u8> {
+    let tlv = match_tlv(session.handle, handles, template_id);
+    let plaintext_len = match_plaintext_len(tlv.len());
     session
-        .wrap(
-            command,
-            attr::CAPTURE,
-            &match_tlv(session.handle, template_id),
-            MATCH_PLAINTEXT_LEN,
-            iv,
-            sequence,
-        )
-        .expect("the verify constants build a frame")
+        .wrap(command, attr::CAPTURE, &tlv, plaintext_len, iv, sequence)
+        .expect("the identify constants build a frame")
 }
 
 /// A synthetic wrapped verify reply whose plaintext is `plaintext`.

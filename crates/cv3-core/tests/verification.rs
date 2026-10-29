@@ -2,17 +2,17 @@
 //!
 //! Every expected frame is built with the same codec the implementation uses, from constants
 //! written out independently here: the command numbers, attributes, TLV layouts and sequence
-//! numbers come from the protocol description, not from the module under test. The `0x72` verify
-//! request is asserted byte for byte, including the completed `(3, 20, template_id)` entry, and
-//! `0x73` is asserted as the same request with only its command word changed.
+//! numbers come from the protocol description, not from the module under test. The request is the
+//! vendor's parameter list from the ControlVault 3 disassembly: four fixed `(0,4,…)` entries, an
+//! optional type-2 array of `u32` template handles and an optional `(3,20,hash)` entry.
 
 mod common;
 
 use common::{
-    HANDLE, MATCH_PLAINTEXT_LEN, MATCH_TLV_LEN, MATCH_VALUE, SAMPLE_HASH, arm_frame, capture_reply,
+    HANDLE, MATCH_TLV_BASE_LEN, MATCH_VALUE, SAMPLE_HASH, arm_frame, capture_reply,
     command_frame_at_with, fixed_iv, match_frame, match_frame_at, match_frame_at_with,
-    match_frame_with, match_plaintext, match_plaintext_with_len, match_reply, match_tlv,
-    opened_session, sample_hash_plaintext,
+    match_frame_with, match_plaintext, match_plaintext_len, match_plaintext_with_len, match_reply,
+    match_tlv, opened_session, sample_hash_plaintext,
 };
 use cv3_core::crypto;
 use cv3_core::frame;
@@ -120,7 +120,7 @@ fn a_verify_arms_waits_matches_and_reports_the_reply() {
 }
 
 #[test]
-fn the_verify_frame_is_eighty_eight_tlv_bytes_at_plaintext_len_128() {
+fn the_verify_frame_is_the_vendors_fifty_six_byte_list_at_plaintext_len_96() {
     let mut transport = ScriptedTransport::default();
     let session = opened_session(&mut transport);
     let key = *session.key().as_bytes();
@@ -143,30 +143,33 @@ fn the_verify_frame_is_eighty_eight_tlv_bytes_at_plaintext_len_128() {
 
     assert_eq!(
         frame.len(),
-        188,
-        "128 plaintext bytes pad to 144 ciphertext bytes"
+        156,
+        "96 plaintext bytes pad to 112 ciphertext bytes"
     );
     assert_eq!(le32(frame, 0), 1, "magic");
-    assert_eq!(le32(frame, 4), 188, "total length");
+    assert_eq!(le32(frame, 4), 156, "total length");
     assert_eq!(
         &frame[8..10],
         &cmd::VERIFY.to_le_bytes(),
-        "0x72 is the vendor's verify"
+        "0x72 is the one-to-one verify"
     );
     assert_eq!(frame[10], attr::CAPTURE, "attribute 0x47");
     assert_eq!(frame[11], 0x02, "wrapped encoding");
     assert_eq!(le32(frame, 16), HANDLE, "session handle");
-    assert_eq!(le32(frame, 40), MATCH_TLV_LEN as u32, "declared TLV length");
+    assert_eq!(
+        le32(frame, 40),
+        MATCH_TLV_BASE_LEN as u32,
+        "declared TLV length"
+    );
 
     let mut iv = [0u8; crypto::BLOCK_LEN];
     iv.copy_from_slice(&frame[24..40]);
     let plaintext = crypto::decrypt_cbc(&key, &iv, &frame[44..]).expect("the request decrypts");
-    assert_eq!(plaintext.len(), MATCH_PLAINTEXT_LEN);
-    assert_eq!(&plaintext[..MATCH_TLV_LEN], &match_tlv(HANDLE, None));
+    let tlv_len = MATCH_TLV_BASE_LEN;
+    assert_eq!(plaintext.len(), match_plaintext_len(tlv_len));
+    assert_eq!(&plaintext[..tlv_len], &match_tlv(HANDLE, &[], None));
     assert!(
-        plaintext[MATCH_TLV_LEN + 32..]
-            .iter()
-            .all(|byte| *byte == 0),
+        plaintext[tlv_len + 32..].iter().all(|byte| *byte == 0),
         "the rest of the plaintext is zero padding after the token"
     );
     assert_eq!(verification.verdict.plaintext_len, 52);
@@ -237,20 +240,88 @@ fn the_identify_command_reuses_the_request_and_changes_only_its_command_word() {
         iv.copy_from_slice(&frame[24..40]);
         crypto::decrypt_cbc(&key, &iv, &frame[44..]).expect("the request decrypts")
     };
+    let tlv_len = match_tlv(HANDLE, &[], Some(&template)).len();
     let verify_plaintext = plaintext_of(&expected_verify);
     let identify_plaintext = plaintext_of(&expected_identify);
     assert_eq!(
-        &verify_plaintext[..MATCH_TLV_LEN],
-        &identify_plaintext[..MATCH_TLV_LEN],
-        "the request body is the same 88-byte TLV"
+        &verify_plaintext[..tlv_len],
+        &identify_plaintext[..tlv_len],
+        "the request body is the same TLV"
     );
-    assert_eq!(verify_plaintext.len(), MATCH_PLAINTEXT_LEN);
-    assert_eq!(identify_plaintext.len(), MATCH_PLAINTEXT_LEN);
+    assert_eq!(verify_plaintext.len(), match_plaintext_len(tlv_len));
+    assert_eq!(identify_plaintext.len(), match_plaintext_len(tlv_len));
     assert_ne!(
         verify_plaintext, identify_plaintext,
         "the token covers the header, so the command word changes it"
     );
     assert_eq!(verification.verdict.command, cmd::IDENTIFY);
+}
+
+#[test]
+fn the_four_request_shapes_declare_their_lengths_and_compute_the_plaintext() {
+    let hash = [0x5au8; 20];
+    let shapes: [(&[u32], Option<&[u8; 20]>); 4] = [
+        (&[], None),
+        (&[0x1122_3344], None),
+        (&[], Some(&hash)),
+        (&[0x1122_3344], Some(&hash)),
+    ];
+    let mut plaintexts: Vec<Vec<u8>> = Vec::new();
+
+    for (handles, hash) in shapes {
+        let tlv_len = match_tlv(HANDLE, handles, hash).len();
+        let plaintext_len = match_plaintext_len(tlv_len);
+        let mut transport = ScriptedTransport::default();
+        let session = opened_session(&mut transport);
+        let key = *session.key().as_bytes();
+        let mut operation = Match::new(session, match_iv())
+            .with_command(cmd::IDENTIFY)
+            .with_template_id(hash.copied());
+        for handle in handles {
+            operation = operation.with_template_handle(*handle);
+        }
+        let frame = expect_send(operation.start());
+
+        assert_eq!(le32(&frame, 40) as usize, tlv_len, "declared TLV length");
+        let expected_plaintext = match tlv_len {
+            56 | 60 => 96,
+            84 | 88 => 128,
+            other => panic!("unexpected TLV length {other}"),
+        };
+        assert_eq!(
+            plaintext_len, expected_plaintext,
+            "the plaintext is rounded up from the TLV"
+        );
+        assert_eq!(
+            frame.len(),
+            44 + expected_plaintext + 16,
+            "PKCS#7 adds one block after the computed plaintext"
+        );
+
+        let mut iv = [0u8; crypto::BLOCK_LEN];
+        iv.copy_from_slice(&frame[24..40]);
+        let plaintext = crypto::decrypt_cbc(&key, &iv, &frame[44..]).expect("the request decrypts");
+        assert_eq!(plaintext.len(), plaintext_len);
+        assert_eq!(&plaintext[..tlv_len], &match_tlv(HANDLE, handles, hash));
+        assert!(
+            plaintext[tlv_len + 32..].iter().all(|byte| *byte == 0),
+            "only the token follows the TLV"
+        );
+        plaintexts.push(plaintext);
+    }
+
+    for plaintext in &plaintexts[1..] {
+        assert_eq!(
+            &plaintext[..48],
+            &plaintexts[0][..48],
+            "the four fixed entries are identical in every shape"
+        );
+    }
+    assert_ne!(
+        &plaintexts[0][48..56],
+        &plaintexts[1][48..56],
+        "the type-2 size is the only difference without a hash"
+    );
 }
 
 #[test]
@@ -269,13 +340,13 @@ fn a_match_can_name_the_template_id_the_enrolment_committed() {
     run(&mut operation, &mut transport).expect("the reply decodes");
 
     let frame = &transport.sent()[3];
-    assert_eq!(frame, &expected, "the request carries the template id");
+    assert_eq!(frame, &expected, "the request carries the hash entry");
     let mut iv = [0u8; crypto::BLOCK_LEN];
     iv.copy_from_slice(&frame[24..40]);
     let plaintext = crypto::decrypt_cbc(&key, &iv, &frame[44..]).expect("the request decrypts");
-    assert_eq!(&plaintext[60..64], &3u32.to_le_bytes(), "tag 3");
-    assert_eq!(&plaintext[64..68], &20u32.to_le_bytes(), "length 20");
-    assert_eq!(&plaintext[68..88], &template, "the caller's template id");
+    assert_eq!(&plaintext[56..60], &3u32.to_le_bytes(), "type 3");
+    assert_eq!(&plaintext[60..64], &20u32.to_le_bytes(), "length 20");
+    assert_eq!(&plaintext[64..84], &template, "the caller's hash");
 }
 
 #[test]

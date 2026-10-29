@@ -100,6 +100,8 @@ pub struct FakeUsb {
     pub enrolment_id: [u8; 20],
     /// Status the scripted sensor answers the wrapped `0x6e` commit with.
     pub commit_status: u32,
+    /// If set, the decrypted plaintext of the `0x6e` commit reply; by default empty.
+    pub commit_plaintext: Option<Vec<u8>>,
     /// If set, the scripted sensor fails the `0x6e` commit in the transport.
     pub commit_command_error: Option<UsbError>,
     /// Status the scripted sensor answers the wrapped verify request (`0x72` or `0x73`) with.
@@ -178,6 +180,7 @@ impl Default for FakeUsb {
             completion_after: None,
             enrolment_id: ENROLMENT_ID,
             commit_status: 0,
+            commit_plaintext: None,
             commit_command_error: None,
             match_status: 0,
             match_plaintext: None,
@@ -280,6 +283,7 @@ impl UsbBackend for FakeUsb {
             completion_after: self.completion_after,
             enrolment_id: self.enrolment_id,
             commit_status: self.commit_status,
+            commit_plaintext: self.commit_plaintext.clone(),
             commit_command_error: self.commit_command_error.clone(),
             match_status: self.match_status,
             match_plaintext: self.match_plaintext.clone(),
@@ -423,6 +427,7 @@ pub struct HandshakeSensor {
     pub completion_after: Option<usize>,
     pub enrolment_id: [u8; 20],
     pub commit_status: u32,
+    pub commit_plaintext: Option<Vec<u8>>,
     pub commit_command_error: Option<UsbError>,
     pub match_status: u32,
     pub match_plaintext: Option<Vec<u8>>,
@@ -662,7 +667,7 @@ impl HandshakeSensor {
                     cmd::COMMIT_ENROLMENT,
                     attr::SESSION,
                     self.commit_status,
-                    &[],
+                    self.commit_plaintext.as_deref().unwrap_or(&[]),
                 ),
             },
             cmd::ARM_CAPTURE => self.arm_reply(),

@@ -67,19 +67,21 @@ The acceptance run whose log is `target/hardware-acceptance-20261028-201206.log`
   all completed. The enrolment committed and reported a sensor **enrolment id**
   (`80f5eb3d7e7e2034cd960db24c059208b41586c3` in step 06, `b05432744322b732b58b5d54e2812ed7603ffab2`
   in step 09).
-- **`0x73` refused with `0x59`.** For both an enrolled and an unenrolled finger, the request as the
-  audited reference builds it — a 68-byte TLV whose final `(3, 20)` entry carries no value bytes —
-  was answered `0x59`. Completing that entry with the 20-byte template id (88-byte TLV, 128-byte
-  plaintext) changed the answer to `0x0E`. The same `0x0E` came back from the `0x2F` query with the
-  reference's 56-byte TLV (a body-less 44-byte reply).
+- **`0x73` refused with `0x59`, with the old CV2-shaped request.** For both an enrolled and an
+  unenrolled finger, the request as the audited reference builds it — the ControlVault 2
+  parameter block, whose last `(3, 20)` entry carried no value bytes — was answered `0x59`.
+  Completing that entry with the 20-byte template id (an 88-byte TLV, 128-byte plaintext) changed
+  the answer to `0x0E`. That request still carried the CV2 constants; the corrected ControlVault 3
+  request below is different and **has not been measured**. The same `0x0E` came back from the
+  `0x2F` query with the reference's 56-byte TLV (a body-less 44-byte reply).
 - **`0x72` is verify; `0x73` is identify.** Disassembly of the vendor blob
   (`extracted/broadcom/.../libfprint-2-tod-1-broadcom.so`) shows `cv_do_fingerprint_verify` calling
-  `cvhManageCVAPICall` with command `0x72` and `cv_do_fingerprint_identify` calling it with `0x73`
-  (falling back to `0x2F` without a template list). The reference labels `0x73` as match, which is
-  why the verify-shaped request was refused. The probe now sends `0x72` for verification and keeps
-  `0x73` for identify. Both statuses `0x00` and `0x89` are treated as "answered" because the vendor
-  special-cases `0x89`; the verdict is still read from the reply body. **The `0x72` request has not
-  been measured.**
+  `cvhManageCVAPICall` with command `0x72` and `cv_do_fingerprint_identify` calling it with `0x73`.
+  The TOD's Linux match path is `cvif_fingerprint_identify` → `cv_fingerprint_identify(handle,
+  0x48, 0x53e2, 0, count, ids, …)`, so `0x73` is the vendor's **one-to-many identify with `u32`
+  template handles**; `0x72` is the one-to-one verify. Both statuses `0x00` and `0x89` are treated
+  as "answered" because the vendor special-cases `0x89`; the verdict is still read from the reply
+  body. The probe defaults to `0x73` and keeps `--command 72` for the one-to-one variant.
 - **Commit id.** Committing with the sensor's enrolment id succeeded (`0x00`); committing with the
   last sample hash instead was refused with `0x8E`. The enrolment id is the id to commit.
 - **Re-arm after a cancel.** In `cancel-then-verify` the first arm answered `0x00` at sequence N,
@@ -155,13 +157,51 @@ mid-session cancel affects the sequence.
 The observation is the sensor's answer to the second arm, not the printed verdict: the sequence
 lives inside the MAC. The printed `re-arm sequence` line says which number was sent.
 
+## Match request (identify)
+
+**Read from the vendor blob, not yet measured.** `cv_do_fingerprint_identify` builds its request
+parameter list as:
+
+```text
+(0, 4, handle)
+(0, 4, 0x48)
+(0, 4, 0x53e2)
+(0, 4, 0)
+(2, 4 * count, count × u32 template handles)
+(3, 20, hash)                 only when a hash pointer is supplied
+```
+
+Each wire entry is `u32 type | u32 size | value bytes`, with no padding beyond the value bytes.
+`InitParam_List` and `cvhDecapsulateCmd` confirm that shape. The public Linux path
+`cvif_fingerprint_identify` (0x2b2e0) calls `cv_fingerprint_identify(handle, 0x48, 0x53e2, 0,
+count, ids, …)`, so the array values are `u32` template handles, not 20-byte ids, and the request
+is sent as command `0x73`.
+
+The lengths are therefore `56 + 4 * count + (28 when a hash follows)`:
+
+| Handles | Hash | TLV | Plaintext |
+|---|---|---|---|
+| 0 | no | 56 | 96 |
+| 1 | no | 60 | 96 |
+| 0 | yes | 84 | 128 |
+| 1 | yes | 88 | 128 |
+
+The plaintext is the TLV plus the 32-byte token, rounded up to a whole AES block; PKCS#7 then adds
+one more block. The type-2 entry is always present, with size zero when no handle is named; what a
+zero-size entry asks the sensor to do is not established and the next hardware run measures it.
+
+**The CV2 values in this driver were wrong for CV3.** `0x148` and `0x7b0ad3` do not occur in the
+blob as constants at all; they came from the audited reference, which targets ControlVault 2, and
+`0x53e2` occurs exactly once, as the argument above. `crates/cv3-core/src/verify.rs` now builds
+only the vendor list. **The corrected request has not been measured on this sensor yet.**
+
 ## Match replies
 
 **`0x59`, but no verdict yet.** On 2026-10-28 (`target/hardware-acceptance-20261028-201206.log`)
-the `0x73` request as the reference builds it was refused with `0x59` for both an enrolled and an
-unenrolled finger. The driver now completes the final `(3, 20)` entry with a template id; that
-88-byte request is **not yet measured**, so the verdict word, the value at `+32` and the no-match
-reply remain unobserved.
+the `0x73` request as the audited (CV2) reference builds it was refused with `0x59` for both an
+enrolled and an unenrolled finger. Completing its final `(3, 20)` entry with a template id changed
+the status to `0x0E`; the corrected vendor request above is **not yet measured**, so the verdict
+word, the value at `+32` and the no-match reply remain unobserved.
 
 A hardware run must record, for a match and for a no-match:
 
@@ -172,7 +212,10 @@ A hardware run must record, for a match and for a no-match:
 
 A non-zero `0x73` status must also record its raw reply length and, when the body decrypts, the
 decrypted plaintext length and hex. `cvctl` prints those diagnostics; a `0x59` that still carried a
-body is then visible instead of being reduced to the status alone.
+body is then visible instead of being reduced to the status alone. The probe prints the decrypted
+plaintext in 16-byte rows plus a `type=… len=… value=…` TLV scan on success and on a refusal, so a
+`0x0E` that carried a body is captured too. `cvctl enroll --show-commit` does the same for the
+`0x6E` commit reply, whose type-3 blob and type-0 `u32` are the next hardware measurement.
 
 The question is load-bearing: if a no-match reply already carries the enrolled finger's value at
 `+32`, then flipping the verdict word would pass an id comparison, and ticket 10's binding would

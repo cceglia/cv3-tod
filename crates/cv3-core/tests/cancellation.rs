@@ -111,6 +111,7 @@ fn one_session_arms_cancels_and_then_verifies_with_the_documented_frames_and_seq
             word: 1,
             matched: true,
             value: Some(common::MATCH_VALUE),
+            plaintext: Some(match_plaintext(1, Some(&common::MATCH_VALUE))),
             plaintext_len: 52,
             reply_len: HEADER_LEN + 64,
         }
