@@ -5,12 +5,15 @@ so anything speaking fprintd's protocol works.
 
 **Blocked by:** 13 (enrol through fprintd), 10 (id binding)
 
-**Status:** in-progress
+**Status:** ready-for-human
 
-- [ ] `fprintd-verify` reports a match for a print enrolled through fprintd by ticket 13
-- [ ] It reports no match for an unenrolled finger, and the enrolled print still verifies after a
-      `fprintd` restart
-- [ ] A verification for a specific finger succeeds only for that finger
+- [x] `fprintd-verify` reports a match for a print enrolled through fprintd by ticket 13
+      (measured 2026-10-29: `verify-match`).
+- [x] It reports no match for an unenrolled finger, and the enrolled print still verifies after a
+      `fprintd` restart (measured: the left index against the right-index print gave
+      `verify-no-match`; the right index still matched after `systemctl restart fprintd`).
+- [x] A verification for a specific finger succeeds only for that finger (measured: the right
+      index matched, the left index did not).
 - [x] The driver declares only the features it implements, so clients do not offer operations that
       cannot work
 - [x] A sensor that is absent or held elsewhere produces an error the client can distinguish from a
@@ -65,3 +68,15 @@ session key, so it cannot fabricate the wrapped `0x2F` reply. The harness pins t
 (features, NULL vfuncs), the two payload errors before any frame is written, and that the record
 reaches the core — the `0x66`, `0x68`, `0x04` are what the fake sees. The verdict, the binding and
 the session reuse are covered by the plugin's scripted tests.
+
+Measured on hardware 2026-10-29 with the print enrolled through ticket 13:
+
+```text
+fprintd-verify -f right-index-finger cristiano
+Verifying: right-index-finger
+Verify result: verify-match (done)
+```
+
+With the left index presented against that print: `Verify result: verify-no-match (done)`. After
+`systemctl restart fprintd` the right index still matched. The payload read is the same `fpi-data`
+the enrolment stored, so a print reloaded from fprintd's database verifies without re-enrolment.
