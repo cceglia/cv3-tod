@@ -5,8 +5,10 @@
 # what libfprint actually calls. This script checks the real object:
 #
 #   1. g_module_open()s it, resolves `fpi_tod_shared_driver_get_type` and reads the class: identity,
-#      id table, and the vfuncs libfprint dereferences without a NULL test (`open`, `close`,
-#      `enroll`) — a NULL in any of those is a segfault inside fprintd, which runs as root.
+#      id table, the one feature the driver declares (VERIFY) and the vfuncs libfprint
+#      dereferences without a NULL test (`open`, `close`, `enroll`, `verify`) — a NULL in any of
+#      those is a segfault inside fprintd, which runs as root. The vfuncs for the features the
+#      driver does not declare (capture, identify, list, delete, clear_storage) must stay NULL.
 #   2. Drives fprintd's Claim/Release on that class with tests/fake_gusb.c linked into the harness
 #      (`-Wl,--export-dynamic` so its symbols interpose for the plugin). The fake scripts the
 #      sensor's reply frames at fpi_usb_transfer_submit and models libgusb's open/close/claim
@@ -24,7 +26,10 @@
 #   - an open whose sensor leaves the bus before the 0x23 announcement completes with
 #     FP_DEVICE_ERROR_REMOVED instead of hanging;
 #   - a Release whose 0x04 gets no announcement still completes successfully, with the failure
-#     logged and the interface and handle released.
+#     logged and the interface and handle released;
+#   - a verification of a print with no stored record fails with DATA_NOT_FOUND and of one with an
+#     unknown record version with DATA_INVALID, both before writing a frame, while a print carrying
+#     the real record reaches the core and writes the 0x66 capture arm.
 #
 # Usage: scripts/check-tod-class.sh [path/to/plugin.so]
 #   default path: target/release/libcv3_tod.so

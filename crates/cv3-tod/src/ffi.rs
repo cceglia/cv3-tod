@@ -20,7 +20,9 @@
 //!
 //! Enrolment adds two accessors instead of widening the action: [`cv3_tod_take_progress`] hands C
 //! the stages to report to `fpi_device_enroll_progress`, and [`cv3_tod_take_payload`] hands it the
-//! bound print record once the enrolment has succeeded.
+//! bound print record once the enrolment has succeeded. Verification takes the opposite direction:
+//! [`cv3_tod_verify_start`] receives the `fpi-data` bytes C read off the `FpPrint`, and Rust decodes
+//! the record and decides which match id to ask about.
 
 use std::ptr;
 
@@ -473,6 +475,38 @@ pub unsafe extern "C" fn cv3_tod_enrol_start(tod: *mut Cv3Tod) -> Cv3Action {
     }
 }
 
+/// Starts a verification of the print whose stored record is `payload` on the live session.
+///
+/// `payload` is the `fpi-data` byte array libfprint keeps on the print; this call decodes it and
+/// the record decides which match id the sensor is asked about. Nothing on the C side interprets
+/// the bytes. An empty payload finishes at once with [`OutcomeKind::DataNotFound`] and a payload
+/// that is not this driver's record with [`OutcomeKind::DataInvalid`], both as a finish action.
+///
+/// # Safety
+///
+/// `tod` must be null or a live pointer from [`cv3_tod_create`]; `payload` must be null or point to
+/// `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cv3_tod_verify_start(
+    tod: *mut Cv3Tod,
+    payload: *const u8,
+    len: usize,
+) -> Cv3Action {
+    // SAFETY: the caller guarantees `tod` is live; `as_mut` is null safe.
+    let Some(session) = (unsafe { tod.as_mut() }) else {
+        return Cv3Action::error("cv3: the plugin session was not created");
+    };
+    // SAFETY: the caller guarantees `payload` points to `len` readable bytes (or is null, which
+    // `from_raw_parts` tolerates only for a zero length; both cases are mapped to an empty slice).
+    let bytes: &[u8] = if payload.is_null() || len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(payload, len) }
+    };
+    let step = session.plugin.verify_start(bytes);
+    session.publish(step)
+}
+
 /// Takes the next progress report for `fpi_device_enroll_progress`.
 ///
 /// Returns `0` when there is nothing to report, `1` for a completed stage and `2` for a rejected
@@ -643,6 +677,22 @@ mod tests {
         assert_eq!(
             usize::try_from(cv3_tod_enrol_stages()).expect("a positive count"),
             cv3_core::bind::ENROL_STAGES
+        );
+    }
+
+    #[test]
+    fn a_verify_start_without_a_payload_or_session_is_an_error_not_a_panic() {
+        let mut session = Cv3Tod::new();
+        // SAFETY: `session` is live; a NULL payload with zero length is explicitly allowed.
+        let action = unsafe { cv3_tod_verify_start(&mut session, ptr::null(), 0) };
+        assert_eq!(action.kind, ActionKind::Finish as u32);
+        assert_eq!(action.error_code, OutcomeKind::General as i32);
+        let end = action.message.iter().position(|byte| *byte == 0).unwrap();
+        assert!(
+            std::str::from_utf8(&action.message[..end])
+                .expect("a message")
+                .contains("session"),
+            "the error says the session is the problem"
         );
     }
 

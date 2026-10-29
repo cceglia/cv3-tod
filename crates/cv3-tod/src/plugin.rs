@@ -27,14 +27,14 @@ use cv3_core::enrol::EnrolError;
 use cv3_core::event::{Action, TransportError};
 use cv3_core::handshake::{Handshake, HandshakeError};
 use cv3_core::operation::Operation;
-use cv3_core::print::PRINT_PAYLOAD_LEN;
+use cv3_core::print::{PRINT_PAYLOAD_LEN, PrintPayload};
 use cv3_core::session::{CloseError, CloseSession, OpenError, OpenSession, Session};
-use cv3_core::verify::{MatchError, VerifyError};
+use cv3_core::verify::{MatchError, Verification, Verify, VerifyError};
 use cv3_wire::{
     Exchange, FingerWait, IoFailure, IoReply, Transfer, event_from_finger, event_from_outcome,
 };
 
-use crate::secret::{EnrolIvs, Secrets};
+use crate::secret::{EnrolIvs, Secrets, VerifyIvs};
 
 /// What the shim should tell `libfprint` when an operation ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +50,20 @@ pub enum OutcomeKind {
     Busy = 3,
     /// The sensor left the bus.
     Removed = 4,
+    /// A verification the sensor answered, but not with a match for the print asked about.
+    ///
+    /// Not an error: `fprintd` reports "no match" and the user may try again.
+    NoMatch = 5,
+    /// The finger never arrived. `libfprint` carries this as a retry, so `fprintd` says "retry"
+    /// rather than "device error".
+    Retry = 6,
+    /// The operation was cancelled. `libfprint`'s task is already cancelled; the shim reports that
+    /// no match was found and completes.
+    Cancelled = 7,
+    /// The print's stored record is not one this driver can read.
+    DataInvalid = 8,
+    /// The print carries no stored record at all.
+    DataNotFound = 9,
 }
 
 /// One finished open or close.
@@ -377,9 +391,68 @@ enum Job {
     Opening(Box<OpenRun>),
     /// A live session, kept until the close releases its handle and zeroed key.
     Session(Session),
+    Verifying(Box<VerifyRun>),
     Enrolling(Box<EnrolRun>),
     Closing(CloseRun),
     Finished,
+}
+
+/// One step of a whole verification: perform this transfer, or report the final outcome.
+enum VerifyStep {
+    Transfer(Transfer),
+    Finished {
+        output: Result<Verification, VerifyError>,
+        /// The last transport failure, which selects the `libfprint` error.
+        failure: Option<IoFailure>,
+    },
+}
+
+/// Drives one [`Verify`] against the print's recorded match id over the shared transfer machinery.
+///
+/// The request is the vendor's `0x2F` handle form: the sensor matches the captured finger against
+/// the one template handle the print recorded at enrolment, and the reply has to name that same
+/// handle before [`PrintPayload::accepts`] accepts it.
+struct VerifyRun {
+    flow: Flow<Verify>,
+    print: PrintPayload,
+}
+
+impl VerifyRun {
+    fn new(session: Session, print: PrintPayload, ivs: VerifyIvs) -> Self {
+        let operation = Verify::new(session, ivs.capture, ivs.matching)
+            .with_template_handle(print.match_id())
+            .with_command(cv3_core::proto::cmd::IDENTIFY_HANDLES);
+        Self {
+            flow: Flow::new(operation),
+            print,
+        }
+    }
+
+    /// The print this run is answering for.
+    fn print(&self) -> PrintPayload {
+        self.print
+    }
+
+    fn start(&mut self) -> VerifyStep {
+        Self::classify(self.flow.start())
+    }
+
+    fn on_io_result(&mut self, reply: IoReply) -> VerifyStep {
+        Self::classify(self.flow.on_io_result(reply))
+    }
+
+    fn classify(step: FlowStep<Result<Verification, VerifyError>>) -> VerifyStep {
+        match step {
+            FlowStep::Transfer(transfer) => VerifyStep::Transfer(transfer),
+            FlowStep::Finished { output, failure } => VerifyStep::Finished { output, failure },
+            // A verification always asks for the finger wait, which `Flow` performs; this cannot
+            // happen, and reporting it beats panicking inside fprintd.
+            FlowStep::Unsupported => VerifyStep::Finished {
+                output: Err(VerifyError::UnexpectedEvent),
+                failure: None,
+            },
+        }
+    }
 }
 
 /// One step of a whole enrolment: perform this transfer, or report the final outcome.
@@ -495,6 +568,10 @@ impl Plugin {
                 let step = run.on_io_result(reply);
                 self.after_open_step(*run, step)
             }
+            Job::Verifying(mut run) => {
+                let step = run.on_io_result(reply);
+                self.after_verify_step(*run, step)
+            }
             Job::Enrolling(mut run) => {
                 let step = run.on_io_result(reply);
                 self.after_enrol_step(*run, step)
@@ -511,6 +588,56 @@ impl Plugin {
                 ))
             }
         }
+    }
+
+    /// Starts a verification of `payload` — the print's `fpi-data` bytes — on the live session.
+    ///
+    /// The bytes are decoded here, in Rust: an empty payload is [`OutcomeKind::DataNotFound`] and
+    /// anything that is not this driver's bound record is [`OutcomeKind::DataInvalid`], never a
+    /// guess. The verification then runs against the match id the record names and accepts only
+    /// what [`PrintPayload::accepts`] accepts. The session is never opened or closed here.
+    pub fn verify_start(&mut self, payload: &[u8]) -> Step {
+        match VerifyIvs::generate() {
+            Ok(ivs) => self.verify_start_with(payload, ivs),
+            Err(error) => Step::Finished(Outcome::error(
+                OutcomeKind::General,
+                format!("cv3: cannot start the verification: {error}"),
+            )),
+        }
+    }
+
+    /// Starts a verification with the given IVs. Test support for a deterministic run.
+    pub fn verify_start_with(&mut self, payload: &[u8], ivs: VerifyIvs) -> Step {
+        if !matches!(self.job, Job::Session(_)) {
+            return Step::Finished(Outcome::error(
+                OutcomeKind::General,
+                "cv3: verification needs an open sensor session",
+            ));
+        }
+        if payload.is_empty() {
+            return Step::Finished(Outcome::error(
+                OutcomeKind::DataNotFound,
+                "cv3: the print carries no stored record, so there is nothing to verify against",
+            ));
+        }
+        let print = match PrintPayload::decode(payload) {
+            Ok(print) => print,
+            Err(error) => {
+                return Step::Finished(Outcome::error(
+                    OutcomeKind::DataInvalid,
+                    format!("cv3: the print's record cannot be verified: {error}"),
+                ));
+            }
+        };
+        let Job::Session(session) = std::mem::replace(&mut self.job, Job::Finished) else {
+            return Step::Finished(Outcome::error(
+                OutcomeKind::General,
+                "cv3: verification needs an open sensor session",
+            ));
+        };
+        let mut run = VerifyRun::new(session, print, ivs);
+        let step = run.start();
+        self.after_verify_step(run, step)
     }
 
     /// Starts a whole enrolment on the live session and returns the first transfer.
@@ -587,6 +714,13 @@ impl Plugin {
                     message: "cv3: close requested with no completed session".to_owned(),
                 })
             }
+            Job::Verifying(_) => {
+                self.job = Job::Finished;
+                Step::Finished(Outcome {
+                    kind: OutcomeKind::Ok,
+                    message: "cv3: close requested during a verification".to_owned(),
+                })
+            }
             Job::Enrolling(_) => {
                 self.job = Job::Finished;
                 Step::Finished(Outcome {
@@ -627,6 +761,49 @@ impl Plugin {
                     message: message.unwrap_or_default(),
                 })
             }
+        }
+    }
+
+    fn after_verify_step(&mut self, run: VerifyRun, step: VerifyStep) -> Step {
+        let print = run.print();
+        match step {
+            VerifyStep::Transfer(transfer) => {
+                self.job = Job::Verifying(Box::new(run));
+                Step::transfer(transfer)
+            }
+            VerifyStep::Finished {
+                output,
+                failure: io_failure,
+            } => match output {
+                Ok(Verification { verdict, session }) => {
+                    // The session stays open and usable for the next operation: a no-match is a
+                    // result, not a failure, and verify never closes the session itself.
+                    self.job = Job::Session(session);
+                    if print.accepts(&verdict) {
+                        Step::Finished(Outcome::ok())
+                    } else {
+                        Step::Finished(Outcome::error(
+                            OutcomeKind::NoMatch,
+                            format!(
+                                "cv3: no match for this print: verdict {}, matched handle {}, \
+                                 expected {:#010x}",
+                                verdict.word,
+                                match verdict.matched_handle {
+                                    Some(handle) => format!("{handle:#010x}"),
+                                    None => "absent".to_owned(),
+                                },
+                                print.match_id(),
+                            ),
+                        ))
+                    }
+                }
+                Err(error) => {
+                    // The capture or the match tore the session down before reporting, so
+                    // nothing is left to hand back.
+                    self.job = Job::Finished;
+                    Step::Finished(outcome_from_verify(&error, io_failure))
+                }
+            },
         }
     }
 
@@ -834,6 +1011,69 @@ fn bind_kind(error: &BindError, io: Option<IoFailure>) -> OutcomeKind {
         | BindError::Confirmation(VerifyError::Match(MatchError::Transport(_))) => {
             OutcomeKind::General
         }
+    }
+}
+
+/// What `libfprint` is told when a verification did not accept a match.
+///
+/// Three outcomes are kept apart because `fprintd` reports them differently: a no-match (the
+/// sensor answered a verdict that is not this print's), a retry (the finger never arrived) and a
+/// device error (the transport or the protocol failed). The `Accepts` refusal and the payload
+/// checks are decided before this point; only the sensor's answer is classified here.
+fn outcome_from_verify(error: &VerifyError, io: Option<IoFailure>) -> Outcome {
+    match error {
+        // The user did not get a finger down in time: nothing about the sensor is wrong, so this
+        // is the retry vocabulary rather than a device error.
+        VerifyError::Capture(CaptureError::FingerTimeout) => Outcome::error(
+            OutcomeKind::Retry,
+            "cv3: no finger arrived within the finger timeout; place the finger again",
+        ),
+        // The action's cancellable was cancelled. libfprint's task already carries the
+        // cancellation and the shim completes without a match; ticket 15 owns the full path.
+        VerifyError::Capture(CaptureError::Cancelled)
+        | VerifyError::Match(MatchError::Cancelled) => Outcome::error(
+            OutcomeKind::Cancelled,
+            "cv3: the verification was cancelled",
+        ),
+        VerifyError::Capture(CaptureError::Transport(error))
+        | VerifyError::Match(MatchError::Transport(error)) => {
+            let fallback = match error {
+                TransportError::Disconnected => OutcomeKind::Removed,
+                _ => OutcomeKind::General,
+            };
+            let kind = io_kind(io, fallback);
+            Outcome::error(kind, format!("cv3: verification failed: {error}"))
+        }
+        // The sensor answered or refused in a way this driver does not accept: a protocol
+        // failure, not a general one.
+        VerifyError::Capture(
+            CaptureError::AlreadyPending
+            | CaptureError::NoSampleHash
+            | CaptureError::MissingReply
+            | CaptureError::SensorStatus(_)
+            | CaptureError::MalformedReply(_),
+        )
+        | VerifyError::Match(
+            MatchError::WrongSequence
+            | MatchError::SensorStatus { .. }
+            | MatchError::MissingReply
+            | MatchError::MissingVerdict { .. }
+            | MatchError::MalformedReply(_),
+        ) => Outcome::error(
+            OutcomeKind::Proto,
+            format!("cv3: verification failed: {error}"),
+        ),
+        VerifyError::Capture(
+            CaptureError::Build(_) | CaptureError::UnexpectedEvent | CaptureError::AlreadyFinished,
+        )
+        | VerifyError::Match(
+            MatchError::Build(_) | MatchError::UnexpectedEvent | MatchError::AlreadyFinished,
+        )
+        | VerifyError::UnexpectedEvent
+        | VerifyError::AlreadyFinished => Outcome::error(
+            OutcomeKind::General,
+            format!("cv3: verification failed: {error}"),
+        ),
     }
 }
 
@@ -2003,5 +2243,440 @@ mod tests {
         );
         assert_eq!(progress.last().expect("a final report").completed, 13);
         assert!(progress.iter().all(|report| report.completed <= 13));
+    }
+
+    // ---- Verification through the session -----------------------------------------------------
+
+    use cv3_core::print::{PRINT_PAYLOAD_LEN as BOUND_RECORD_LEN, PrintPayload, PrintSource};
+
+    /// The bytes ticket 13 stores on an enrolled print: a bound record naming `COMMIT_HANDLE`.
+    fn bound_payload(handle: u32) -> Vec<u8> {
+        PrintPayload::bound(ENROLMENT_ID, PrintSource::EnrolmentId, handle)
+            .encode()
+            .to_vec()
+    }
+
+    /// An open session and the key its frames use.
+    fn opened_for_verification() -> (Plugin, [u8; SESSION_KEY_LEN]) {
+        let key = session_key();
+        let mut script: VecDeque<IoReply> = [
+            reply(challenge_reply(0)),
+            reply(response_reply(0)),
+            reply(open_reply(0)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (opened_plugin(&mut script), key)
+    }
+
+    fn verify_ivs() -> VerifyIvs {
+        VerifyIvs {
+            capture: [0x80; 16],
+            matching: [0x90; 16],
+        }
+    }
+
+    /// Starts a verification of `payload` and drives it against scripted transport results.
+    fn drive_verify(
+        plugin: &mut Plugin,
+        payload: &[u8],
+        script: &mut VecDeque<IoReply>,
+    ) -> (Step, Vec<Transfer>) {
+        let first = plugin.verify_start_with(payload, verify_ivs());
+        drive(plugin, first, script)
+    }
+
+    /// The two commands one verification sends: the capture arm, then the handle-form match.
+    fn verify_commands(transfers: &[Transfer]) -> Vec<u16> {
+        transfers.iter().filter_map(command_of_opt).collect()
+    }
+
+    #[test]
+    fn a_verification_of_the_bound_print_reports_a_match_and_keeps_the_session() {
+        let (mut plugin, key) = opened_for_verification();
+        let mut script = VecDeque::new();
+        push_confirmation(&mut script, &key, 1, COMMIT_HANDLE);
+
+        let (step, transfers) =
+            drive_verify(&mut plugin, &bound_payload(COMMIT_HANDLE), &mut script);
+
+        assert_eq!(step, Step::Finished(Outcome::ok()));
+        assert_eq!(
+            verify_commands(&transfers),
+            [cmd::ARM_CAPTURE, cmd::IDENTIFY_HANDLES],
+            "a capture arm, then 0x2F against the recorded handle"
+        );
+        assert_eq!(
+            transfers
+                .iter()
+                .filter(|transfer| matches!(transfer, Transfer::FingerIn { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            transfers
+                .iter()
+                .filter(|transfer| matches!(transfer, Transfer::FingerIn { .. }))
+                .all(Transfer::cancellable),
+            "the finger wait is the cancellable transfer"
+        );
+        assert!(
+            matches!(plugin.job, Job::Session(_)),
+            "the session is usable for the next operation"
+        );
+
+        // And it really is: the close still writes the plain 0x04 on it.
+        let mut close = empty_reply().into_iter().collect();
+        let (step, transfers) = close_run(&mut plugin, &mut close);
+        assert_eq!(step, Step::Finished(Outcome::ok()));
+        assert_eq!(command_of(&transfers[0]), cmd::CLOSE_SESSION);
+    }
+
+    #[test]
+    fn a_no_match_is_reported_without_an_error_and_keeps_the_session() {
+        let (mut plugin, key) = opened_for_verification();
+        let mut script = VecDeque::new();
+        push_confirmation(&mut script, &key, 0, 0);
+
+        let (step, _) = drive_verify(&mut plugin, &bound_payload(COMMIT_HANDLE), &mut script);
+
+        match step {
+            Step::Finished(outcome) => {
+                assert_eq!(outcome.kind, OutcomeKind::NoMatch);
+                assert!(outcome.message.contains("no match"), "{}", outcome.message);
+            }
+            other => panic!("expected a finished verification, got {other:?}"),
+        }
+        assert!(matches!(plugin.job, Job::Session(_)));
+    }
+
+    #[test]
+    fn a_match_for_another_handle_is_a_no_match_for_this_print() {
+        let (mut plugin, key) = opened_for_verification();
+        let mut script = VecDeque::new();
+        // Verdict 1, but the sensor matched the other enrolled template.
+        push_confirmation(&mut script, &key, 1, 0x002f_1a08);
+
+        let (step, _) = drive_verify(&mut plugin, &bound_payload(COMMIT_HANDLE), &mut script);
+
+        match step {
+            Step::Finished(outcome) => {
+                assert_eq!(outcome.kind, OutcomeKind::NoMatch);
+                assert!(
+                    outcome.message.contains("0x002f1a08"),
+                    "the message names the handle the sensor matched: {}",
+                    outcome.message
+                );
+            }
+            other => panic!("expected a finished verification, got {other:?}"),
+        }
+        assert!(matches!(plugin.job, Job::Session(_)));
+    }
+
+    #[test]
+    fn a_reply_that_does_not_decrypt_is_a_protocol_failure_not_a_match() {
+        let (mut plugin, key) = opened_for_verification();
+        let mut script = VecDeque::new();
+        script.extend(reply(wrapped_reply(
+            &key,
+            cmd::ARM_CAPTURE,
+            attr::CAPTURE,
+            &sample_hash_plaintext(),
+        )));
+        script.push_back(IoReply::Data(
+            cv3_core::proto::interrupt::FINGER.to_le_bytes().to_vec(),
+        ));
+        // A body too short to be a wrapped reply: the match reply itself is malformed.
+        script.push_back(IoReply::Completed);
+        script.push_back(announcement(8));
+        script.push_back(IoReply::Data(vec![0u8; 8]));
+        // The match's own teardown: the sessionless cancel and the close.
+        script.extend(empty_reply());
+        script.extend(empty_reply());
+
+        let (step, transfers) =
+            drive_verify(&mut plugin, &bound_payload(COMMIT_HANDLE), &mut script);
+
+        match step {
+            Step::Finished(outcome) => {
+                assert_eq!(outcome.kind, OutcomeKind::Proto);
+                assert!(outcome.message.contains("malformed"), "{}", outcome.message);
+            }
+            other => panic!("expected a finished verification, got {other:?}"),
+        }
+        assert_eq!(
+            verify_commands(&transfers)
+                .iter()
+                .filter(|command| **command == cmd::CLOSE_SESSION)
+                .count(),
+            1,
+            "the match's teardown closed the handle it could not trust"
+        );
+        assert!(
+            matches!(plugin.job, Job::Finished),
+            "the teardown closed the session, so there is none to hand back"
+        );
+    }
+
+    #[test]
+    fn a_print_without_a_record_is_data_not_found_before_any_transfer() {
+        let (mut plugin, _) = opened_for_verification();
+
+        let (step, transfers) = drive_verify(&mut plugin, &[], &mut VecDeque::new());
+
+        match step {
+            Step::Finished(outcome) => {
+                assert_eq!(outcome.kind, OutcomeKind::DataNotFound);
+                assert!(
+                    outcome.message.contains("no stored record"),
+                    "{}",
+                    outcome.message
+                );
+            }
+            other => panic!("expected a finished verification, got {other:?}"),
+        }
+        assert!(transfers.is_empty(), "nothing was sent: {transfers:?}");
+        assert!(
+            matches!(plugin.job, Job::Session(_)),
+            "an unusable payload never touched the session"
+        );
+    }
+
+    #[test]
+    fn a_record_of_another_version_or_length_is_data_invalid() {
+        let mut unknown_version = bound_payload(COMMIT_HANDLE);
+        unknown_version[4] = 2;
+        let short = bound_payload(COMMIT_HANDLE)[..BOUND_RECORD_LEN - 1].to_vec();
+        let mut foreign = bound_payload(COMMIT_HANDLE);
+        foreign[0] = b'X';
+
+        for (payload, why) in [
+            (unknown_version, "an unknown version"),
+            (short, "a short record"),
+            (foreign, "a foreign magic"),
+        ] {
+            let (mut plugin, _) = opened_for_verification();
+            let (step, transfers) = drive_verify(&mut plugin, &payload, &mut VecDeque::new());
+
+            match step {
+                Step::Finished(outcome) => {
+                    assert_eq!(outcome.kind, OutcomeKind::DataInvalid, "{why}");
+                }
+                other => panic!("{why}: expected a finished verification, got {other:?}"),
+            }
+            assert!(transfers.is_empty(), "{why}: nothing was sent");
+            assert!(
+                matches!(plugin.job, Job::Session(_)),
+                "{why}: the session is untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn a_finger_that_never_arrives_is_a_retry_not_a_device_error() {
+        let (mut plugin, key) = opened_for_verification();
+        let mut script = VecDeque::new();
+        script.extend(reply(wrapped_reply(
+            &key,
+            cmd::ARM_CAPTURE,
+            attr::CAPTURE,
+            &sample_hash_plaintext(),
+        )));
+        script.push_back(IoReply::Failed(IoFailure::Timeout));
+        // The capture's teardown after the finger timeout.
+        script.extend(empty_reply());
+        script.extend(empty_reply());
+
+        let (step, _) = drive_verify(&mut plugin, &bound_payload(COMMIT_HANDLE), &mut script);
+
+        match step {
+            Step::Finished(outcome) => {
+                assert_eq!(
+                    outcome.kind,
+                    OutcomeKind::Retry,
+                    "fprintd must offer a retry, not a device error: {}",
+                    outcome.message
+                );
+            }
+            other => panic!("expected a finished verification, got {other:?}"),
+        }
+        assert!(matches!(plugin.job, Job::Finished));
+    }
+
+    #[test]
+    fn a_transport_failure_at_each_verification_stage_is_reported() {
+        // The failure is injected at the arm's write, its announcement, its body and the finger
+        // read, in that order.
+        for failure_at in 0..4 {
+            let (mut plugin, key) = opened_for_verification();
+            let mut script = VecDeque::new();
+            match failure_at {
+                0 => script.push_back(IoReply::Failed(IoFailure::Disconnected)),
+                1 => {
+                    script.push_back(IoReply::Completed);
+                    script.push_back(IoReply::Failed(IoFailure::Stall));
+                }
+                2 => {
+                    script.push_back(IoReply::Completed);
+                    script.push_back(announcement(56));
+                    script.push_back(IoReply::Failed(IoFailure::Stall));
+                }
+                _ => {
+                    script.extend(reply(wrapped_reply(
+                        &key,
+                        cmd::ARM_CAPTURE,
+                        attr::CAPTURE,
+                        &sample_hash_plaintext(),
+                    )));
+                    script.push_back(IoReply::Failed(IoFailure::Stall));
+                }
+            }
+            script.extend(empty_reply());
+            script.extend(empty_reply());
+
+            let (step, transfers) =
+                drive_verify(&mut plugin, &bound_payload(COMMIT_HANDLE), &mut script);
+
+            match step {
+                Step::Finished(outcome) => {
+                    let expected = if failure_at == 0 {
+                        OutcomeKind::Removed
+                    } else {
+                        OutcomeKind::General
+                    };
+                    assert_eq!(outcome.kind, expected, "failure {failure_at}");
+                    assert!(
+                        outcome.message.contains("verification failed"),
+                        "failure {failure_at}: {}",
+                        outcome.message
+                    );
+                }
+                other => {
+                    panic!("failure {failure_at}: expected a finished verification, got {other:?}")
+                }
+            }
+            assert!(
+                matches!(plugin.job, Job::Finished),
+                "failure {failure_at}: the teardown closed the session"
+            );
+            assert_eq!(
+                verify_commands(&transfers).last(),
+                Some(&cmd::CLOSE_SESSION),
+                "failure {failure_at}: the best-effort teardown ran"
+            );
+        }
+    }
+
+    #[test]
+    fn a_timestamp_request_during_the_verify_finger_wait_is_answered() {
+        let (mut plugin, key) = opened_for_verification();
+        let mut script = VecDeque::new();
+        script.extend(reply(wrapped_reply(
+            &key,
+            cmd::ARM_CAPTURE,
+            attr::CAPTURE,
+            &sample_hash_plaintext(),
+        )));
+        // The sensor asks for the clock before delivering the finger event.
+        script.push_back(IoReply::Data(
+            cv3_wire::timestamp::HOST_TIMESTAMP_INTERRUPT
+                .to_le_bytes()
+                .to_vec(),
+        ));
+        script.push_back(IoReply::Completed);
+        script.push_back(IoReply::Data(
+            cv3_core::proto::interrupt::FINGER.to_le_bytes().to_vec(),
+        ));
+        let match_plaintext = {
+            let mut plaintext = vec![0u8; 56];
+            plaintext[4..8].copy_from_slice(&4u32.to_le_bytes());
+            plaintext[8..12].copy_from_slice(&1u32.to_le_bytes());
+            plaintext[16..20].copy_from_slice(&4u32.to_le_bytes());
+            plaintext[20..24].copy_from_slice(&COMMIT_HANDLE.to_le_bytes());
+            plaintext
+        };
+        script.extend(reply(wrapped_reply(
+            &key,
+            cmd::IDENTIFY_HANDLES,
+            attr::CAPTURE,
+            &match_plaintext,
+        )));
+
+        let (step, transfers) =
+            drive_verify(&mut plugin, &bound_payload(COMMIT_HANDLE), &mut script);
+
+        assert_eq!(step, Step::Finished(Outcome::ok()));
+        let control = transfers
+            .iter()
+            .position(|transfer| matches!(transfer, Transfer::ControlOut { .. }))
+            .expect("the timestamp request is answered");
+        let Transfer::ControlOut {
+            request,
+            timeout_ms,
+            ..
+        } = &transfers[control]
+        else {
+            unreachable!()
+        };
+        assert_eq!(*request, cv3_wire::timestamp::HOST_TIMESTAMP_REQUEST);
+        assert_eq!(*timeout_ms, cv3_wire::timestamp::SYNC_TIMEOUT_MS);
+        assert!(!transfers[control].cancellable());
+        assert!(matches!(transfers[control - 1], Transfer::FingerIn { .. }));
+        assert!(matches!(transfers[control + 1], Transfer::FingerIn { .. }));
+        assert!(matches!(plugin.job, Job::Session(_)));
+    }
+
+    #[test]
+    fn a_cancelled_finger_wait_completes_without_a_match() {
+        let (mut plugin, key) = opened_for_verification();
+        let mut script = VecDeque::new();
+        script.extend(reply(wrapped_reply(
+            &key,
+            cmd::ARM_CAPTURE,
+            attr::CAPTURE,
+            &sample_hash_plaintext(),
+        )));
+        script.push_back(IoReply::Failed(IoFailure::Cancelled));
+        // The capture's teardown: the sessionless cancel and the close.
+        script.extend(empty_reply());
+        script.extend(empty_reply());
+
+        let (step, transfers) =
+            drive_verify(&mut plugin, &bound_payload(COMMIT_HANDLE), &mut script);
+
+        match step {
+            Step::Finished(outcome) => {
+                assert_eq!(outcome.kind, OutcomeKind::Cancelled);
+                assert!(outcome.message.contains("cancelled"), "{}", outcome.message);
+            }
+            other => panic!("expected a finished verification, got {other:?}"),
+        }
+        // The capture was cancelled on the sensor, so the cancelled run leaves the sensor with no
+        // armed capture and no session handle. Ticket 15 owns making the *device* reusable after a
+        // cancel without fprintd reopening it; verify itself never closes a live session.
+        assert_eq!(
+            verify_commands(&transfers),
+            [cmd::ARM_CAPTURE, cmd::CANCEL_CAPTURE, cmd::CLOSE_SESSION]
+        );
+    }
+
+    #[test]
+    fn a_verification_needs_an_open_session() {
+        let mut plugin = Plugin::new();
+        let (step, transfers) = drive_verify(
+            &mut plugin,
+            &bound_payload(COMMIT_HANDLE),
+            &mut VecDeque::new(),
+        );
+
+        match step {
+            Step::Finished(outcome) => {
+                assert_eq!(outcome.kind, OutcomeKind::General);
+                assert!(outcome.message.contains("session"), "{}", outcome.message);
+            }
+            other => panic!("expected a finished verification, got {other:?}"),
+        }
+        assert!(transfers.is_empty());
     }
 }

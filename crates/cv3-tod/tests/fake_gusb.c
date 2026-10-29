@@ -229,6 +229,19 @@ fake_gusb_plan_enrol (void)
   add_vanished_device ();
 }
 
+/* A successful open followed by a sensor that answers nothing more: the verification's arm reaches
+ * the core, whose capture fails and whose best-effort teardown follows. A *successful* verify needs
+ * wrapped replies the fake cannot fabricate (it holds no session key), so the accepted match and the
+ * no-match are covered by the Rust tests and by the hardware run. */
+void
+fake_gusb_plan_verify (void)
+{
+  fake_gusb_reset ();
+  add_challenge_reply ();
+  add_response_reply (0x00);
+  add_open_reply ();
+}
+
 guint
 fake_gusb_out_count (void)
 {

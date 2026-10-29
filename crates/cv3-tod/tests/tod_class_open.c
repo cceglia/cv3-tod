@@ -10,7 +10,8 @@
  *  - the exported entry point resolves and returns a class carrying the identity and the id table
  *    the SPEC names;
  *  - every vfunc libfprint calls through the class pointer without a NULL guard (`open`, `close`,
- *    `enroll`) is non-NULL: a NULL there is a segfault inside fprintd, which runs as root;
+ *    `enroll`, `verify`) is non-NULL: a NULL there is a segfault inside fprintd, which runs as
+ *    root; the vfuncs for the features this driver does not declare stay NULL;
  *  - a first Claim whose 0x24 reply is refused fails with FP_DEVICE_ERROR_PROTO, and before it
  *    reports the failure it writes the plain 0x04 that releases the handle the 0x23 reply named,
  *    releases interface 0 and closes the GUsb handle libfprint opened: no handle is left on the
@@ -19,6 +20,8 @@
  *    and completes; a failed open leaves nothing behind that stops the next one;
  *  - Release sends the plain 0x04, releases the interface and completes successfully; a further
  *    Release is refused by libfprint with NOT_OPEN and nothing crashes.
+ *  - a verification of a print with no record fails with DATA_NOT_FOUND and of one with an unknown
+ *    record version with DATA_INVALID, both before any frame; the real record reaches the core.
  *
  * The scripted replies are real frames the Rust core parses and cryptographically accepts; the
  * fake fabricates nothing the core would reject. The fake also enforces libfprint's transfer
@@ -33,6 +36,7 @@
 /* tests/fake_gusb.c, linked into this executable so its symbols interpose for the plugin. */
 void fake_gusb_plan_session (void);
 void fake_gusb_plan_enrol (void);
+void fake_gusb_plan_verify (void);
 void fake_gusb_plan_vanishing (void);
 void fake_gusb_plan_close_failure (void);
 guint fake_gusb_out_count (void);
@@ -94,10 +98,12 @@ check_identity (FpDeviceClass *klass)
          "scan type is press (got %d)", klass->scan_type);
 
   /* Enrolment is advertised by the stage count, not by a feature bit: libfprint 1.95 has no
-   * FP_DEVICE_FEATURE_ENROLL. The class must still carry one feature for construction, and that
-   * placeholder is withdrawn by probe. */
+   * FP_DEVICE_FEATURE_ENROLL. The class must still carry one feature for construction, and the one
+   * this driver implements is VERIFY. */
   check (klass->nr_enroll_stages == 13,
          "the class declares thirteen enrolment stages (got %d)", klass->nr_enroll_stages);
+  check (klass->features == FP_DEVICE_FEATURE_VERIFY,
+         "the class declares VERIFY and nothing else (got 0x%02x)", klass->features);
 
   check (klass->id_table != NULL, "the class has an id table");
   if (klass->id_table != NULL)
@@ -113,10 +119,23 @@ check_identity (FpDeviceClass *klass)
 static void
 check_unconditional_vfuncs (FpDeviceClass *klass)
 {
-  /* libfprint 1.95 dereferences these three through the class pointer without testing for NULL. */
+  /* libfprint 1.95 dereferences these four through the class pointer without testing for NULL. */
   check (klass->open != NULL, "open is set");
   check (klass->close != NULL, "close is set");
   check (klass->enroll != NULL, "enroll is set");
+  check (klass->verify != NULL, "verify is set");
+}
+
+/* The features this driver does not declare must stay NULL, or libfprint would offer an operation
+ * that cannot work and dereference a missing vfunc. */
+static void
+check_undeclared_vfuncs (FpDeviceClass *klass)
+{
+  check (klass->capture == NULL, "capture is not offered");
+  check (klass->identify == NULL, "identify is not offered");
+  check (klass->list == NULL, "list is not offered");
+  check (klass->delete == NULL, "delete is not offered");
+  check (klass->clear_storage == NULL, "clear_storage is not offered");
 }
 
 static void
@@ -402,6 +421,116 @@ check_enrol_failure (GType type)
   g_object_unref (usb);
 }
 
+/* Verification on an open session, for the three things the fake can honestly show:
+ *
+ *  - a print with no `fpi-data` is refused with FP_DEVICE_ERROR_DATA_NOT_FOUND and nothing is
+ *    written — the driver never guesses a match id;
+ *  - a print whose record this driver does not know (another version) is refused with
+ *    FP_DEVICE_ERROR_DATA_INVALID, also before any transfer;
+ *  - the real record reaches the core, which writes the `0x66` capture arm, fails on the sensor the
+ *    fake does not answer, and runs its best-effort teardown.
+ *
+ * The accepted match and the no-match themselves need wrapped replies, which the fake cannot
+ * fabricate without the session key; the Rust tests cover them and the hardware run confirms them.
+ */
+static void
+check_verify (GType type)
+{
+  static const guint8 record[30] = {
+    'C', 'V', '3', 'P', 1, 1,
+    0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5,
+    0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5,
+    0x1f, 0x36, 0xf2, 0x00,
+  };
+  guint8 unknown_version[sizeof record];
+  FpDevice *device = g_object_new (type, NULL);
+  GUsbDevice *usb = g_object_new (G_USB_TYPE_DEVICE, NULL);
+  GTypeClass *base_class = g_type_class_ref (FP_TYPE_DEVICE);
+  gint private_offset = g_type_class_get_instance_private_offset (base_class);
+  GError *error = NULL;
+  FpPrint *print;
+  gboolean matched = TRUE;
+
+  g_object_ref (usb);
+  *(GUsbDevice **) ((char *) device + private_offset + 8) = usb;
+  g_type_class_unref (base_class);
+
+  fake_gusb_plan_verify ();
+  check (fp_device_open_sync (device, NULL, &error),
+         "the open before a verification succeeds (got error `%s`)",
+         error ? error->message : "-");
+  g_clear_error (&error);
+
+  /* No stored record: DATA_NOT_FOUND, and no frame is written. */
+  print = fp_print_new (device);
+  check (!fp_device_verify_sync (device, print, NULL, NULL, NULL, &matched, NULL, &error),
+         "a print without a record does not verify");
+  check (error != NULL && error->domain == FP_DEVICE_ERROR
+           && error->code == FP_DEVICE_ERROR_DATA_NOT_FOUND,
+         "a print without a record reports DATA_NOT_FOUND (got %d `%s`)",
+         error ? error->code : -1, error ? error->message : "-");
+  check (error != NULL && g_strstr_len (error->message, -1, "cv3") != NULL,
+         "the DATA_NOT_FOUND error names the driver (got `%s`)",
+         error ? error->message : "-");
+  g_clear_error (&error);
+  g_object_unref (print);
+  check (fake_gusb_out_count () == 3,
+         "a print without a record wrote no frame (got %u)", fake_gusb_out_count ());
+
+  /* A record of an unknown version: DATA_INVALID, and still no frame. */
+  memcpy (unknown_version, record, sizeof record);
+  unknown_version[4] = 2;
+  print = fp_print_new (device);
+  g_object_set (print, "fpi-type", FPI_PRINT_RAW, NULL);
+  g_object_set (print, "fpi-data",
+                g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, unknown_version,
+                                           sizeof unknown_version, 1),
+                NULL);
+  check (!fp_device_verify_sync (device, print, NULL, NULL, NULL, &matched, NULL, &error),
+         "a print with an unknown record version does not verify");
+  check (error != NULL && error->domain == FP_DEVICE_ERROR
+           && error->code == FP_DEVICE_ERROR_DATA_INVALID,
+         "an unknown record version reports DATA_INVALID (got %d `%s`)",
+         error ? error->code : -1, error ? error->message : "-");
+  g_clear_error (&error);
+  g_object_unref (print);
+  check (fake_gusb_out_count () == 3,
+         "an unknown record version wrote no frame (got %u)", fake_gusb_out_count ());
+
+  /* The real record: the core arms the capture and the unanswered sensor fails the run. */
+  print = fp_print_new (device);
+  g_object_set (print, "fpi-type", FPI_PRINT_RAW, NULL);
+  g_object_set (print, "fpi-data",
+                g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, record, sizeof record, 1),
+                NULL);
+  check (!fp_device_verify_sync (device, print, NULL, NULL, NULL, &matched, NULL, &error),
+         "a verification the sensor does not answer fails");
+  check (error != NULL && error->domain == FP_DEVICE_ERROR,
+         "the failed verification fails in the fp-device domain (got `%s`)",
+         error ? g_quark_to_string (error->domain) : "-");
+  check (error != NULL && g_strstr_len (error->message, -1, "verification failed") != NULL,
+         "the failed verification says it was the verification (got `%s`)",
+         error ? error->message : "-");
+  g_clear_error (&error);
+  g_object_unref (print);
+
+  expect_commands ((const guint16[]) { 0x23, 0x24, 0x02, 0x66, 0x68, 0x04 }, 6,
+                   "the failed verification");
+  check (fake_gusb_is_open (), "the failed verification leaves the device open");
+  check (fake_gusb_interface_claimed (),
+         "the failed verification keeps interface 0 claimed");
+
+  check (fp_device_close_sync (device, NULL, &error),
+         "the device closes after a failed verification (got error `%s`)",
+         error ? error->message : "-");
+  g_clear_error (&error);
+  check (!fake_gusb_interface_claimed (),
+         "the close after a failed verification released interface 0");
+
+  g_object_unref (device);
+  g_object_unref (usb);
+}
+
 /* The bound record is stored as a GVariant of type `ay` under `fpi-data`, with `fpi-type` RAW.
  * Pin that this libfprint round-trips it through fp_print_serialize/fp_print_deserialize: the
  * driver's success path relies on exactly this representation, which no Rust test can check. */
@@ -502,8 +631,10 @@ main (int argc, char **argv)
   klass = g_type_class_ref (type);
   check_identity (klass);
   check_unconditional_vfuncs (klass);
+  check_undeclared_vfuncs (klass);
   check_session (type);
   check_enrol_failure (type);
+  check_verify (type);
   check_print_payload_round_trip (type);
   check_vanished_device (type);
   check_close_transfer_failure (type);

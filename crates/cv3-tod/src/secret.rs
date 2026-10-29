@@ -61,6 +61,25 @@ impl EnrolIvs {
     }
 }
 
+/// The two IVs one verification needs.
+///
+/// The core generates no randomness: the capture arm and the match request each take a fresh IV.
+/// They are drawn per verification so no two CBC frames share one.
+pub struct VerifyIvs {
+    pub capture: [u8; BLOCK_LEN],
+    pub matching: [u8; BLOCK_LEN],
+}
+
+impl VerifyIvs {
+    /// Draws the two IVs from the operating system.
+    pub fn generate() -> Result<Self, RandomError> {
+        Ok(Self {
+            capture: random_bytes()?,
+            matching: random_bytes()?,
+        })
+    }
+}
+
 /// The operating system refused to supply randomness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RandomError(pub String);
@@ -103,5 +122,14 @@ mod tests {
         assert_ne!(ivs.enrol, ivs.matching);
         assert_ne!(ivs.confirmation_capture, ivs.matching);
         assert_ne!(ivs.enrol, again.enrol);
+    }
+
+    #[test]
+    fn a_verification_uses_two_fresh_different_ivs() {
+        let ivs = VerifyIvs::generate().expect("OS randomness");
+        let again = VerifyIvs::generate().expect("OS randomness");
+
+        assert_ne!(ivs.capture, ivs.matching);
+        assert_ne!(ivs.capture, again.capture);
     }
 }
