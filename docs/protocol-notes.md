@@ -252,9 +252,13 @@ Measured 2026-10-29:
 - **A no-match carries the same shape with zeros**: `(0,4,0)(0,4,0)`.
 - **There is no 20-byte value at `+32`**: the reference's value was the token.
 
-Ticket 09 still owes: a capture and match immediately after a commit in one session (the probe's
-`enroll-then-verify` now uses the commit reply's handle for that confirmation), and the same
-measurement for a second finger to show the handle is per-template.
+Also measured: **a capture and a match immediately after a commit, in the same session**, work.
+`enroll-then-verify` committed handle `0x007069a9` and the confirmation touch answered `status 0x00`,
+`verdict 1`, `matched handle 0x007069a9`.
+
+Ticket 09 still owes the same-finger-twice and second-finger comparisons, which show whether the
+handle is per-enrolment (it is expected to be) and that a different finger's template cannot
+satisfy another print's handle.
 
 ## Inventory
 

@@ -10,8 +10,8 @@ that the design cannot work as written.
 Time box: **three hardware sessions or one calendar week, whichever comes first.** Reaching it without
 an answer is a result: record what was observed and stop.
 
-- [ ] A capture and a match immediately after a commit are demonstrated to work, or to fail, on hardware
-      — the reference implementation never does this
+- [x] A capture and a match immediately after a commit are demonstrated to work on hardware:
+      `enroll-then-verify` committed `0x007069a9` and the confirmation touch matched it.
 - [x] The value returned with a match is compared with the enrolment id from `0x6C`: different.
       The match reply's `(0,4,…)` entry is the commit reply's handle (`0x00f2361f`), not the 20-byte
       enrolment id.
