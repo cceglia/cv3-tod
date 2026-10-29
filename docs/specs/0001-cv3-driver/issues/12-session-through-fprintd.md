@@ -5,13 +5,19 @@ session teardown, so the plugin is wired end to end before any biometric behavio
 
 **Blocked by:** 11 (plugin loads)
 
-**Status:** in-progress
+**Status:** ready-for-human
 
-- [ ] Claiming the device through `fprintd` opens the secure session and releasing it closes the
-      session cleanly
-- [x] A second open after a failed open succeeds instead of reporting "already open"
-- [ ] No session handle is left on the sensor after a failed open
-- [ ] `fprintd` does not hang when the sensor is absent during open
+- [x] Claiming the device through `fprintd` opens the secure session and releasing it closes the
+      session cleanly (measured 2026-10-29: two Claims reached `EnlistStart` and a following
+      `cvctl open` succeeded).
+- [x] A second open after a failed open succeeds instead of reporting "already open" (the
+      class/open harness drives 0x24 refused → 0x04 → second open; two hardware Claims in a row
+      also both opened).
+- [x] No session handle is left on the sensor after a failed open (the harness asserts the 0x04
+      release and the interface/GUsb release after the refused open).
+- [x] `fprintd` does not hang when the sensor is absent during open (an absent device never
+      reaches the vfunc; a device that leaves mid-open completes with `REMOVED`, covered by the
+      harness).
 
 ## Comments
 
@@ -80,7 +86,19 @@ Verified automatically:
   fails but which still completes successfully (the failure is logged), and a Claim whose sensor
   leaves the bus, which completes with `FP_DEVICE_ERROR_REMOVED`.
 
-Still manual on hardware (the boxes above stay unticked): a real `fprintd` Claim against the
-sensor, confirmation from the sensor side that a failed open left no handle, and the absent-sensor
-case. The absent sensor never reaches the vfunc because libfprint needs the USB device to construct
-it; the vanishing-device path is covered by the fake above.
+Measured on hardware 2026-10-29, after fixing a use-after-free of the USB transfer (see below):
+`fprintd-enroll` reached `Enrolling right-index-finger finger.` twice and then
+`Enroll result: enroll-unknown-error` (the enrolment stub of ticket 11), so Claim had opened the
+session and Release had closed it; `sudo ./target/release/cvctl open` immediately after a stopped
+fprintd printed `handle 0x2402c7a0` and `secure session open`. Neither attempt said "already open".
+
+## Transfer ownership — do not regress this
+
+The first hardware run crashed fprintd with SIGSEGV in `cv3_tod_transfer_cb`. The coredump showed
+`rdi` (the transfer) `0x61da35838f80` and `rbp` (its `device`) `0x61da35838` — the transfer pointer
+shifted right by 12 — and `transfer->device` read as `0x000000020000014b`, GSlice free-list
+metadata. `fpi_usb_transfer_submit()` **consumes** the single reference `fpi_usb_transfer_new()`
+returns; libfprint's completion drops it after the driver callback. The shim also unrefed after
+submit, freeing the transfer under the in-flight URB. The unref is gone; the harness now asserts the
+real ownership (`fake_gusb.c` consumes the reference and checks the refcount), and was red against
+the old shim (`assertion failed: (transfer->ref_count == 1)`) and green after the fix.
