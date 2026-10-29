@@ -6,17 +6,24 @@ any protocol work exists.
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-human
+**Status:** done
 
-- [ ] `cvctl devices` prints the sensor's vendor and product, bus and port when it is present
-- [ ] It refuses with a distinct "busy" message, without disturbing anything, when another process
-      (such as `fprintd`) holds the sensor
-- [ ] It reports a clear "not found" and exits non-zero when the sensor is absent
-- [ ] It claims the interface, reads the endpoint layout, and releases both on the success path, on
-      error, and on a catchable signal
-- [ ] An announced non-zero reply body is always read before the next command, and a zero-length
+- [x] `cvctl devices` prints the sensor's vendor and product, bus and port when it is present
+      (measured 2026-10-29: `vendor 0a5c product 5843 bus 3 port 8`).
+- [x] It refuses with a distinct "busy" message, without disturbing anything, when another process
+      (such as `fprintd`) holds the sensor (measured: exit 3 and `interface 0 is already claimed`
+      while a verify was waiting).
+- [x] It reports a clear "not found" and exits non-zero when the sensor is absent (measured with the
+      device deauthorized: `sensor 0a5c:5843 not found`, exit 2; it came back after reauthorizing).
+- [x] It claims the interface, reads the endpoint layout, and releases both on the success path, on
+      error, and on a catchable signal (measured: `devices` twice around the busy and absent cases;
+      Ctrl+C during `capture` gave `capture cancelled` and the next `devices` succeeded).
+- [x] An announced non-zero reply body is always read before the next command, and a zero-length
       announcement performs no read — both covered by tests
-- [ ] No code path resets the USB device or writes the port's `disable` knob
+      (`a_non_zero_announcement_reads_exactly_its_body`,
+      `a_zero_length_announcement_performs_no_bulk_read`).
+- [x] No code path resets the USB device or writes the port's `disable` knob (grep of the probe
+      sources: neither call exists).
 
 ## Comments
 
