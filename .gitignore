@@ -4,3 +4,5 @@
 /*.deb
 # Local session recordings are real device traffic; never commit them.
 *.cvrec
+# Agent scratch: the handoff and reports are local, the skills are tracked.
+/.agents/tmp/
