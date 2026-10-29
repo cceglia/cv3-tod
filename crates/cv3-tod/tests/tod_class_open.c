@@ -22,6 +22,9 @@
  *    Release is refused by libfprint with NOT_OPEN and nothing crashes.
  *  - a verification of a print with no record fails with DATA_NOT_FOUND and of one with an unknown
  *    record version with DATA_INVALID, both before any frame; the real record reaches the core.
+ *  - every transfer submitted in these scenarios is a command, and every one is submitted with a
+ *    NULL GCancellable. The one cancellable transfer, the finger wait, needs the shim-dispatch
+ *    harness because the fake cannot fabricate the wrapped reply that precedes it.
  *
  * The scripted replies are real frames the Rust core parses and cryptographically accepts; the
  * fake fabricates nothing the core would reject. The fake also enforces libfprint's transfer
@@ -39,6 +42,8 @@ void fake_gusb_plan_enrol (void);
 void fake_gusb_plan_verify (void);
 void fake_gusb_plan_vanishing (void);
 void fake_gusb_plan_close_failure (void);
+guint fake_gusb_submit_count (void);
+gboolean fake_gusb_submit_cancellable (guint index);
 guint fake_gusb_out_count (void);
 guint16 fake_gusb_out_command (guint index);
 gboolean fake_gusb_is_open (void);
@@ -83,6 +88,21 @@ expect_commands (const guint16 *expected, guint count, const char *stage)
       check (command == expected[i], "%s frame %u is 0x%02x (got 0x%02x)",
              stage, i + 1, expected[i], command);
     }
+}
+
+/* Every transfer the shim submitted in this plan was a command (bulk OUT, interrupt announcement,
+ * body or control), so every one must have been submitted with a NULL GCancellable. The finger
+ * wait, the one cancellable transfer, is reached only by the shim-dispatch harness below because
+ * this fake cannot fabricate the wrapped reply that precedes it. */
+static void
+check_command_submissions (const char *stage)
+{
+  guint count = fake_gusb_submit_count ();
+
+  check (count > 0, "%s submitted at least one transfer", stage);
+  for (guint i = 0; i < count; i++)
+    check (!fake_gusb_submit_cancellable (i),
+           "%s submission %u was a command with a NULL cancellable", stage, i);
 }
 
 static void
@@ -136,6 +156,9 @@ check_undeclared_vfuncs (FpDeviceClass *klass)
   check (klass->list == NULL, "list is not offered");
   check (klass->delete == NULL, "delete is not offered");
   check (klass->clear_storage == NULL, "clear_storage is not offered");
+  /* No second cancellation source: libfprint cancels the action's GCancellable itself, and the
+   * finger wait is the only transfer submitted with it. */
+  check (klass->cancel == NULL, "cancel is NULL; the GCancellable is the only cancel source");
 }
 
 static void
@@ -266,6 +289,8 @@ check_session (GType type)
     g_clear_error (&error);
   }
 
+  check_command_submissions ("the claim/release session");
+
   g_object_unref (device);
   g_object_unref (usb);
 }
@@ -310,6 +335,7 @@ check_vanished_device (GType type)
          "the vanished-device open released interface 0");
   check (!fake_gusb_is_open (),
          "the vanished-device open closed the GUsb handle");
+  check_command_submissions ("the vanished-device open");
 
   g_object_unref (device);
   g_object_unref (usb);
@@ -351,6 +377,7 @@ check_close_transfer_failure (GType type)
            "the failing close frame is 0x04 (got 0x%02x)", fake_gusb_out_command (3));
   check (!fake_gusb_interface_claimed (), "the failing close released interface 0");
   check (!fake_gusb_is_open (), "the failing close closed the GUsb handle");
+  check_command_submissions ("the failing close");
 
   g_object_unref (device);
   g_object_unref (usb);
@@ -416,6 +443,7 @@ check_enrol_failure (GType type)
          error ? error->message : "-");
   g_clear_error (&error);
   check (!fake_gusb_interface_claimed (), "the close after a failed enrolment released interface 0");
+  check_command_submissions ("the failed enrolment");
 
   g_object_unref (device);
   g_object_unref (usb);
@@ -526,6 +554,7 @@ check_verify (GType type)
   g_clear_error (&error);
   check (!fake_gusb_interface_claimed (),
          "the close after a failed verification released interface 0");
+  check_command_submissions ("the failed verification");
 
   g_object_unref (device);
   g_object_unref (usb);

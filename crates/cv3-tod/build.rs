@@ -36,6 +36,7 @@ const DEVICE_NAME: &str = "Dell/Broadcom ControlVault 3";
 
 fn main() {
     println!("cargo:rerun-if-changed=shim/cv3_tod.c");
+    println!("cargo:rerun-if-changed=shim/cv3_tod.h");
     println!("cargo:rerun-if-changed=build.rs");
 
     let manifest_dir = PathBuf::from(

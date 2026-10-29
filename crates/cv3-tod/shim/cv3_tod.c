@@ -17,100 +17,11 @@
  */
 #include "drivers_api.h"
 
+#include "cv3_tod.h"
 #include "cv3_tod_identity.h"
 
 /* The sensor's one interface, claimed for the life of an open. */
 #define CV3_INTERFACE 0
-
-/* ---- The Rust boundary, defined in src/ffi.rs. -------------------------------------------- */
-
-typedef struct _Cv3Tod Cv3Tod;
-
-typedef enum
-{
-  CV3_ACTION_OUT = 0,
-  CV3_ACTION_INTERRUPT_IN = 1,
-  CV3_ACTION_BULK_IN = 2,
-  CV3_ACTION_CONTROL = 3,
-  CV3_ACTION_FINISH = 4,
-  /* The finger event: an interrupt read, and the only transfer submitted cancellable. */
-  CV3_ACTION_WAIT_FINGER = 5,
-} Cv3ActionKind;
-
-typedef enum
-{
-  CV3_IO_COMPLETED = 0,
-  CV3_IO_DATA = 1,
-  CV3_IO_FAILED = 2,
-} Cv3IoResult;
-
-typedef enum
-{
-  CV3_IO_ERROR_TIMEOUT = 0,
-  CV3_IO_ERROR_DISCONNECTED = 1,
-  CV3_IO_ERROR_CANCELLED = 2,
-  CV3_IO_ERROR_BUSY = 3,
-  CV3_IO_ERROR_STALL = 4,
-  CV3_IO_ERROR_OTHER = 5,
-} Cv3IoError;
-
-/* Matches cv3_tod::plugin::OutcomeKind. */
-typedef enum
-{
-  CV3_FINISH_OK = 0,
-  CV3_FINISH_GENERAL = 1,
-  CV3_FINISH_PROTO = 2,
-  CV3_FINISH_BUSY = 3,
-  CV3_FINISH_REMOVED = 4,
-  /* The sensor answered a verdict, but not a match for the print asked about. */
-  CV3_FINISH_NO_MATCH = 5,
-  /* No finger arrived: libfprint carries this as a retry, not a device error. */
-  CV3_FINISH_RETRY = 6,
-  /* The operation's cancellable was cancelled; libfprint's task already knows. */
-  CV3_FINISH_CANCELLED = 7,
-  CV3_FINISH_DATA_INVALID = 8,
-  CV3_FINISH_DATA_NOT_FOUND = 9,
-} Cv3FinishKind;
-
-/* Must match cv3_tod::ffi::Cv3Action, which static-asserts the same size and offsets. */
-typedef struct
-{
-  guint32  kind;
-  guint8   endpoint;
-  guint8   request_type;
-  guint8   request;
-  /* One when this transfer must be submitted with the action's cancellable. */
-  guint8   cancellable;
-  guint16  value;
-  guint16  index;
-  guint32  timeout_ms;
-  guint8  *buffer;
-  gsize    length;
-  gint32   status;
-  gint32   error_code;
-  char     message[256];
-} Cv3Action;
-
-_Static_assert (sizeof (Cv3Action) == 296,
-                "Cv3Action must match cv3-tod's #[repr(C)] layout");
-_Static_assert (G_STRUCT_OFFSET (Cv3Action, cancellable) == 7,
-                "Cv3Action.cancellable must stay at offset 7");
-_Static_assert (G_STRUCT_OFFSET (Cv3Action, message) == 40,
-                "Cv3Action.message must stay at offset 40");
-
-Cv3Tod *cv3_tod_create (void);
-void cv3_tod_destroy (Cv3Tod *tod);
-Cv3Action cv3_tod_open_start (Cv3Tod *tod);
-Cv3Action cv3_tod_on_transfer (Cv3Tod *tod,
-                               guint32 result,
-                               guint32 error,
-                               gsize   actual_length);
-Cv3Action cv3_tod_close_start (Cv3Tod *tod);
-gint32 cv3_tod_enrol_stages (void);
-Cv3Action cv3_tod_enrol_start (Cv3Tod *tod);
-gint32 cv3_tod_take_progress (Cv3Tod *tod, gint32 *completed);
-gsize cv3_tod_take_payload (Cv3Tod *tod, guint8 *destination, gsize capacity);
-Cv3Action cv3_tod_verify_start (Cv3Tod *tod, const guint8 *payload, gsize length);
 
 /* ---- The device --------------------------------------------------------------------------- */
 
@@ -314,12 +225,19 @@ cv3_tod_close_finished (FpDevice *device)
 
 /* Ends a verification: reports the match result and completes.
  *
- * A match, a no-match and a cancelled run are reported with no error, which is what `fprintd` turns
- * into `verify-match` and `verify-no-match`; a cancelled run's task still returns the cancellation
- * to its caller. A retry is reported as FPI_MATCH_ERROR carrying libfprint's retry error, which is
- * the only shape libfprint accepts with an error: an error next to a match result is itself a
- * driver bug it warns about. libfprint takes ownership of that error. Every other finish completes
- * with the mapped device error.
+ * A match and a no-match are reported with no error, which is what `fprintd` turns into
+ * `verify-match` and `verify-no-match`. A retry is reported as FPI_MATCH_ERROR carrying libfprint's
+ * retry error, which is the only shape libfprint accepts with an error: an error next to a match
+ * result is itself a driver bug it warns about. libfprint takes ownership of that error.
+ *
+ * A cancelled run is neither a match nor a no-match: it completes with an error and reports no
+ * verdict. libfprint's task already carries the external cancellation and returns
+ * G_IO_ERROR_CANCELLED to the client regardless, but reporting FPI_MATCH_FAIL here would hand
+ * `fprintd` a "verify-no-match" callback for an operation the user abandoned, before the
+ * cancellation is seen. The core sends its `0x68`/`0x04` teardown before it finishes, so this
+ * completion happens only after those transfers have completed.
+ *
+ * Every other finish completes with the mapped device error.
  */
 static void
 cv3_tod_verify_finished (FpDevice *device, const Cv3Action *action)
@@ -342,9 +260,9 @@ cv3_tod_verify_finished (FpDevice *device, const Cv3Action *action)
                                                           action->message));
       break;
     case CV3_FINISH_CANCELLED:
-      /* A cancelled run found no match: the report keeps the match decision explicit, and
-       * libfprint's cancelled task still returns the cancellation to its caller. */
-      fpi_device_verify_report (device, FPI_MATCH_FAIL, NULL, NULL);
+      /* No report: a cancellation is not a verdict. The error is replaced by libfprint's
+       * G_IO_ERROR_CANCELLED because the task's cancellable is cancelled. */
+      error = fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL, "%s", action->message);
       break;
     default:
       error = fpi_device_error_new_msg (cv3_tod_error_for (action->error_code), "%s",
@@ -357,6 +275,23 @@ cv3_tod_verify_finished (FpDevice *device, const Cv3Action *action)
 
 static void
 cv3_tod_dispatch (FpDevice *device, Cv3Action action);
+
+/* Whether libfprint's cancellable for the current action has been cancelled.
+ *
+ * A cancellation can arrive while a command transfer is in flight. That transfer is deliberately
+ * not cancellable, so it runs to its result and the core may finish normally — for example a
+ * verification whose match command was already on the bus, or an enrolment whose confirmation
+ * match completed. The client asked to stop, so the shim must not turn that result into a match or
+ * a stored print: it completes with the cancellation instead. This reads the same GCancellable
+ * libfprint cancels; it is not a second cancellation source.
+ */
+static gboolean
+cv3_tod_action_cancelled (FpDevice *device)
+{
+  GCancellable *cancellable = fpi_device_get_cancellable (device);
+
+  return cancellable != NULL && g_cancellable_is_cancelled (cancellable);
+}
 
 /* Reports every stage or rejected sample the core has queued since the last call.
  *
@@ -494,6 +429,18 @@ cv3_tod_dispatch (FpDevice *device, Cv3Action action)
 
           self->enrolling = FALSE;
           self->enroll_print = NULL;
+          if (action.status == 0 && cv3_tod_action_cancelled (device))
+            {
+              /* The command in flight completed, but the client cancelled: store nothing. The
+               * template may remain on the sensor; the message says so. */
+              fpi_device_enroll_complete (
+                device, NULL,
+                fpi_device_error_new_msg (
+                  FP_DEVICE_ERROR_GENERAL,
+                  "cv3: the enrolment was cancelled; a template may remain on the sensor and "
+                  "cannot be identified or removed yet"));
+              return;
+            }
           if (action.status == 0)
             {
               guint8 payload[64];
@@ -521,6 +468,9 @@ cv3_tod_dispatch (FpDevice *device, Cv3Action action)
             }
           else
             {
+              /* A cancelled enrolment takes this path too: no print is stored, the core's
+               * teardown has already completed, and libfprint returns G_IO_ERROR_CANCELLED to the
+               * client because the task's cancellable is cancelled. */
               fpi_device_enroll_complete (
                 device, NULL,
                 fpi_device_error_new_msg (cv3_tod_error_for (action.error_code), "%s",
@@ -530,6 +480,18 @@ cv3_tod_dispatch (FpDevice *device, Cv3Action action)
       else if (self->verifying)
         {
           self->verifying = FALSE;
+          /* A cancellation that landed during a non-cancellable command (or just after the core
+           * finished) must not become a verdict: complete with the cancellation, with no match
+           * report. The core's own cancelled outcome takes the same path. */
+          if (cv3_tod_action_cancelled (device)
+              && action.error_code != CV3_FINISH_CANCELLED)
+            {
+              fpi_device_verify_complete (
+                device,
+                fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                          "cv3: the verification was cancelled"));
+              return;
+            }
           cv3_tod_verify_finished (device, &action);
         }
       else if (self->closing)
@@ -627,7 +589,15 @@ cv3_tod_dispatch (FpDevice *device, Cv3Action action)
     }
 
   /* Only the action that carries `cancellable` gets libfprint's cancellable. That is the finger
-   * wait and nothing else: aborting a command transfer mid-flight deep-wedges this sensor. */
+   * wait and nothing else: aborting a command transfer mid-flight deep-wedges this sensor.
+   *
+   * There is deliberately no `cancel` vfunc in the class. libfprint cancels its per-action
+   * GCancellable itself when the task is cancelled (and forwards an external cancellation to it),
+   * and this is the only transfer submitted with that cancellable, so the finger wait stops at once
+   * while every command transfer keeps waiting for its result. A `cancel` vfunc would be a second
+   * cancellation source racing the GCancellable, and it could not abort a command transfer without
+   * violating the rule above. A cancellation that arrives while a command is in flight is therefore
+   * remembered by the cancellable and ends the next finger wait immediately. */
   if (action.cancellable)
     cancellable = fpi_device_get_cancellable (device);
 
@@ -833,6 +803,10 @@ cv3_tod_shim_class_init (FpiDeviceCv3Class *klass)
   device_class->close = cv3_tod_close;
   device_class->enroll = cv3_tod_enroll;
   device_class->verify = cv3_tod_verify;
+  /* No cancel vfunc: libfprint cancels the action's GCancellable itself, and the finger wait is
+   * the only transfer submitted with it. Adding one here would be a second cancellation source
+   * racing that cancellable; the class harness pins this NULL. */
+  device_class->cancel = NULL;
 }
 
 static void

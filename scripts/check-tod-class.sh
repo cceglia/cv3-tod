@@ -73,4 +73,17 @@ cc -o "$work/tod-class-open" "$tests/tod_class_open.c" "$tests/fake_gusb.c" \
 
 "$work/tod-class-open" "$plugin"
 
-echo "TOD class/open check passed for $plugin"
+# The C-side cancellation property. This harness keeps the real shim and libfprint's task and
+# cancellation machinery but stubs the Rust boundary, because the fake cannot fabricate the wrapped
+# reply that precedes the finger wait. It proves the command/wait cancellable split, that the wait
+# is libfprint's own cancellable, that the action finishes only after the command's result, and
+# that a cancelled wait completes with G_IO_ERROR_CANCELLED and no match callback.
+cc -o "$work/tod-shim-dispatch" "$tests/tod_shim_dispatch.c" "$tests/fake_gusb.c" \
+    -I "$root/crates/cv3-tod/shim" \
+    $(pkg-config --cflags libfprint-2-tod-1 gmodule-2.0) \
+    $(pkg-config --libs libfprint-2-tod-1 libfprint-2 gusb gmodule-2.0) \
+    -Wl,--export-dynamic
+
+"$work/tod-shim-dispatch" "$plugin"
+
+echo "TOD class/open and shim dispatch checks passed for $plugin"

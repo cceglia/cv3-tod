@@ -976,11 +976,18 @@ fn bind_kind(error: &BindError, io: Option<IoFailure>) -> OutcomeKind {
             ),
         )
         | BindError::NoCommitHandle => OutcomeKind::Proto,
+        // A cancelled enrolment or confirmation is its own outcome. The shim completes with an
+        // error and no print either way, but fprintd's cancellation result is clearer than a
+        // generic failure, and the message still says the template may remain.
+        BindError::Enrol(EnrolError::Cancelled { .. })
+        | BindError::Confirmation(
+            VerifyError::Capture(CaptureError::Cancelled)
+            | VerifyError::Match(MatchError::Cancelled),
+        ) => OutcomeKind::Cancelled,
         BindError::Enrol(
             EnrolError::Build(_)
             | EnrolError::Capture(_)
             | EnrolError::AttemptLimit { .. }
-            | EnrolError::Cancelled { .. }
             | EnrolError::UnexpectedEvent { .. }
             | EnrolError::AlreadyFinished,
         )
@@ -988,15 +995,11 @@ fn bind_kind(error: &BindError, io: Option<IoFailure>) -> OutcomeKind {
             VerifyError::Capture(
                 CaptureError::Build(_)
                 | CaptureError::FingerTimeout
-                | CaptureError::Cancelled
                 | CaptureError::UnexpectedEvent
                 | CaptureError::AlreadyFinished,
             )
             | VerifyError::Match(
-                MatchError::Build(_)
-                | MatchError::Cancelled
-                | MatchError::UnexpectedEvent
-                | MatchError::AlreadyFinished,
+                MatchError::Build(_) | MatchError::UnexpectedEvent | MatchError::AlreadyFinished,
             )
             | VerifyError::UnexpectedEvent
             | VerifyError::AlreadyFinished,
@@ -1028,8 +1031,10 @@ fn outcome_from_verify(error: &VerifyError, io: Option<IoFailure>) -> Outcome {
             OutcomeKind::Retry,
             "cv3: no finger arrived within the finger timeout; place the finger again",
         ),
-        // The action's cancellable was cancelled. libfprint's task already carries the
-        // cancellation and the shim completes without a match; ticket 15 owns the full path.
+        // The action's cancellable was cancelled. The primitive's teardown has already sent the
+        // sessionless `0x68` and the plain `0x04`, so the session is gone and no capture is armed.
+        // This is not a verdict: the shim completes with an error and libfprint's cancelled task
+        // returns G_IO_ERROR_CANCELLED to the client.
         VerifyError::Capture(CaptureError::Cancelled)
         | VerifyError::Match(MatchError::Cancelled) => Outcome::error(
             OutcomeKind::Cancelled,
@@ -1980,7 +1985,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cancelled_finger_wait_fails_without_a_payload_and_says_the_template_may_remain() {
+    fn a_cancelled_finger_wait_finishes_after_the_teardown_without_a_payload() {
         let key = session_key();
         let mut script: VecDeque<IoReply> = [
             reply(challenge_reply(0)),
@@ -2007,14 +2012,20 @@ mod tests {
             &sample_hash_plaintext(),
         )));
         enrol.push_back(IoReply::Failed(IoFailure::Cancelled));
-        // The capture's teardown: the sessionless cancel and the close.
+        // Nothing may finish before the capture's teardown replies arrive: the sessionless cancel
+        // and the close.
         enrol.extend(empty_reply());
         enrol.extend(empty_reply());
 
         let (step, transfers, _) = drive_enrol(&mut plugin, &mut enrol);
         match step {
             Step::Finished(outcome) => {
-                assert_eq!(outcome.kind, OutcomeKind::General);
+                assert_eq!(
+                    outcome.kind,
+                    OutcomeKind::Cancelled,
+                    "a cancellation is its own outcome, not a generic failure: {}",
+                    outcome.message
+                );
                 assert!(outcome.message.contains("cancelled"), "{}", outcome.message);
                 assert!(
                     outcome.message.contains("cannot identify or remove it yet"),
@@ -2024,7 +2035,111 @@ mod tests {
             }
             other => panic!("expected a finished enrolment, got {other:?}"),
         }
-        assert_eq!(plugin.take_payload(), None);
+        assert_eq!(
+            plugin.take_payload(),
+            None,
+            "a cancelled enrolment stores nothing"
+        );
+        assert!(
+            matches!(plugin.job, Job::Finished),
+            "the teardown closed the session, so the state machine is finished"
+        );
+        assert_eq!(
+            transfers
+                .iter()
+                .filter_map(command_of_opt)
+                .collect::<Vec<_>>(),
+            [
+                cmd::DISCARD_ENROLMENT,
+                cmd::START_ENROLMENT,
+                cmd::ARM_CAPTURE,
+                cmd::CANCEL_CAPTURE,
+                cmd::CLOSE_SESSION,
+            ],
+            "the cancel and close are sent, in that order, before the finish"
+        );
+        assert!(
+            transfers
+                .iter()
+                .filter(|transfer| !matches!(transfer, Transfer::FingerIn { .. }))
+                .all(|transfer| !transfer.cancellable()),
+            "only the finger wait was cancellable"
+        );
+
+        // The failed enrolment already closed the session; closing again sends nothing and a fresh
+        // operation must start with a new open.
+        let (step, close_transfers) = close_run(&mut plugin, &mut VecDeque::new());
+        assert_eq!(step, Step::Finished(Outcome::ok()));
+        assert!(close_transfers.is_empty());
+        assert_eq!(
+            plugin.enrol_start_with(enroled_ivs()),
+            Step::Finished(Outcome::error(
+                OutcomeKind::General,
+                "cv3: enrolment needs an open sensor session"
+            )),
+            "a cancelled enrolment leaves no session to continue on"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_confirmation_finishes_as_cancelled_and_stores_nothing() {
+        let key = session_key();
+        let mut open: VecDeque<IoReply> = [
+            reply(challenge_reply(0)),
+            reply(response_reply(0)),
+            reply(open_reply(0)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let mut plugin = opened_plugin(&mut open);
+
+        let mut enrol = VecDeque::new();
+        enrol.extend(reply(wrapped_reply(
+            &key,
+            cmd::DISCARD_ENROLMENT,
+            attr::SESSION,
+            &[],
+        )));
+        enrol.extend(empty_reply());
+        push_enrol_sample(
+            &mut enrol,
+            &key,
+            status::SAMPLE_ACCEPTED,
+            Some(&ENROLMENT_ID),
+        );
+        push_enrol_commit(&mut enrol, &key, &commit_plaintext(COMMIT_HANDLE));
+        // The confirmation's arm succeeds, then the client cancels the touch.
+        enrol.extend(reply(wrapped_reply(
+            &key,
+            cmd::ARM_CAPTURE,
+            attr::CAPTURE,
+            &sample_hash_plaintext(),
+        )));
+        enrol.push_back(IoReply::Failed(IoFailure::Cancelled));
+        enrol.extend(empty_reply());
+        enrol.extend(empty_reply());
+
+        let (step, transfers, _) = drive_enrol(&mut plugin, &mut enrol);
+
+        match step {
+            Step::Finished(outcome) => {
+                assert_eq!(outcome.kind, OutcomeKind::Cancelled);
+                assert!(
+                    outcome.message.contains("confirmation"),
+                    "the message names the cancelled touch: {}",
+                    outcome.message
+                );
+                assert!(
+                    outcome.message.contains("may remain"),
+                    "the template caveat is kept: {}",
+                    outcome.message
+                );
+            }
+            other => panic!("expected a finished enrolment, got {other:?}"),
+        }
+        assert_eq!(plugin.take_payload(), None, "nothing is stored");
+        assert!(matches!(plugin.job, Job::Finished));
         assert_eq!(
             transfers
                 .iter()
@@ -2032,11 +2147,8 @@ mod tests {
                 .collect::<Vec<_>>()
                 .last(),
             Some(&cmd::CLOSE_SESSION),
-            "the cancelled capture closed its handle"
+            "the confirmation's teardown closed the session"
         );
-
-        // The failed enrolment already closed the session; closing again sends nothing.
-        assert_eq!(plugin.close_start(), Step::Finished(Outcome::ok()));
     }
 
     #[test]
@@ -2320,6 +2432,13 @@ mod tests {
                 .filter(|transfer| matches!(transfer, Transfer::FingerIn { .. }))
                 .all(Transfer::cancellable),
             "the finger wait is the cancellable transfer"
+        );
+        assert!(
+            transfers
+                .iter()
+                .filter(|transfer| !matches!(transfer, Transfer::FingerIn { .. }))
+                .all(|transfer| !transfer.cancellable()),
+            "no command transfer is ever cancellable"
         );
         assert!(
             matches!(plugin.job, Job::Session(_)),
@@ -2628,7 +2747,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cancelled_finger_wait_completes_without_a_match() {
+    fn a_cancelled_finger_wait_finishes_after_the_teardown_without_a_match_or_a_store() {
         let (mut plugin, key) = opened_for_verification();
         let mut script = VecDeque::new();
         script.extend(reply(wrapped_reply(
@@ -2638,7 +2757,8 @@ mod tests {
             &sample_hash_plaintext(),
         )));
         script.push_back(IoReply::Failed(IoFailure::Cancelled));
-        // The capture's teardown: the sessionless cancel and the close.
+        // The capture's teardown: the sessionless cancel and the close. The finish cannot arrive
+        // until both replies have been consumed.
         script.extend(empty_reply());
         script.extend(empty_reply());
 
@@ -2648,17 +2768,204 @@ mod tests {
         match step {
             Step::Finished(outcome) => {
                 assert_eq!(outcome.kind, OutcomeKind::Cancelled);
+                assert!(
+                    !matches!(outcome.kind, OutcomeKind::NoMatch | OutcomeKind::Retry),
+                    "a cancellation is not a verdict and not a retry"
+                );
                 assert!(outcome.message.contains("cancelled"), "{}", outcome.message);
             }
             other => panic!("expected a finished verification, got {other:?}"),
         }
-        // The capture was cancelled on the sensor, so the cancelled run leaves the sensor with no
-        // armed capture and no session handle. Ticket 15 owns making the *device* reusable after a
-        // cancel without fprintd reopening it; verify itself never closes a live session.
+        // A cancelled verify never reaches the match request: one arm, then the teardown.
+        assert_eq!(
+            verify_commands(&transfers),
+            [cmd::ARM_CAPTURE, cmd::CANCEL_CAPTURE, cmd::CLOSE_SESSION],
+            "the teardown is complete before the finish, and no 0x2F was sent"
+        );
+        assert_eq!(
+            transfers
+                .iter()
+                .filter(|transfer| matches!(transfer, Transfer::FingerIn { .. }))
+                .count(),
+            1,
+            "the cancelled wait is not retried behind the client's back"
+        );
+        assert!(
+            matches!(plugin.job, Job::Finished),
+            "the teardown closed the session, so the state machine is finished"
+        );
+        assert_eq!(
+            plugin.take_payload(),
+            None,
+            "a cancelled verify stores nothing"
+        );
+
+        // Closing again is harmless and sends nothing: the core already closed the handle.
+        let (step, close_transfers) = close_run(&mut plugin, &mut VecDeque::new());
+        assert_eq!(step, Step::Finished(Outcome::ok()));
+        assert!(close_transfers.is_empty());
+
+        // The next operation must be a fresh open, not a second verify on the dead session.
+        assert_eq!(
+            plugin.verify_start_with(&bound_payload(COMMIT_HANDLE), verify_ivs()),
+            Step::Finished(Outcome::error(
+                OutcomeKind::General,
+                "cv3: verification needs an open sensor session"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_cancel_never_aborts_a_command_transfer_and_the_wait_is_the_only_cancellable() {
+        let (mut plugin, key) = opened_for_verification();
+        let first = plugin.verify_start_with(&bound_payload(COMMIT_HANDLE), verify_ivs());
+        let mut transfers = Vec::new();
+
+        // The arm is a command transfer and is not cancellable. The verification has not finished:
+        // it is waiting for that command's result.
+        let Step::Transfer(arm) = first else {
+            panic!("expected the capture arm, got {first:?}");
+        };
+        assert!(matches!(arm, Transfer::Out { .. }), "the arm is a command");
+        assert!(!arm.cancellable());
+        assert!(
+            matches!(plugin.job, Job::Verifying(_)),
+            "the action is still in progress while its command is in flight"
+        );
+        transfers.push(arm);
+
+        // Feed the arm's three results explicitly. Only after them does the cancellable finger
+        // wait appear.
+        let mut arm_replies = reply(wrapped_reply(
+            &key,
+            cmd::ARM_CAPTURE,
+            attr::CAPTURE,
+            &sample_hash_plaintext(),
+        ))
+        .into_iter();
+        let Step::Transfer(announcement) =
+            plugin.on_transfer(arm_replies.next().expect("the arm completed"))
+        else {
+            panic!("expected the arm's announcement read");
+        };
+        assert!(matches!(announcement, Transfer::InterruptIn { .. }));
+        transfers.push(announcement);
+        let Step::Transfer(body) =
+            plugin.on_transfer(arm_replies.next().expect("the arm was announced"))
+        else {
+            panic!("expected the arm's reply body read");
+        };
+        assert!(matches!(body, Transfer::BulkIn { .. }));
+        transfers.push(body);
+        let step = plugin.on_transfer(arm_replies.next().expect("the arm reply body"));
+
+        let Step::Transfer(finger) = step else {
+            panic!("expected the finger wait, got {step:?}");
+        };
+        assert!(matches!(finger, Transfer::FingerIn { .. }));
+        assert!(finger.cancellable());
+        transfers.push(finger);
+
+        // A cancellation ends that wait; the teardown commands are ordinary, non-cancellable
+        // transfers and are awaited like the arm was.
+        let mut step = plugin.on_transfer(IoReply::Failed(IoFailure::Cancelled));
+        let mut teardown = VecDeque::new();
+        teardown.extend(empty_reply());
+        teardown.extend(empty_reply());
+        while let Step::Transfer(transfer) = step {
+            assert!(
+                !transfer.cancellable(),
+                "a teardown command must never be submitted cancellable"
+            );
+            transfers.push(transfer);
+            step = plugin.on_transfer(
+                teardown
+                    .pop_front()
+                    .expect("the teardown script has both replies"),
+            );
+        }
+
+        assert!(
+            matches!(step, Step::Finished(ref outcome) if outcome.kind == OutcomeKind::Cancelled)
+        );
         assert_eq!(
             verify_commands(&transfers),
             [cmd::ARM_CAPTURE, cmd::CANCEL_CAPTURE, cmd::CLOSE_SESSION]
         );
+        assert!(
+            transfers
+                .iter()
+                .filter(|transfer| !matches!(transfer, Transfer::FingerIn { .. }))
+                .all(|transfer| !transfer.cancellable()),
+            "every command transfer is submitted without a cancellable"
+        );
+        assert!(matches!(plugin.job, Job::Finished));
+    }
+
+    #[test]
+    fn ten_cancelled_verifications_then_fresh_opens_leave_the_state_machine_clean() {
+        let key = session_key();
+        let mut plugin = Plugin::new();
+
+        for cycle in 0..10 {
+            let mut open: VecDeque<IoReply> = [
+                reply(challenge_reply(0)),
+                reply(response_reply(0)),
+                reply(open_reply(0)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let (step, open_transfers) = open_run(&mut plugin, &mut open);
+            assert_eq!(step, Step::Finished(Outcome::ok()), "cycle {cycle}: open");
+            assert_eq!(
+                open_transfers
+                    .iter()
+                    .filter_map(command_of_opt)
+                    .collect::<Vec<_>>(),
+                [cmd::CHALLENGE, cmd::CHALLENGE_RESPONSE, cmd::OPEN_SESSION],
+                "cycle {cycle}: a fresh open is the handshake and the wrapped 0x02 only"
+            );
+            assert!(
+                matches!(plugin.job, Job::Session(_)),
+                "cycle {cycle}: the open leaves a live session"
+            );
+
+            let mut script = VecDeque::new();
+            script.extend(reply(wrapped_reply(
+                &key,
+                cmd::ARM_CAPTURE,
+                attr::CAPTURE,
+                &sample_hash_plaintext(),
+            )));
+            script.push_back(IoReply::Failed(IoFailure::Cancelled));
+            script.extend(empty_reply());
+            script.extend(empty_reply());
+
+            let (step, transfers) =
+                drive_verify(&mut plugin, &bound_payload(COMMIT_HANDLE), &mut script);
+            assert!(
+                matches!(step, Step::Finished(ref outcome) if outcome.kind == OutcomeKind::Cancelled),
+                "cycle {cycle}: the cancellation finishes promptly"
+            );
+            assert_eq!(
+                verify_commands(&transfers),
+                [cmd::ARM_CAPTURE, cmd::CANCEL_CAPTURE, cmd::CLOSE_SESSION],
+                "cycle {cycle}: no capture is left armed and no handle is left open"
+            );
+            assert!(
+                matches!(plugin.job, Job::Finished),
+                "cycle {cycle}: the state machine is finished, not stale"
+            );
+            assert_eq!(plugin.take_payload(), None, "cycle {cycle}: nothing stored");
+
+            let (step, close_transfers) = close_run(&mut plugin, &mut VecDeque::new());
+            assert_eq!(step, Step::Finished(Outcome::ok()), "cycle {cycle}: close");
+            assert!(
+                close_transfers.is_empty(),
+                "cycle {cycle}: the cancel already closed the handle"
+            );
+        }
     }
 
     #[test]

@@ -52,6 +52,19 @@ static guint current_step;
 static guint16 out_commands[FAKE_MAX_STEPS];
 static guint out_count;
 
+#define FAKE_MAX_SUBMITS 32
+
+typedef struct
+{
+  gboolean        cancellable;
+  FpiTransferType type;
+} FakeSubmit;
+
+static FakeSubmit submits[FAKE_MAX_SUBMITS];
+static guint submit_count;
+/* When non-NULL, the external task cancellable to cancel when the finger wait is submitted. */
+static GCancellable *cancel_task_on_wait;
+
 static void
 put_le32 (guint8 *p, guint32 value)
 {
@@ -175,8 +188,11 @@ fake_gusb_reset (void)
   step_index = 0;
   current_step = 0;
   out_count = 0;
+  submit_count = 0;
+  cancel_task_on_wait = NULL;
   memset (steps, 0, sizeof steps);
   memset (out_commands, 0, sizeof out_commands);
+  memset (submits, 0, sizeof submits);
 }
 
 /*
@@ -240,6 +256,40 @@ fake_gusb_plan_verify (void)
   add_challenge_reply ();
   add_response_reply (0x00);
   add_open_reply ();
+}
+
+/* The shim-dispatch harness's plan. Its verify script starts with a bulk OUT command that consumes
+ * the scripted empty reply; the finger wait that follows is submitted with libfprint's cancellable,
+ * which this fake cancels and completes with G_USB_DEVICE_ERROR_CANCELLED — the way libgusb ends a
+ * transfer whose cancellable was cancelled. `task_cancellable` is the external GCancellable the
+ * harness passed to libfprint; cancelling it makes the GTask return G_IO_ERROR_CANCELLED, exactly
+ * as fprintd's cancellation does. */
+void
+fake_gusb_plan_dispatch (GCancellable *task_cancellable)
+{
+  fake_gusb_reset ();
+  add_empty_reply ();
+  cancel_task_on_wait = task_cancellable;
+}
+
+guint
+fake_gusb_submit_count (void)
+{
+  return submit_count;
+}
+
+gboolean
+fake_gusb_submit_cancellable (guint index)
+{
+  g_assert (index < submit_count);
+  return submits[index].cancellable;
+}
+
+FpiTransferType
+fake_gusb_submit_type (guint index)
+{
+  g_assert (index < submit_count);
+  return submits[index].type;
 }
 
 guint
@@ -382,6 +432,7 @@ typedef struct
 {
   FpiUsbTransfer *transfer;
   gpointer        user_data;
+  GCancellable   *cancellable;
 } PendingTransfer;
 
 static gboolean
@@ -398,7 +449,14 @@ complete_transfer (gpointer data)
    * allocator's free list feed the callback a garbage `transfer->device`. */
   g_assert (transfer->ref_count == 1);
 
-  if (transfer->type == FP_TRANSFER_BULK && !(transfer->endpoint & FPI_USB_ENDPOINT_IN))
+  if (pending->cancellable != NULL && g_cancellable_is_cancelled (pending->cancellable))
+    {
+      /* libgusb completes a cancelled transfer with G_IO_ERROR_CANCELLED (a cancelled
+       * G_USB_DEVICE_ERROR here); nothing is read or written. */
+      g_set_error_literal (&error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_CANCELLED,
+                           "fake gusb: the transfer was cancelled");
+    }
+  else if (transfer->type == FP_TRANSFER_BULK && !(transfer->endpoint & FPI_USB_ENDPOINT_IN))
     {
       /* A command write. Record it and attach it to the next scripted reply. */
       if (transfer->length < 10)
@@ -465,6 +523,7 @@ complete_transfer (gpointer data)
    * the caller, and the completion drops it after the callback has returned. Nothing else unrefs a
    * submitted transfer; the transfer is freed here, not by the caller. */
   fpi_usb_transfer_unref (transfer);
+  g_clear_object (&pending->cancellable);
   g_free (pending);
   return G_SOURCE_REMOVE;
 }
@@ -479,13 +538,29 @@ fpi_usb_transfer_submit (FpiUsbTransfer        *transfer,
   PendingTransfer *pending = g_new0 (PendingTransfer, 1);
 
   (void) timeout_ms;
-  (void) cancellable;
 
   /* `fpi_usb_transfer_submit` takes no reference of its own: it consumes the single reference
    * `fpi_usb_transfer_new` returned. Checking it here catches a caller that already dropped that
    * reference (which would leave the freeing to whoever decrements next) or took another one
    * (which would leak the transfer once the completion drops only one). */
   g_assert (transfer->ref_count == 1);
+
+  if (submit_count < FAKE_MAX_SUBMITS)
+    {
+      submits[submit_count].cancellable = cancellable != NULL;
+      submits[submit_count].type = transfer->type;
+      submit_count++;
+    }
+
+  if (cancel_task_on_wait != NULL && cancellable != NULL)
+    {
+      /* The only transfer the shim submits with a cancellable is the finger wait, and it must be
+       * libfprint's own per-action cancellable — not a second source. */
+      g_assert (cancellable == fpi_device_get_cancellable (transfer->device));
+      pending->cancellable = g_object_ref (cancellable);
+      /* The external cancellation fprintd performs; libfprint forwards it to the internal one. */
+      g_cancellable_cancel (cancel_task_on_wait);
+    }
 
   transfer->callback = callback;
   transfer->user_data = user_data;
