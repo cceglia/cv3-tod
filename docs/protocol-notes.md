@@ -37,10 +37,12 @@ timezone. The field widths and positions are what the controller consumes, so th
 otherwise identical. The year field is six bits (2000..2063) and saturates at either end.
 
 `cvctl` answers type-5 events below the command layer — in the shared exchange for reply
-announcements and in the probe's finger wait, with a bounded number of retries. It does **not** send
-the sync unprompted: on 2026-10-29 an unsolicited sync at session start timed out and the handshake
-that followed also timed out, so the probe now waits for the sensor to ask. With `--hex` the
-host-side control appears as `* timestamp <packed:08x>`, alongside the `>`/`<` bulk lines.
+announcements and in the shared finger wait, with a bounded number of retries. The plugin's
+`libfprint` transport runs the same `cv3_wire::FingerWait`, so the finger wait answers the clock
+there too. It does **not** send the sync unprompted: on 2026-10-29 an unsolicited sync at session
+start timed out and the handshake that followed also timed out, so the probe now waits for the
+sensor to ask. With `--hex` the host-side control appears as `* timestamp <packed:08x>`, alongside
+the `>`/`<` bulk lines.
 
 ## Measured on 2026-10-28
 

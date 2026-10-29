@@ -7,9 +7,12 @@
  * Cv3Tod (src/plugin.rs, src/ffi.rs) owns all of that; this file receives an action, performs it
  * with libfprint's USB API, and hands the outcome back.
  *
- * The Rust half returns a Cv3Action for every step: OUT / INTERRUPT_IN / BULK_IN / CONTROL, or
- * FINISH with a status, an error kind and a message. Buffers always belong to Rust; this file only
- * passes them to fpi_usb_transfer_fill_*_full with a NULL free function.
+ * The Rust half returns a Cv3Action for every step: OUT / INTERRUPT_IN / BULK_IN / CONTROL /
+ * WAIT_FINGER, or FINISH with a status, an error kind and a message. The finger event is the one
+ * transfer submitted with libfprint's cancellable; command transfers never are. Buffers always
+ * belong to Rust; this file only passes them to fpi_usb_transfer_fill_*_full with a NULL free
+ * function. Enrolment progress and the bound print record are taken through two small accessors,
+ * so no protocol length or stage arithmetic lives here.
  */
 #include "drivers_api.h"
 
@@ -29,6 +32,8 @@ typedef enum
   CV3_ACTION_BULK_IN = 2,
   CV3_ACTION_CONTROL = 3,
   CV3_ACTION_FINISH = 4,
+  /* The finger event: an interrupt read, and the only transfer submitted cancellable. */
+  CV3_ACTION_WAIT_FINGER = 5,
 } Cv3ActionKind;
 
 typedef enum
@@ -65,7 +70,8 @@ typedef struct
   guint8   endpoint;
   guint8   request_type;
   guint8   request;
-  guint8   reserved;
+  /* One when this transfer must be submitted with the action's cancellable. */
+  guint8   cancellable;
   guint16  value;
   guint16  index;
   guint32  timeout_ms;
@@ -78,6 +84,8 @@ typedef struct
 
 _Static_assert (sizeof (Cv3Action) == 296,
                 "Cv3Action must match cv3-tod's #[repr(C)] layout");
+_Static_assert (G_STRUCT_OFFSET (Cv3Action, cancellable) == 7,
+                "Cv3Action.cancellable must stay at offset 7");
 _Static_assert (G_STRUCT_OFFSET (Cv3Action, message) == 40,
                 "Cv3Action.message must stay at offset 40");
 
@@ -89,6 +97,10 @@ Cv3Action cv3_tod_on_transfer (Cv3Tod *tod,
                                guint32 error,
                                gsize   actual_length);
 Cv3Action cv3_tod_close_start (Cv3Tod *tod);
+gint32 cv3_tod_enrol_stages (void);
+Cv3Action cv3_tod_enrol_start (Cv3Tod *tod);
+gint32 cv3_tod_take_progress (Cv3Tod *tod, gint32 *completed);
+gsize cv3_tod_take_payload (Cv3Tod *tod, guint8 *destination, gsize capacity);
 
 /* ---- The device --------------------------------------------------------------------------- */
 
@@ -101,6 +113,9 @@ typedef struct _FpiDeviceCv3
   gboolean interface_claimed;
   gboolean opening;
   gboolean closing;
+  gboolean enrolling;
+  /* The template print libfprint handed to the enroll vfunc; borrowed for the action only. */
+  FpPrint *enroll_print;
 } FpiDeviceCv3;
 
 typedef struct _FpiDeviceCv3Class
@@ -125,13 +140,14 @@ static const FpIdEntry cv3_tod_id_table[] = {
 static void
 cv3_tod_probe (FpDevice *device)
 {
-  /* The session is opened by the open vfunc, not here.
+  /* Enrolment needs no feature bit in this ABI: libfprint 1.95 has no
+   * FP_DEVICE_FEATURE_ENROLL, and fprintd gates EnrollStart on a non-zero
+   * fp_device_get_nr_enroll_stages(), which the class sets to the core's 13 below.
    *
-   * libfprint asserts in fp_device_constructed that a device class advertises some feature, and
-   * this milestone implements no user-visible operation yet. The class therefore starts from the
-   * capability the sensor physically has and withdraws it here, before the probe completes: fprintd
-   * is told about a reader that supports nothing yet, instead of being offered a capture that
-   * cannot run.
+   * The CAPTURE bit is the construction placeholder that ticket 11 needed: libfprint asserts in
+   * fp_device_constructed that a class advertises some feature. It is withdrawn here, before the
+   * probe completes, because this driver still cannot capture an image; VERIFY arrives with
+   * ticket 14. What is offered today is enrolment, and that is the stage count, not this mask.
    */
   fpi_device_update_features (device, FP_DEVICE_FEATURE_CAPTURE, FP_DEVICE_FEATURE_NONE);
   fpi_device_probe_complete (device, NULL, CV3_TOD_DEVICE_NAME, NULL);
@@ -284,6 +300,52 @@ cv3_tod_close_finished (FpDevice *device)
 static void
 cv3_tod_dispatch (FpDevice *device, Cv3Action action);
 
+/* Reports every stage or rejected sample the core has queued since the last call.
+ *
+ * libfprint's progress callback is synchronous, so this runs before the next transfer is submitted:
+ * the client hears about stage N before the driver waits for the next touch. A rejected sample is
+ * reported with FP_DEVICE_RETRY_GENERAL, which fprintd turns into `enroll-retry-scan`: the stage
+ * count does not advance, and the next capture is already armed.
+ */
+static void
+cv3_tod_report_progress (FpDevice *device)
+{
+  FpiDeviceCv3 *self = CV3_TOD_DEVICE (device);
+  gint32 completed = 0;
+  gint32 kind;
+
+  if (self->tod == NULL)
+    return;
+
+  while ((kind = cv3_tod_take_progress (self->tod, &completed)) != 0)
+    {
+      GError *retry = NULL;
+
+      if (kind == 2)
+        retry = fpi_device_retry_new_msg (
+          FP_DEVICE_RETRY_GENERAL,
+          "cv3: the sensor could not use that sample; place the finger again");
+      fpi_device_enroll_progress (device, completed, self->enroll_print, retry);
+      g_clear_error (&retry);
+    }
+}
+
+/* Stores the bound print record in the FpPrint libfprint will persist.
+ *
+ * `fpi-data` is a GVariant of type `ay`, 30 bytes of the core's fixed CV3P record, and `fpi-type`
+ * is FPI_PRINT_RAW so libfprint stores and returns the bytes verbatim. The bytes come from Rust;
+ * this file only copies them into the variant. The finger, username and description libfprint put
+ * on the template are left untouched.
+ */
+static void
+cv3_tod_set_print_payload (FpPrint *print, const guint8 *bytes, gsize len)
+{
+  g_object_set (print, "fpi-type", FPI_PRINT_RAW, NULL);
+  g_object_set (print, "fpi-data",
+                g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, bytes, len, sizeof (guint8)),
+                NULL);
+}
+
 static void
 cv3_tod_transfer_cb (FpiUsbTransfer *transfer,
                      FpDevice       *device,
@@ -302,7 +364,9 @@ cv3_tod_transfer_cb (FpiUsbTransfer *transfer,
       result = CV3_IO_FAILED;
       code = cv3_tod_io_error_for (error);
     }
-  else if (action_kind == CV3_ACTION_INTERRUPT_IN || action_kind == CV3_ACTION_BULK_IN)
+  else if (action_kind == CV3_ACTION_INTERRUPT_IN
+           || action_kind == CV3_ACTION_BULK_IN
+           || action_kind == CV3_ACTION_WAIT_FINGER)
     {
       result = CV3_IO_DATA;
       actual_length = transfer->actual_length > 0 ? (gsize) transfer->actual_length : 0;
@@ -329,8 +393,9 @@ cv3_tod_transfer_cb (FpiUsbTransfer *transfer,
  *
  * The timeout is not chosen here: the action carries the core's own constant (5 s to write a
  * command, 60 s for a reply announcement or body, 3 s for a teardown frame, 1 s for the host
- * timestamp control request). Command transfers are passed a NULL cancellable and are never
- * cancelled: aborting one mid-flight is what deep-wedges this sensor.
+ * timestamp control request, 30 s for the finger wait). Only the finger wait is submitted with
+ * libfprint's cancellable; every command transfer gets NULL and is never cancelled, because
+ * aborting one mid-flight is what deep-wedges this sensor.
  *
  * Transfer ownership: `fpi_usb_transfer_new` returns one reference and `fpi_usb_transfer_submit`
  * consumes it, so a submitted transfer is never unrefed here or in the callback. libfprint's
@@ -341,6 +406,12 @@ cv3_tod_dispatch (FpDevice *device, Cv3Action action)
 {
   FpiDeviceCv3 *self = CV3_TOD_DEVICE (device);
   FpiUsbTransfer *transfer;
+  GCancellable *cancellable = NULL;
+
+  /* Progress goes out before the next transfer: the client hears about a completed stage or a
+   * rejected sample while the driver has not yet started the next read. */
+  if (self->enrolling)
+    cv3_tod_report_progress (device);
 
   if (action.kind == CV3_ACTION_FINISH)
     {
@@ -354,6 +425,40 @@ cv3_tod_dispatch (FpDevice *device, Cv3Action action)
           else
             {
               cv3_tod_open_failed (device, action.error_code, action.message);
+            }
+        }
+      else if (self->enrolling)
+        {
+          FpPrint *print = self->enroll_print;
+
+          self->enrolling = FALSE;
+          self->enroll_print = NULL;
+          if (action.status == 0)
+            {
+              guint8 payload[64];
+              gsize len;
+
+              if (self->tod == NULL
+                  || print == NULL
+                  || (len = cv3_tod_take_payload (self->tod, payload,
+                                                  sizeof payload)) == 0)
+                {
+                  fpi_device_enroll_complete (
+                    device, NULL,
+                    fpi_device_error_new_msg (
+                      FP_DEVICE_ERROR_GENERAL,
+                      "cv3: the enrolment finished without a bound print"));
+                  return;
+                }
+              cv3_tod_set_print_payload (print, payload, len);
+              fpi_device_enroll_complete (device, print, NULL);
+            }
+          else
+            {
+              fpi_device_enroll_complete (
+                device, NULL,
+                fpi_device_error_new_msg (cv3_tod_error_for (action.error_code), "%s",
+                                          action.message));
             }
         }
       else if (self->closing)
@@ -377,6 +482,15 @@ cv3_tod_dispatch (FpDevice *device, Cv3Action action)
       if (self->opening)
         cv3_tod_open_failed (device, CV3_FINISH_GENERAL,
                              "cv3: a transfer action carried no buffer");
+      else if (self->enrolling)
+        {
+          self->enrolling = FALSE;
+          self->enroll_print = NULL;
+          fpi_device_enroll_complete (
+            device, NULL,
+            fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                      "cv3: a transfer action carried no buffer"));
+        }
       else if (self->closing)
         cv3_tod_close_finished (device);
       return;
@@ -395,6 +509,10 @@ cv3_tod_dispatch (FpDevice *device, Cv3Action action)
                                        action.length, NULL);
       break;
     case CV3_ACTION_INTERRUPT_IN:
+      fpi_usb_transfer_fill_interrupt_full (transfer, action.endpoint, action.buffer,
+                                            action.length, NULL);
+      break;
+    case CV3_ACTION_WAIT_FINGER:
       fpi_usb_transfer_fill_interrupt_full (transfer, action.endpoint, action.buffer,
                                             action.length, NULL);
       break;
@@ -421,7 +539,12 @@ cv3_tod_dispatch (FpDevice *device, Cv3Action action)
       return;
     }
 
-  fpi_usb_transfer_submit (transfer, action.timeout_ms, NULL, cv3_tod_transfer_cb,
+  /* Only the action that carries `cancellable` gets libfprint's cancellable. That is the finger
+   * wait and nothing else: aborting a command transfer mid-flight deep-wedges this sensor. */
+  if (action.cancellable)
+    cancellable = fpi_device_get_cancellable (device);
+
+  fpi_usb_transfer_submit (transfer, action.timeout_ms, cancellable, cv3_tod_transfer_cb,
                            GINT_TO_POINTER (action.kind));
 
   /* OWNERSHIP: `fpi_usb_transfer_submit` CONSUMES the reference `fpi_usb_transfer_new` returned;
@@ -464,6 +587,8 @@ cv3_tod_open (FpDevice *device)
   self->interface_claimed = TRUE;
   self->opening = TRUE;
   self->closing = FALSE;
+  self->enrolling = FALSE;
+  self->enroll_print = NULL;
   if (self->tod != NULL)
     cv3_tod_destroy (self->tod);
   self->tod = cv3_tod_create ();
@@ -477,6 +602,8 @@ cv3_tod_close (FpDevice *device)
 
   self->opening = FALSE;
   self->closing = TRUE;
+  self->enrolling = FALSE;
+  self->enroll_print = NULL;
 
   if (self->tod == NULL)
     {
@@ -487,16 +614,42 @@ cv3_tod_close (FpDevice *device)
   cv3_tod_dispatch (device, cv3_tod_close_start (self->tod));
 }
 
+/* One whole enrolment on the session the open left behind.
+ *
+ * The template print comes from libfprint and keeps the finger, username and description fprintd
+ * supplied. The Rust core drives the samples, the commit and the confirmation touch and hands back
+ * the 30-byte bound record; on any failure it returns a message that names the template that may
+ * remain on the sensor. Enrolment never opens or closes the session: a success leaves it usable for
+ * the next operation.
+ */
 static void
 cv3_tod_enroll (FpDevice *device)
 {
-  /* libfprint calls this pointer without a NULL check once a template print is supplied. The
-   * withdrawn features mean fprintd never asks, so this is defence in depth against a caller
-   * driving libfprint directly.
-   */
-  fpi_device_enroll_complete (device, NULL,
-                              fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
-                                                        "cv3: enrolment is not implemented yet"));
+  FpiDeviceCv3 *self = CV3_TOD_DEVICE (device);
+  FpPrint *print = NULL;
+
+  if (self->tod == NULL || self->opening || self->closing || self->enrolling)
+    {
+      fpi_device_enroll_complete (
+        device, NULL,
+        fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_OPEN,
+                                  "cv3: the sensor session is not open"));
+      return;
+    }
+
+  fpi_device_get_enroll_data (device, &print);
+  if (print == NULL)
+    {
+      fpi_device_enroll_complete (
+        device, NULL,
+        fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                  "cv3: libfprint supplied no template print"));
+      return;
+    }
+
+  self->enroll_print = print;
+  self->enrolling = TRUE;
+  cv3_tod_dispatch (device, cv3_tod_enrol_start (self->tod));
 }
 
 static void
@@ -509,8 +662,14 @@ cv3_tod_shim_class_init (FpiDeviceCv3Class *klass)
   device_class->type = FP_DEVICE_TYPE_USB;
   device_class->id_table = cv3_tod_id_table;
   device_class->scan_type = FP_SCAN_TYPE_PRESS;
-  /* Placeholder, withdrawn by probe: libfprint refuses to construct a class with no feature. */
+  /* libfprint 1.95 asserts that a class advertises some feature, and has no ENROLL flag: enrolment
+   * is advertised by a non-zero nr_enroll_stages below. CAPTURE is only the construction
+   * placeholder, withdrawn by probe because this driver cannot capture an image; VERIFY arrives
+   * with ticket 14. */
   device_class->features = FP_DEVICE_FEATURE_CAPTURE;
+  /* Up to twelve accepted samples plus the confirmation touch; the sensor may complete early. The
+   * number comes from the core, so the class and the progress reports cannot disagree. */
+  device_class->nr_enroll_stages = cv3_tod_enrol_stages ();
   device_class->probe = cv3_tod_probe;
   /* These three are dereferenced without a NULL check; the rest are feature-guarded by libfprint
    * and stay NULL until a later ticket can honour them.
@@ -527,4 +686,6 @@ cv3_tod_shim_init (FpiDeviceCv3 *self)
   self->interface_claimed = FALSE;
   self->opening = FALSE;
   self->closing = FALSE;
+  self->enrolling = FALSE;
+  self->enroll_print = NULL;
 }

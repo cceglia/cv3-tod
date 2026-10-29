@@ -32,6 +32,7 @@
 
 /* tests/fake_gusb.c, linked into this executable so its symbols interpose for the plugin. */
 void fake_gusb_plan_session (void);
+void fake_gusb_plan_enrol (void);
 void fake_gusb_plan_vanishing (void);
 void fake_gusb_plan_close_failure (void);
 guint fake_gusb_out_count (void);
@@ -91,6 +92,12 @@ check_identity (FpDeviceClass *klass)
   check (klass->type == FP_DEVICE_TYPE_USB, "class type is USB (got %d)", klass->type);
   check (klass->scan_type == FP_SCAN_TYPE_PRESS,
          "scan type is press (got %d)", klass->scan_type);
+
+  /* Enrolment is advertised by the stage count, not by a feature bit: libfprint 1.95 has no
+   * FP_DEVICE_FEATURE_ENROLL. The class must still carry one feature for construction, and that
+   * placeholder is withdrawn by probe. */
+  check (klass->nr_enroll_stages == 13,
+         "the class declares thirteen enrolment stages (got %d)", klass->nr_enroll_stages);
 
   check (klass->id_table != NULL, "the class has an id table");
   if (klass->id_table != NULL)
@@ -330,6 +337,135 @@ check_close_transfer_failure (GType type)
   g_object_unref (usb);
 }
 
+/* One enrolment on an open session whose first command the fake cannot answer: the vfunc must
+ * reach the core, report the failure as an FP_DEVICE_ERROR naming the driver, store nothing, and
+ * leave the device closable. A successful enrolment needs wrapped replies the fake cannot
+ * fabricate (it holds no session key), so the success path and the payload are covered by the
+ * Rust tests and by the hardware run. */
+static void
+check_enrol_failure (GType type)
+{
+  FpDevice *device = g_object_new (type, NULL);
+  GUsbDevice *usb = g_object_new (G_USB_TYPE_DEVICE, NULL);
+  GTypeClass *base_class = g_type_class_ref (FP_TYPE_DEVICE);
+  gint private_offset = g_type_class_get_instance_private_offset (base_class);
+  GError *error = NULL;
+  FpPrint *template_print;
+  FpPrint *enrolled;
+
+  g_object_ref (usb);
+  *(GUsbDevice **) ((char *) device + private_offset + 8) = usb;
+  g_type_class_unref (base_class);
+
+  fake_gusb_plan_enrol ();
+  check (fp_device_open_sync (device, NULL, &error),
+         "the open before the enrolment succeeds (got error `%s`)",
+         error ? error->message : "-");
+  g_clear_error (&error);
+
+  template_print = fp_print_new (device);
+  fp_print_set_finger (template_print, FP_FINGER_LEFT_INDEX);
+  fp_print_set_username (template_print, "harness");
+
+  enrolled = fp_device_enroll_sync (device, template_print, NULL, NULL, NULL, &error);
+  check (enrolled == NULL, "an enrolment the fake cannot answer fails");
+  check (error != NULL, "the failed enrolment reports an error");
+  if (error != NULL)
+    {
+      check (error->domain == FP_DEVICE_ERROR,
+             "the failed enrolment fails in the fp-device domain (got `%s`)",
+             g_quark_to_string (error->domain));
+      check (g_strstr_len (error->message, -1, "cv3") != NULL,
+             "the failed enrolment names the driver (got `%s`)", error->message);
+      check (g_strstr_len (error->message, -1, "enrolment failed") != NULL,
+             "the failed enrolment says it was the enrolment (got `%s`)", error->message);
+      check (g_strstr_len (error->message, -1, "template") != NULL,
+             "the failed enrolment says what may remain (got `%s`)", error->message);
+    }
+  g_clear_error (&error);
+  /* fp_device_enroll_sync took the template print (floating ownership), so it is not unrefed
+   * here. */
+
+  /* The vfunc reached the core: the discard, then the best-effort teardown the core runs. */
+  expect_commands ((const guint16[]) { 0x23, 0x24, 0x02, 0x6D, 0x68, 0x04 }, 6,
+                   "the failed enrolment");
+  check (fake_gusb_is_open (), "the failed enrolment leaves the device open");
+  check (fake_gusb_interface_claimed (), "the failed enrolment keeps interface 0 claimed");
+
+  check (fp_device_close_sync (device, NULL, &error),
+         "the device closes after a failed enrolment (got error `%s`)",
+         error ? error->message : "-");
+  g_clear_error (&error);
+  check (!fake_gusb_interface_claimed (), "the close after a failed enrolment released interface 0");
+
+  g_object_unref (device);
+  g_object_unref (usb);
+}
+
+/* The bound record is stored as a GVariant of type `ay` under `fpi-data`, with `fpi-type` RAW.
+ * Pin that this libfprint round-trips it through fp_print_serialize/fp_print_deserialize: the
+ * driver's success path relies on exactly this representation, which no Rust test can check. */
+static void
+check_print_payload_round_trip (GType type)
+{
+  static const guint8 payload[30] = {
+    'C', 'V', '3', 'P', 1, 1,
+    0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5,
+    0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5,
+    0x1f, 0x36, 0xf2, 0x00,
+  };
+  FpDevice *device = g_object_new (type, NULL);
+  GError *error = NULL;
+  FpPrint *print = fp_print_new (device);
+  FpPrint *copy;
+  GVariant *stored = NULL;
+  guchar *serialized = NULL;
+  gsize length = 0;
+  gsize payload_len = 0;
+  const guint8 *payload_bytes;
+
+  fp_print_set_finger (print, FP_FINGER_LEFT_INDEX);
+  fp_print_set_username (print, "harness");
+  g_object_set (print, "fpi-type", FPI_PRINT_RAW, NULL);
+  g_object_set (print, "fpi-data",
+                g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, payload,
+                                           sizeof payload, 1),
+                NULL);
+
+  check (fp_print_serialize (print, &serialized, &length, &error),
+         "a print with the bound payload serializes (got error `%s`)",
+         error ? error->message : "-");
+  g_clear_error (&error);
+  if (serialized != NULL)
+    {
+      copy = fp_print_deserialize (serialized, length, &error);
+      check (copy != NULL, "the serialized print deserializes (got error `%s`)",
+             error ? error->message : "-");
+      g_clear_error (&error);
+      if (copy != NULL)
+        {
+          g_object_get (copy, "fpi-data", &stored, NULL);
+          check (stored != NULL && g_variant_is_of_type (stored, G_VARIANT_TYPE ("ay")),
+                 "the round-tripped print carries a byte-array fpi-data");
+          if (stored != NULL && g_variant_is_of_type (stored, G_VARIANT_TYPE ("ay")))
+            {
+              payload_bytes = g_variant_get_fixed_array (stored, &payload_len, 1);
+              check (payload_len == sizeof payload,
+                     "the round-tripped payload is %zu bytes (got %zu)",
+                     sizeof payload, payload_len);
+              check (payload_len == sizeof payload
+                     && memcmp (payload_bytes, payload, sizeof payload) == 0,
+                     "the round-tripped payload is the same 30 bytes");
+            }
+          g_clear_pointer (&stored, g_variant_unref);
+          g_object_unref (copy);
+        }
+      g_free (serialized);
+    }
+  g_object_unref (print);
+  g_object_unref (device);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -367,6 +503,8 @@ main (int argc, char **argv)
   check_identity (klass);
   check_unconditional_vfuncs (klass);
   check_session (type);
+  check_enrol_failure (type);
+  check_print_payload_round_trip (type);
   check_vanished_device (type);
   check_close_transfer_failure (type);
   g_type_class_unref (klass);

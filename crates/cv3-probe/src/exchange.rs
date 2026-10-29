@@ -16,8 +16,8 @@
 
 use std::time::Duration;
 
-use cv3_core::proto::timeout;
-use cv3_wire::{IoFailure, IoReply, Transfer, WireError};
+use cv3_core::proto::interrupt;
+use cv3_wire::{FingerError, FingerWait, IoFailure, IoReply, Transfer, WireError};
 
 pub use cv3_wire::{ANNOUNCEMENT_LEN, MAX_REPLY_LEN, Reply};
 
@@ -192,6 +192,15 @@ impl<'a> Exchange<'a> {
                     Err(error) => IoReply::Failed(io_failure(error)),
                 }
             }
+            Transfer::FingerIn { timeout_ms } => {
+                match self
+                    .io
+                    .read_finger(Duration::from_millis(timeout_ms as u64))
+                {
+                    Ok(payload) => IoReply::Data(payload),
+                    Err(error) => IoReply::Failed(io_failure(error)),
+                }
+            }
             Transfer::BulkIn { len, timeout_ms } => {
                 match self
                     .io
@@ -214,17 +223,31 @@ impl<'a> Exchange<'a> {
     /// Waits for the finger event, the one transfer the protocol allows to be cancelled.
     ///
     /// Returns the event word from the first four bytes. The caller decides which values mean
-    /// something; `0x03` is the sensor's "finger read". A short read or a transport failure is a
-    /// typed error, never a panic.
+    /// something; `0x03` is the sensor's "finger read". A host timestamp request is answered while
+    /// waiting, exactly as during a reply announcement, and the interrupt endpoint is read again. A
+    /// short read or a transport failure is a typed error, never a panic.
     pub fn wait_finger(&mut self) -> Result<u32, ExchangeError> {
-        let event = self
-            .io
-            .read_finger(Duration::from_millis(timeout::FINGER_MS as u64))
-            .map_err(ExchangeError::Finger)?;
-        if event.len() < FINGER_EVENT_LEN {
-            return Err(ExchangeError::ShortFingerEvent { got: event.len() });
+        let mut wait = FingerWait::new();
+        while let Some(transfer) = wait.next_transfer() {
+            let result = self.perform(transfer);
+            wait.on_io_result(result);
         }
-        Ok(u32::from_le_bytes([event[0], event[1], event[2], event[3]]))
+        match wait
+            .outcome()
+            .expect("a finished finger wait reports an outcome")
+        {
+            Ok(()) => Ok(interrupt::FINGER),
+            Err(FingerError::Interrupt(failure) | FingerError::Control(failure)) => {
+                Err(ExchangeError::Finger(usb_failure(failure)))
+            }
+            Err(FingerError::TooManyTimestampRequests) => {
+                Err(ExchangeError::Finger(UsbError::TimestampRequests))
+            }
+            Err(FingerError::ShortEvent { got }) => Err(ExchangeError::ShortFingerEvent { got }),
+            // The probe reports the raw word; its transport turns an unexpected value into a typed
+            // error with the same wording the plugin uses.
+            Err(FingerError::UnexpectedEvent { event }) => Ok(event),
+        }
     }
 }
 
@@ -232,6 +255,7 @@ impl<'a> Exchange<'a> {
 mod tests {
     use super::*;
     use crate::timestamp;
+    use cv3_core::proto::timeout;
     use std::cell::RefCell;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +273,8 @@ mod tests {
         interrupt_queue: std::collections::VecDeque<Result<Vec<u8>, UsbError>>,
         bulk: Result<Vec<u8>, UsbError>,
         finger: Result<Vec<u8>, UsbError>,
+        /// When non-empty, consumed before `finger`, so one wait can see several reads.
+        finger_queue: std::collections::VecDeque<Result<Vec<u8>, UsbError>>,
         out_error: Option<UsbError>,
         sync_error: Option<UsbError>,
         timestamps: Vec<u32>,
@@ -265,6 +291,7 @@ mod tests {
                 interrupt_queue: std::collections::VecDeque::new(),
                 bulk: Ok(vec![0xAA; reply_len as usize]),
                 finger: Ok(0x03u32.to_le_bytes().to_vec()),
+                finger_queue: std::collections::VecDeque::new(),
                 out_error: None,
                 sync_error: None,
                 timestamps: Vec::new(),
@@ -301,7 +328,10 @@ mod tests {
 
         fn read_finger(&mut self, timeout: Duration) -> Result<Vec<u8>, UsbError> {
             self.calls.borrow_mut().push(Call::Finger(timeout));
-            self.finger.clone()
+            match self.finger_queue.pop_front() {
+                Some(next) => next,
+                None => self.finger.clone(),
+            }
         }
 
         fn sync_timestamp(&mut self, packed: u32) -> Result<(), UsbError> {
@@ -563,6 +593,32 @@ mod tests {
                 timeout::FINGER_MS as u64
             ))]
         );
+    }
+
+    #[test]
+    fn a_timestamp_request_during_the_finger_wait_is_answered_and_the_read_retried() {
+        let mut io = MockIo::new(0, 0);
+        io.finger = Ok(0x03u32.to_le_bytes().to_vec());
+        io.finger_queue
+            .push_back(Ok(cv3_wire::timestamp::HOST_TIMESTAMP_INTERRUPT
+                .to_le_bytes()
+                .to_vec()));
+        {
+            let mut exchange = Exchange::new(&mut io);
+            assert_eq!(exchange.wait_finger(), Ok(0x03));
+        }
+
+        let calls = io.calls();
+        assert!(
+            matches!(
+                calls[0],
+                Call::Finger(duration)
+                    if duration == Duration::from_millis(timeout::FINGER_MS as u64)
+            ),
+            "{calls:?}"
+        );
+        assert!(matches!(calls[1], Call::Timestamp(_)), "{calls:?}");
+        assert!(matches!(calls[2], Call::Finger(_)), "{calls:?}");
     }
 
     #[test]

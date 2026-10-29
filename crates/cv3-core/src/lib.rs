@@ -17,6 +17,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bind;
 pub mod cancel;
 pub mod capture;
 pub mod crypto;
@@ -34,6 +35,10 @@ pub mod transcript;
 pub mod transport;
 pub mod verify;
 
+pub use bind::{
+    BindError, BoundEnrolment, ENROL_STAGES, EnrolAndBind, EnrolFailure, EnrolStages,
+    TEMPLATE_MAY_REMAIN,
+};
 pub use cancel::{CancelCapture, CancelError};
 pub use capture::{
     ArmCapture, ArmOutcome, CAPTURE_PLAINTEXT_LEN, CAPTURE_TLV_LEN, Capture, CaptureError,

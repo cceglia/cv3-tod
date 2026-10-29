@@ -217,6 +217,18 @@ fake_gusb_plan_session (void)
   add_empty_reply ();
 }
 
+/* A successful open followed by a sensor that leaves the bus when the enrolment's first command
+ * is answered: the vfunc reaches the core, which fails the enrolment and runs its teardown. */
+void
+fake_gusb_plan_enrol (void)
+{
+  fake_gusb_reset ();
+  add_challenge_reply ();
+  add_response_reply (0x00);
+  add_open_reply ();
+  add_vanished_device ();
+}
+
 guint
 fake_gusb_out_count (void)
 {

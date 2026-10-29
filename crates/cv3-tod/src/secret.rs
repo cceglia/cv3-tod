@@ -39,6 +39,28 @@ impl Secrets {
     }
 }
 
+/// The three IVs one enrolment needs.
+///
+/// The core generates no randomness: the enrolment derives one IV per wrapped frame from
+/// [`Self::enrol`], and the confirmation touch uses the other two for its capture arm and its match
+/// request. They are drawn fresh for every enrolment so no two CBC frames share an IV.
+pub struct EnrolIvs {
+    pub enrol: [u8; BLOCK_LEN],
+    pub confirmation_capture: [u8; BLOCK_LEN],
+    pub matching: [u8; BLOCK_LEN],
+}
+
+impl EnrolIvs {
+    /// Draws the three IVs from the operating system.
+    pub fn generate() -> Result<Self, RandomError> {
+        Ok(Self {
+            enrol: random_bytes()?,
+            confirmation_capture: random_bytes()?,
+            matching: random_bytes()?,
+        })
+    }
+}
+
 /// The operating system refused to supply randomness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RandomError(pub String);
@@ -70,5 +92,16 @@ mod tests {
         assert_ne!(first.client_nonce, second.client_nonce);
         assert_ne!(first.host_nonce, second.host_nonce);
         assert_ne!(first.open_iv, second.open_iv);
+    }
+
+    #[test]
+    fn an_enrolment_uses_three_fresh_different_ivs() {
+        let ivs = EnrolIvs::generate().expect("OS randomness");
+        let again = EnrolIvs::generate().expect("OS randomness");
+
+        assert_ne!(ivs.enrol, ivs.confirmation_capture);
+        assert_ne!(ivs.enrol, ivs.matching);
+        assert_ne!(ivs.confirmation_capture, ivs.matching);
+        assert_ne!(ivs.enrol, again.enrol);
     }
 }

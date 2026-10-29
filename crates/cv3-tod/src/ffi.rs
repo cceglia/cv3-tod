@@ -11,6 +11,16 @@
 //! the actual length back through [`cv3_tod_on_transfer`], where the allocation is reclaimed. The
 //! buffer is a separate allocation, never a field of the `Cv3Tod` that the same call mutably
 //! borrows, so the pointer C hands back cannot alias Rust's state.
+//!
+//! Transfer ownership is C's, and the rule is fixed: `fpi_usb_transfer_new` returns one reference
+//! and `fpi_usb_transfer_submit` **consumes** it, so a submitted transfer is never unreffed by the
+//! shim. libfprint's completion wrapper drops that reference after the callback returns. Only a
+//! transfer that was never submitted is the shim's to free. Unreffing a submitted one is a
+//! use-after-free in the completion, which is what the class harness's refcount check catches.
+//!
+//! Enrolment adds two accessors instead of widening the action: [`cv3_tod_take_progress`] hands C
+//! the stages to report to `fpi_device_enroll_progress`, and [`cv3_tod_take_payload`] hands it the
+//! bound print record once the enrolment has succeeded.
 
 use std::ptr;
 
@@ -58,6 +68,8 @@ pub enum ActionKind {
     BulkIn = 2,
     Control = 3,
     Finish = 4,
+    /// An interrupt read of the finger event: the one transfer C may cancel.
+    WaitFinger = 5,
 }
 
 /// The result C reports for one transfer. The numbers match `Cv3IoResult` in the shim.
@@ -92,7 +104,11 @@ pub struct Cv3Action {
     pub endpoint: u8,
     pub request_type: u8,
     pub request: u8,
-    pub reserved: u8,
+    /// One when C must perform this transfer with the action's cancellable; zero otherwise.
+    ///
+    /// Only the finger wait may be cancelled. A command transfer handed a cancellable is what
+    /// deep-wedges this sensor when it is aborted, so C must never cancel anything else.
+    pub cancellable: u8,
     pub value: u16,
     pub index: u16,
     pub timeout_ms: u32,
@@ -155,6 +171,19 @@ impl Cv3Tod {
                         timeout_ms,
                         buffer,
                         length,
+                        ..Cv3Action::empty()
+                    }
+                }
+                Transfer::FingerIn { timeout_ms } => {
+                    let (buffer, length) =
+                        self.store_buffer(vec![0u8; cv3_wire::INTERRUPT_BUFFER_LEN]);
+                    Cv3Action {
+                        kind: ActionKind::WaitFinger as u32,
+                        endpoint: endpoint::INTERRUPT,
+                        timeout_ms,
+                        buffer,
+                        length,
+                        cancellable: 1,
                         ..Cv3Action::empty()
                     }
                 }
@@ -253,7 +282,7 @@ impl Cv3Action {
             endpoint: 0,
             request_type: 0,
             request: 0,
-            reserved: 0,
+            cancellable: 0,
             value: 0,
             index: 0,
             timeout_ms: 0,
@@ -415,6 +444,95 @@ pub unsafe extern "C" fn cv3_tod_close_start(tod: *mut Cv3Tod) -> Cv3Action {
     }
 }
 
+/// The number of enrolment stages the plugin declares to `libfprint`.
+///
+/// It comes from the core's own [`cv3_core::bind::ENROL_STAGES`], so the shim's class and the
+/// operation's stage reports cannot disagree.
+#[unsafe(no_mangle)]
+pub extern "C" fn cv3_tod_enrol_stages() -> i32 {
+    i32::try_from(cv3_core::bind::ENROL_STAGES).unwrap_or(i32::MAX)
+}
+
+/// Starts a whole enrolment on the live session and returns the first transfer.
+///
+/// A failure before the first transfer comes back as a [`ActionKind::Finish`] action with a
+/// message; the shim reports it as the enrolment's failure.
+///
+/// # Safety
+///
+/// `tod` must be null or a live pointer from [`cv3_tod_create`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cv3_tod_enrol_start(tod: *mut Cv3Tod) -> Cv3Action {
+    // SAFETY: the caller guarantees `tod` is live; `as_mut` is null safe.
+    match unsafe { tod.as_mut() } {
+        Some(session) => {
+            let step = session.plugin.enrol_start();
+            session.publish(step)
+        }
+        None => Cv3Action::error("cv3: the plugin session was not created"),
+    }
+}
+
+/// Takes the next progress report for `fpi_device_enroll_progress`.
+///
+/// Returns `0` when there is nothing to report, `1` for a completed stage and `2` for a rejected
+/// sample the client should retry. `completed` receives the stage count, always at most
+/// [`cv3_core::bind::ENROL_STAGES`].
+///
+/// # Safety
+///
+/// `tod` must be null or a live pointer from [`cv3_tod_create`]; `completed` must be null or point
+/// to a writable `i32`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cv3_tod_take_progress(tod: *mut Cv3Tod, completed: *mut i32) -> i32 {
+    // SAFETY: the caller guarantees `tod` is live; `as_mut` is null safe.
+    let Some(session) = (unsafe { tod.as_mut() }) else {
+        return 0;
+    };
+    let Some(progress) = session.plugin.take_progress() else {
+        return 0;
+    };
+    if !completed.is_null() {
+        // SAFETY: the caller guarantees `completed` is writable.
+        unsafe {
+            *completed = i32::try_from(progress.completed).unwrap_or(i32::MAX);
+        }
+    }
+    if progress.retry { 2 } else { 1 }
+}
+
+/// Copies the bound print record of a completed enrolment into `destination`.
+///
+/// Returns the number of bytes written, or `0` when there is no payload or `destination` is too
+/// small. The shim calls this only after a successful finish action.
+///
+/// # Safety
+///
+/// `tod` must be null or a live pointer from [`cv3_tod_create`]; `destination` must be null or
+/// valid for writes of `capacity` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cv3_tod_take_payload(
+    tod: *mut Cv3Tod,
+    destination: *mut u8,
+    capacity: usize,
+) -> usize {
+    // SAFETY: the caller guarantees `tod` is live; `as_mut` is null safe.
+    let Some(session) = (unsafe { tod.as_mut() }) else {
+        return 0;
+    };
+    let Some(payload) = session.plugin.take_payload() else {
+        return 0;
+    };
+    if destination.is_null() || capacity < payload.len() {
+        return 0;
+    }
+    // SAFETY: `destination` is valid for `capacity` bytes and `payload` is a distinct local array.
+    unsafe {
+        ptr::copy_nonoverlapping(payload.as_ptr(), destination, payload.len());
+    }
+    payload.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,5 +591,75 @@ mod tests {
         assert_eq!(action.error_code, OutcomeKind::Proto as i32);
         let end = action.message.iter().position(|byte| *byte == 0).unwrap();
         assert_eq!(&action.message[..end], b"cv3: refused");
+    }
+
+    #[test]
+    fn a_finger_wait_action_is_the_one_cancellable_transfer() {
+        let mut session = Cv3Tod::new();
+        let action = session.publish(Step::Transfer(Transfer::FingerIn {
+            timeout_ms: cv3_core::proto::timeout::FINGER_MS,
+        }));
+
+        assert_eq!(action.kind, ActionKind::WaitFinger as u32);
+        assert_eq!(action.endpoint, endpoint::INTERRUPT);
+        assert_eq!(action.cancellable, 1);
+        assert_eq!(action.timeout_ms, cv3_core::proto::timeout::FINGER_MS);
+        assert_eq!(action.length, cv3_wire::INTERRUPT_BUFFER_LEN);
+        assert!(!action.buffer.is_null());
+    }
+
+    #[test]
+    fn every_command_action_is_non_cancellable() {
+        let mut session = Cv3Tod::new();
+        for transfer in [
+            Transfer::Out {
+                frame: vec![0; 16],
+                timeout_ms: 5_000,
+            },
+            Transfer::InterruptIn {
+                max_len: 64,
+                timeout_ms: 60_000,
+            },
+            Transfer::BulkIn {
+                len: 4,
+                timeout_ms: 60_000,
+            },
+            Transfer::ControlOut {
+                request_type: 0x40,
+                request: 0x0d,
+                value: 1,
+                index: 2,
+                timeout_ms: 1_000,
+            },
+        ] {
+            let action = session.publish(Step::Transfer(transfer));
+            assert_eq!(action.cancellable, 0, "kind {}", action.kind);
+        }
+    }
+
+    #[test]
+    fn the_declared_stage_count_is_the_core_value() {
+        assert_eq!(cv3_tod_enrol_stages(), 13);
+        assert_eq!(
+            usize::try_from(cv3_tod_enrol_stages()).expect("a positive count"),
+            cv3_core::bind::ENROL_STAGES
+        );
+    }
+
+    #[test]
+    fn the_enrolment_accessors_are_empty_and_null_safe_before_a_run() {
+        let mut session = Cv3Tod::new();
+        let mut completed = -1;
+        // SAFETY: `session` is a live `Cv3Tod` and `completed` is a local `i32`.
+        assert_eq!(
+            unsafe { cv3_tod_take_progress(&mut session, &mut completed) },
+            0
+        );
+        assert_eq!(completed, -1, "nothing is written without a report");
+        // SAFETY: `session` is live; a NULL destination is explicitly allowed.
+        assert_eq!(
+            unsafe { cv3_tod_take_payload(&mut session, ptr::null_mut(), 0) },
+            0
+        );
     }
 }

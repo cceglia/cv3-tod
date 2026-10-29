@@ -29,6 +29,9 @@ use cv3_core::proto::{cmd, endpoint, timeout};
 
 use crate::timestamp::{MAX_REQUESTS, is_host_timestamp_request, pack};
 
+/// Bytes in the finger event the interrupt endpoint delivers.
+pub const FINGER_EVENT_LEN: usize = 4;
+
 /// Bytes in the interrupt announcement.
 pub const ANNOUNCEMENT_LEN: usize = 8;
 /// Largest body accepted. The audited implementation reads into an 8192-byte buffer; a length
@@ -48,6 +51,14 @@ pub enum Transfer {
     Out { frame: Vec<u8>, timeout_ms: u32 },
     /// Read one interrupt payload of at most `max_len` bytes.
     InterruptIn { max_len: usize, timeout_ms: u32 },
+    /// Read the finger event: an interrupt payload, and the only transfer the protocol allows the
+    /// transport to cancel.
+    ///
+    /// The fingerprint commands must never take this path; the shim passes no cancellable to
+    /// [`Transfer::Out`], [`Transfer::InterruptIn`], [`Transfer::BulkIn`] or
+    /// [`Transfer::ControlOut`], because aborting a command transfer mid-flight deep-wedges this
+    /// sensor.
+    FingerIn { timeout_ms: u32 },
     /// Read exactly the announced number of bytes from the reply (bulk IN) endpoint.
     BulkIn { len: usize, timeout_ms: u32 },
     /// Answer the host timestamp request: a vendor/device OUT control request with no data stage.
@@ -65,9 +76,19 @@ impl Transfer {
     pub fn endpoint(&self) -> u8 {
         match self {
             Self::Out { .. } => endpoint::OUT,
-            Self::InterruptIn { .. } | Self::ControlOut { .. } => endpoint::INTERRUPT,
+            Self::InterruptIn { .. } | Self::FingerIn { .. } | Self::ControlOut { .. } => {
+                endpoint::INTERRUPT
+            }
             Self::BulkIn { .. } => endpoint::IN,
         }
+    }
+
+    /// Whether the transport may cancel this transfer.
+    ///
+    /// Only the finger wait may be abandoned; a cancelled command transfer is what deep-wedges the
+    /// sensor, so every other transfer is submitted without a cancellable.
+    pub fn cancellable(&self) -> bool {
+        matches!(self, Self::FingerIn { .. })
     }
 }
 
@@ -228,6 +249,94 @@ impl fmt::Display for WireError {
 }
 
 impl std::error::Error for WireError {}
+
+/// Turns one finished finger wait into the event the core operation expects.
+///
+/// `Ok(())` is [`Event::Finger`]; the event word itself is validated by [`FingerWait`], which
+/// refuses a payload that is not the protocol's `0x03`. A cancelled wait is a cancellation event,
+/// not a transport error, so an operation tears the session down and reports it as one.
+pub fn event_from_finger(outcome: Result<(), FingerError>) -> Event {
+    match outcome {
+        Ok(()) => Event::Finger,
+        Err(error) if error.is_cancelled() => Event::Cancelled,
+        Err(error) => Event::Transport(error.to_transport_error()),
+    }
+}
+
+/// Why a finger wait did not see the finger event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FingerError {
+    /// Reading the interrupt endpoint failed. `Cancelled` is the normal way an abandoned wait ends.
+    Interrupt(IoFailure),
+    /// Answering the sensor's host timestamp request failed.
+    Control(IoFailure),
+    /// The sensor kept asking for the host timestamp without ever delivering a finger event.
+    TooManyTimestampRequests,
+    /// The interrupt payload is too short to carry the event word.
+    ShortEvent { got: usize },
+    /// The event word is not the protocol's finger event.
+    UnexpectedEvent { event: u32 },
+}
+
+impl FingerError {
+    /// Whether the wait ended because someone asked it to stop.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(
+            self,
+            Self::Interrupt(IoFailure::Cancelled) | Self::Control(IoFailure::Cancelled)
+        )
+    }
+
+    /// Maps the failure onto the core's own transport error.
+    pub fn to_transport_error(&self) -> TransportError {
+        match self {
+            Self::Interrupt(IoFailure::Timeout) => TransportError::Timeout,
+            Self::Interrupt(failure) | Self::Control(failure) => match failure {
+                IoFailure::Disconnected => TransportError::Disconnected,
+                IoFailure::Stall => TransportError::Stall,
+                IoFailure::Cancelled => TransportError::Other("transfer cancelled".to_owned()),
+                IoFailure::Busy => TransportError::Other("the sensor is busy".to_owned()),
+                IoFailure::Other(message) => TransportError::Other(message.clone()),
+                IoFailure::Timeout => {
+                    TransportError::Other("answering the host timestamp timed out".to_owned())
+                }
+            },
+            Self::TooManyTimestampRequests => TransportError::Other(
+                "sensor kept requesting the host timestamp without a finger event".to_owned(),
+            ),
+            Self::ShortEvent { got } => TransportError::Other(format!(
+                "finger event is {got} bytes, at least {FINGER_EVENT_LEN} are needed"
+            )),
+            Self::UnexpectedEvent { event } => TransportError::Other(format!(
+                "unexpected interrupt event {event:#04x} where a finger event was expected"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for FingerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Interrupt(error) => write!(f, "reading the finger event failed: {error}"),
+            Self::Control(error) => {
+                write!(f, "answering the host timestamp request failed: {error}")
+            }
+            Self::TooManyTimestampRequests => {
+                f.write_str("sensor kept requesting the host timestamp without a finger event")
+            }
+            Self::ShortEvent { got } => write!(
+                f,
+                "finger event is {got} bytes, at least {FINGER_EVENT_LEN} are needed"
+            ),
+            Self::UnexpectedEvent { event } => write!(
+                f,
+                "unexpected interrupt event {event:#04x} where a finger event was expected"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FingerError {}
 
 /// Turns one finished exchange into the event the core operation expects.
 ///
@@ -406,6 +515,117 @@ impl Reply {
             status: 0,
             body: Vec::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FingerState {
+    /// Waiting for the finger event, having answered `answered` host timestamp requests.
+    Read {
+        answered: usize,
+    },
+    /// Answering a host timestamp request before reading the interrupt endpoint again.
+    Control {
+        packed: u32,
+        answered: usize,
+    },
+    Done(Result<(), FingerError>),
+}
+
+/// One finger wait: the cancellable interrupt read, answering host timestamp requests on the way.
+///
+/// The sensor may ask for the host clock on the interrupt endpoint while it waits for the finger,
+/// exactly as it does before announcing a reply. That request is answered with the same vendor
+/// control and the interrupt endpoint is read again; an unprompted sync is never sent, because an
+/// unsolicited one at session start timed out on 2026-10-29 (see `docs/protocol-notes.md`).
+///
+/// [`Self::next_transfer`] asks for a [`Transfer::FingerIn`] (cancellable) or a
+/// [`Transfer::ControlOut`] (never cancellable); [`Self::on_io_result`] consumes what happened and
+/// the machine finishes with `Ok(())` once the protocol's `0x03` finger event arrives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FingerWait {
+    state: FingerState,
+}
+
+impl Default for FingerWait {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FingerWait {
+    /// Builds a wait that has read nothing yet.
+    pub fn new() -> Self {
+        Self {
+            state: FingerState::Read { answered: 0 },
+        }
+    }
+
+    /// The transfer to perform next, or `None` once the finger event has arrived or the wait failed.
+    ///
+    /// Calling it again before [`Self::on_io_result`] returns the same transfer.
+    pub fn next_transfer(&mut self) -> Option<Transfer> {
+        match &self.state {
+            FingerState::Read { .. } => Some(Transfer::FingerIn {
+                timeout_ms: timeout::FINGER_MS,
+            }),
+            FingerState::Control { packed, .. } => Some(Transfer::ControlOut {
+                request_type: timestamp::HOST_TIMESTAMP_REQUEST_TYPE,
+                request: timestamp::HOST_TIMESTAMP_REQUEST,
+                value: *packed as u16,
+                index: (*packed >> 16) as u16,
+                timeout_ms: timestamp::SYNC_TIMEOUT_MS,
+            }),
+            FingerState::Done(_) => None,
+        }
+    }
+
+    /// Consumes the result of the transfer [`Self::next_transfer`] returned.
+    pub fn on_io_result(&mut self, reply: IoReply) {
+        let state = std::mem::replace(&mut self.state, FingerState::Done(Ok(())));
+        self.state = match state {
+            FingerState::Read { answered } => match reply {
+                IoReply::Data(payload) => on_finger_payload(answered, payload),
+                IoReply::Completed => FingerState::Done(Err(FingerError::ShortEvent { got: 0 })),
+                IoReply::Failed(failure) => FingerState::Done(Err(FingerError::Interrupt(failure))),
+            },
+            FingerState::Control { answered, .. } => match reply {
+                // The answer was accepted; read again with the same count, so a sensor that keeps
+                // asking is still bounded.
+                IoReply::Completed | IoReply::Data(_) => FingerState::Read { answered },
+                IoReply::Failed(failure) => FingerState::Done(Err(FingerError::Control(failure))),
+            },
+            done @ FingerState::Done(_) => done,
+        };
+    }
+
+    /// The finished outcome, or `None` while a transfer is still pending.
+    pub fn outcome(&self) -> Option<Result<(), FingerError>> {
+        match &self.state {
+            FingerState::Done(result) => Some(result.clone()),
+            _ => None,
+        }
+    }
+}
+
+fn on_finger_payload(answered: usize, payload: Vec<u8>) -> FingerState {
+    if is_host_timestamp_request(&payload) {
+        if answered >= MAX_REQUESTS {
+            return FingerState::Done(Err(FingerError::TooManyTimestampRequests));
+        }
+        return FingerState::Control {
+            packed: pack(std::time::SystemTime::now()),
+            answered: answered + 1,
+        };
+    }
+    if payload.len() < FINGER_EVENT_LEN {
+        return FingerState::Done(Err(FingerError::ShortEvent { got: payload.len() }));
+    }
+    let event = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    if event == cv3_core::proto::interrupt::FINGER {
+        FingerState::Done(Ok(()))
+    } else {
+        FingerState::Done(Err(FingerError::UnexpectedEvent { event }))
     }
 }
 
@@ -778,5 +998,228 @@ mod tests {
             Event::Reply { status: 0x0f, body },
             "the announcement status is not the command status"
         );
+    }
+
+    /// Drives a finger wait with scripted results, returning its outcome and every transfer.
+    fn drive_finger_wait(
+        mut wait: FingerWait,
+        results: impl Iterator<Item = IoReply>,
+    ) -> (Option<Result<(), FingerError>>, Vec<Transfer>) {
+        let mut transfers = Vec::new();
+        let mut results = results;
+        while let Some(transfer) = wait.next_transfer() {
+            transfers.push(transfer);
+            match results.next() {
+                Some(result) => wait.on_io_result(result),
+                None => panic!("the script ran out of results"),
+            }
+        }
+        (wait.outcome(), transfers)
+    }
+
+    #[test]
+    fn the_finger_wait_reads_the_interrupt_endpoint_with_the_finger_timeout() {
+        let (outcome, transfers) = drive_finger_wait(
+            FingerWait::new(),
+            [IoReply::Data(
+                cv3_core::proto::interrupt::FINGER.to_le_bytes().to_vec(),
+            )]
+            .into_iter(),
+        );
+
+        assert_eq!(outcome, Some(Ok(())));
+        assert_eq!(
+            transfers,
+            [Transfer::FingerIn {
+                timeout_ms: timeout::FINGER_MS
+            }]
+        );
+        assert!(transfers[0].cancellable(), "the finger wait is cancellable");
+        assert_eq!(transfers[0].endpoint(), endpoint::INTERRUPT);
+    }
+
+    #[test]
+    fn a_command_transfer_is_never_cancellable() {
+        for transfer in [
+            Transfer::Out {
+                frame: vec![0],
+                timeout_ms: 1,
+            },
+            Transfer::InterruptIn {
+                max_len: 8,
+                timeout_ms: 1,
+            },
+            Transfer::BulkIn {
+                len: 8,
+                timeout_ms: 1,
+            },
+            Transfer::ControlOut {
+                request_type: 1,
+                request: 1,
+                value: 0,
+                index: 0,
+                timeout_ms: 1,
+            },
+        ] {
+            assert!(!transfer.cancellable(), "{transfer:?}");
+        }
+    }
+
+    #[test]
+    fn a_timestamp_request_during_the_finger_wait_is_answered_and_the_read_retried() {
+        let (outcome, transfers) = drive_finger_wait(
+            FingerWait::new(),
+            [
+                IoReply::Data(timestamp::HOST_TIMESTAMP_INTERRUPT.to_le_bytes().to_vec()),
+                IoReply::Completed,
+                IoReply::Data(cv3_core::proto::interrupt::FINGER.to_le_bytes().to_vec()),
+            ]
+            .into_iter(),
+        );
+
+        assert_eq!(outcome, Some(Ok(())));
+        assert!(matches!(transfers[0], Transfer::FingerIn { .. }));
+        match transfers[1] {
+            Transfer::ControlOut {
+                request,
+                request_type,
+                timeout_ms,
+                ..
+            } => {
+                assert_eq!(request, timestamp::HOST_TIMESTAMP_REQUEST);
+                assert_eq!(request_type, timestamp::HOST_TIMESTAMP_REQUEST_TYPE);
+                assert_eq!(timeout_ms, timestamp::SYNC_TIMEOUT_MS);
+            }
+            ref other => panic!("expected the timestamp control, got {other:?}"),
+        }
+        assert!(
+            !transfers[1].cancellable(),
+            "answering the clock is not the finger wait"
+        );
+        assert!(matches!(transfers[2], Transfer::FingerIn { .. }));
+    }
+
+    #[test]
+    fn repeated_timestamp_requests_during_the_finger_wait_stop_at_the_bound() {
+        let mut wait = FingerWait::new();
+        for _ in 0..MAX_REQUESTS {
+            assert!(matches!(
+                wait.next_transfer(),
+                Some(Transfer::FingerIn { .. })
+            ));
+            wait.on_io_result(IoReply::Data(
+                timestamp::HOST_TIMESTAMP_INTERRUPT.to_le_bytes().to_vec(),
+            ));
+            assert!(matches!(
+                wait.next_transfer(),
+                Some(Transfer::ControlOut { .. })
+            ));
+            wait.on_io_result(IoReply::Completed);
+        }
+        assert!(matches!(
+            wait.next_transfer(),
+            Some(Transfer::FingerIn { .. })
+        ));
+        wait.on_io_result(IoReply::Data(
+            timestamp::HOST_TIMESTAMP_INTERRUPT.to_le_bytes().to_vec(),
+        ));
+
+        assert_eq!(
+            wait.outcome(),
+            Some(Err(FingerError::TooManyTimestampRequests))
+        );
+        assert_eq!(wait.next_transfer(), None);
+    }
+
+    #[test]
+    fn a_cancelled_finger_wait_becomes_the_core_cancellation_event() {
+        let (outcome, _) = drive_finger_wait(
+            FingerWait::new(),
+            [IoReply::Failed(IoFailure::Cancelled)].into_iter(),
+        );
+
+        assert_eq!(
+            outcome,
+            Some(Err(FingerError::Interrupt(IoFailure::Cancelled)))
+        );
+        assert_eq!(
+            event_from_finger(outcome.expect("finished")),
+            Event::Cancelled
+        );
+    }
+
+    #[test]
+    fn a_finger_timeout_keeps_its_meaning_and_other_failures_do_not() {
+        let (outcome, _) = drive_finger_wait(
+            FingerWait::new(),
+            [IoReply::Failed(IoFailure::Timeout)].into_iter(),
+        );
+        assert_eq!(
+            event_from_finger(outcome.expect("finished")),
+            Event::Transport(TransportError::Timeout),
+            "a finger timeout is not a general transport failure"
+        );
+
+        let (outcome, _) = drive_finger_wait(
+            FingerWait::new(),
+            [IoReply::Failed(IoFailure::Disconnected)].into_iter(),
+        );
+        assert_eq!(
+            event_from_finger(outcome.expect("finished")),
+            Event::Transport(TransportError::Disconnected)
+        );
+    }
+
+    #[test]
+    fn a_failed_timestamp_answer_during_the_wait_is_a_control_failure() {
+        let mut wait = FingerWait::new();
+        assert!(matches!(
+            wait.next_transfer(),
+            Some(Transfer::FingerIn { .. })
+        ));
+        wait.on_io_result(IoReply::Data(
+            timestamp::HOST_TIMESTAMP_INTERRUPT.to_le_bytes().to_vec(),
+        ));
+        wait.on_io_result(IoReply::Failed(IoFailure::Stall));
+
+        assert_eq!(
+            wait.outcome(),
+            Some(Err(FingerError::Control(IoFailure::Stall)))
+        );
+    }
+
+    #[test]
+    fn a_short_or_unexpected_interrupt_payload_is_a_typed_error() {
+        let (outcome, _) = drive_finger_wait(
+            FingerWait::new(),
+            [IoReply::Data(vec![0x03, 0x00, 0x00])].into_iter(),
+        );
+        assert_eq!(outcome, Some(Err(FingerError::ShortEvent { got: 3 })));
+
+        let (outcome, _) = drive_finger_wait(
+            FingerWait::new(),
+            [IoReply::Data(0x07u32.to_le_bytes().to_vec())].into_iter(),
+        );
+        let message = event_from_finger(outcome.expect("finished"));
+        match message {
+            Event::Transport(TransportError::Other(message)) => {
+                assert!(message.contains("0x07"), "{message}");
+                assert!(message.contains("finger"), "{message}");
+            }
+            other => panic!("expected a typed transport error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_finished_finger_wait_asks_for_nothing_and_ignores_late_results() {
+        let mut wait = FingerWait::new();
+        wait.on_io_result(IoReply::Failed(IoFailure::Timeout));
+        assert_eq!(wait.next_transfer(), None);
+
+        let before = wait.outcome();
+        wait.on_io_result(IoReply::Data(
+            cv3_core::proto::interrupt::FINGER.to_le_bytes().to_vec(),
+        ));
+        assert_eq!(wait.outcome(), before, "a late result changes nothing");
     }
 }

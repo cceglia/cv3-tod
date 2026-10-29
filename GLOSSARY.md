@@ -50,10 +50,21 @@ accepted sample; the enrolment records which of the two it used.
 _Avoid_: template name, print id
 
 **Match id**:
-The 20-byte value the sensor returns alongside a positive match. The reference claims it is not the
-enrolment id and that the two are not comparable; that claim is unestablished. What it is derived
-from, and whether it is stable across sessions, is likewise unestablished.
+The template handle the match reply names as the template it compared against. Measured
+2026-10-29: a 4-byte `u32`, the same value as the `0x6E` commit reply's `(0,4,…)` entry, stable
+across a power cycle. It is not a 20-byte value; the reference's "biometric-derived hash" was the
+reply's trailing token.
 _Avoid_: matched id
+
+**Confirmation touch**:
+The one extra capture and `0x2F` identify after a commit. Its matched handle becomes the print's
+**match id**. If it does not happen or does not match, the enrolment fails and stores no print.
+_Avoid_: second enrolment, verification
+
+**Enrolment stage**:
+One of the thirteen stages the driver declares: an accepted sample, or the final confirmation
+touch. The sensor may complete early, so a run reports fewer.
+_Avoid_: step, round
 
 **Bound print**:
 A print whose verification requires the sensor to report the same match id that was recorded for it.
