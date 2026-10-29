@@ -325,8 +325,12 @@ cv3_tod_report_progress (FpDevice *device)
         retry = fpi_device_retry_new_msg (
           FP_DEVICE_RETRY_GENERAL,
           "cv3: the sensor could not use that sample; place the finger again");
-      fpi_device_enroll_progress (device, completed, self->enroll_print, retry);
-      g_clear_error (&retry);
+      g_message ("cv3: progress completed=%d retry=%d", completed, retry != NULL);
+      /* libfprint takes ownership of the error and clears it itself, and it rejects a print
+       * supplied together with an error (the retry must carry none). Clearing the error here as
+       * well is a double free: the daemon aborts with `free(): invalid pointer`. */
+      fpi_device_enroll_progress (device, completed, retry != NULL ? NULL : self->enroll_print,
+                                  retry);
     }
 }
 
@@ -385,6 +389,8 @@ cv3_tod_transfer_cb (FpiUsbTransfer *transfer,
   /* The reference `fpi_usb_transfer_submit` consumed is dropped by libfprint's own completion
    * wrapper, which runs after this callback returns: the transfer is still alive here and must not
    * be unrefed. */
+  g_message ("cv3: transfer kind=%d result=%u err=%u actual=%zu", action_kind, result,
+             code, actual_length);
   action = cv3_tod_on_transfer (self->tod, result, code, actual_length);
   cv3_tod_dispatch (device, action);
 }
@@ -401,6 +407,22 @@ cv3_tod_transfer_cb (FpiUsbTransfer *transfer,
  * consumes it, so a submitted transfer is never unrefed here or in the callback. libfprint's
  * completion wrapper drops that reference after the callback returns. See the note at the submit.
  */
+/* TEMPORARY diagnostic: name the action in the journal while debugging a stall. */
+static const char *
+cv3_tod_action_name (guint32 kind)
+{
+  switch (kind)
+    {
+    case CV3_ACTION_OUT: return "out";
+    case CV3_ACTION_INTERRUPT_IN: return "interrupt-in";
+    case CV3_ACTION_BULK_IN: return "bulk-in";
+    case CV3_ACTION_WAIT_FINGER: return "wait-finger";
+    case CV3_ACTION_CONTROL: return "control";
+    case CV3_ACTION_FINISH: return "finish";
+    default: return "unknown";
+    }
+}
+
 static void
 cv3_tod_dispatch (FpDevice *device, Cv3Action action)
 {
@@ -412,6 +434,10 @@ cv3_tod_dispatch (FpDevice *device, Cv3Action action)
    * rejected sample while the driver has not yet started the next read. */
   if (self->enrolling)
     cv3_tod_report_progress (device);
+
+  g_message ("cv3: action %s len=%zu timeout=%u status=%d",
+             cv3_tod_action_name (action.kind), (size_t) action.length,
+             action.timeout_ms, action.status);
 
   if (action.kind == CV3_ACTION_FINISH)
     {
