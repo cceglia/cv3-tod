@@ -25,8 +25,8 @@ use cv3_core::session::{
 use cv3_core::transcript::{RecordingTransport, ReplayTransport, Transcript};
 use cv3_core::transport::{Transport, run as drive};
 use cv3_core::verify::{
-    MATCH_VALUE_LEN, MatchError, VALUE_OFFSET, VERDICT_MATCH, VERDICT_NO_MATCH, VERDICT_OFFSET,
-    Verdict, Verification, Verify, VerifyError,
+    MATCHED_HANDLE_OFFSET, MatchError, VERDICT_MATCH, VERDICT_NO_MATCH, VERDICT_OFFSET, Verdict,
+    Verification, Verify, VerifyError,
 };
 use cv3_core::{Action, Operation};
 
@@ -1569,12 +1569,12 @@ fn print_status_diagnostics(
     let _ = writeln!(out, "status 0x{status:02x}");
     if let Some(bytes) = plaintext.filter(|bytes| bytes.len() >= VERDICT_OFFSET + 4) {
         let _ = writeln!(out, "{}", verdict_line(le32(bytes, VERDICT_OFFSET)));
-        match value_at(bytes) {
-            Some(value) => {
-                let _ = writeln!(out, "value {}", hex(&value));
+        match matched_handle_at(bytes) {
+            Some(handle) => {
+                let _ = writeln!(out, "matched handle {handle:#010x}");
             }
             None => {
-                let _ = writeln!(out, "value absent");
+                let _ = writeln!(out, "matched handle absent");
             }
         }
     }
@@ -1600,14 +1600,12 @@ fn verdict_line(word: u32) -> String {
     format!("verdict {word} ({meaning})")
 }
 
-/// The twenty bytes at plaintext `+32`, when the plaintext carries them.
-fn value_at(plaintext: &[u8]) -> Option<[u8; MATCH_VALUE_LEN]> {
-    if plaintext.len() < VALUE_OFFSET + MATCH_VALUE_LEN {
+/// The matched template handle at plaintext `+20`, when the reply carries one.
+fn matched_handle_at(plaintext: &[u8]) -> Option<u32> {
+    if plaintext.len() < MATCHED_HANDLE_OFFSET + 4 {
         return None;
     }
-    let mut value = [0u8; MATCH_VALUE_LEN];
-    value.copy_from_slice(&plaintext[VALUE_OFFSET..VALUE_OFFSET + MATCH_VALUE_LEN]);
-    Some(value)
+    Some(le32(plaintext, MATCHED_HANDLE_OFFSET))
 }
 
 fn le32(bytes: &[u8], offset: usize) -> u32 {
@@ -1643,12 +1641,12 @@ fn print_verdict(verdict: &Verdict, out: &mut dyn Write) {
     let _ = writeln!(out, "command 0x{:02x}", verdict.command);
     let _ = writeln!(out, "status 0x{:02x}", verdict.status);
     let _ = writeln!(out, "{}", verdict_line(verdict.word));
-    match &verdict.value {
-        Some(value) => {
-            let _ = writeln!(out, "value {}", hex(value));
+    match verdict.matched_handle {
+        Some(handle) => {
+            let _ = writeln!(out, "matched handle {handle:#010x}");
         }
         None => {
-            let _ = writeln!(out, "value absent");
+            let _ = writeln!(out, "matched handle absent");
         }
     }
     let _ = writeln!(out, "reply length {}", verdict.reply_len);
@@ -2193,8 +2191,8 @@ mod tests {
     use crate::layout::{EndpointDescriptor, TransferType};
     use crate::signals::SignalFlag;
     use crate::testing::{
-        DEVICE_NONCE, DEVICE_PUBLIC, ENROLMENT_ID, FakeUsb, MATCH_VALUE, SAMPLE_HASH, TEST_HANDLE,
-        sensor,
+        DEVICE_NONCE, DEVICE_PUBLIC, ENROLMENT_ID, FakeUsb, MATCHED_HANDLE, SAMPLE_HASH,
+        TEST_HANDLE, sensor,
     };
 
     fn run_with(args: &[&str], usb: &mut FakeUsb, shutdown: &dyn Shutdown) -> (u8, String, String) {
@@ -3532,9 +3530,9 @@ mod tests {
                 cmd::IDENTIFY,
                 0,
                 VERDICT_MATCH,
-                Some(&MATCH_VALUE),
+                Some(MATCHED_HANDLE),
                 108,
-                52
+                56
             )),
             "{out}"
         );
@@ -3701,7 +3699,14 @@ mod tests {
              {}",
             hex(&ENROLMENT_ID),
             hex(&ENROLMENT_ID),
-            verify_output(cmd::IDENTIFY, 0, VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
+            verify_output(
+                cmd::IDENTIFY,
+                0,
+                VERDICT_MATCH,
+                Some(MATCHED_HANDLE),
+                108,
+                56
+            )
         );
         assert_eq!(
             out, expected,
@@ -3785,7 +3790,14 @@ mod tests {
             out,
             format!(
                 "match template id {template}\n{}",
-                verify_output(cmd::IDENTIFY, 0, VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
+                verify_output(
+                    cmd::IDENTIFY,
+                    0,
+                    VERDICT_MATCH,
+                    Some(MATCHED_HANDLE),
+                    108,
+                    56
+                )
             )
         );
         let tlvs = usb.match_tlvs.borrow();
@@ -4104,7 +4116,7 @@ mod tests {
     #[test]
     fn verify_reports_the_measured_0x59_with_the_reply_length_and_plaintext() {
         let mut usb = FakeUsb::with_sensor();
-        let plaintext = match_plaintext(0, Some(&MATCH_VALUE));
+        let plaintext = match_plaintext(0, Some(MATCHED_HANDLE));
         usb.match_status = 0x59;
         usb.match_plaintext = Some(plaintext.clone());
         let shutdown = SignalFlag::new();
@@ -4115,13 +4127,12 @@ mod tests {
         assert!(out.contains("command 0x2f"), "{out}");
         assert!(out.contains("status 0x59"), "{out}");
         assert!(out.contains("reply length 108"), "{out}");
-        assert!(out.contains("plaintext length 52"), "{out}");
+        assert!(out.contains("plaintext length 56"), "{out}");
         assert_eq!(
             out,
             format!(
-                "command 0x2f\nstatus 0x59\n{}\nvalue {}\nreply length 108\nplaintext length 52\n{}",
+                "command 0x2f\nstatus 0x59\n{}\nmatched handle {MATCHED_HANDLE:#010x}\nreply length 108\nplaintext length 56\n{}",
                 verdict_line(0),
-                hex(&MATCH_VALUE),
                 plaintext_dump(&plaintext)
             ),
             "a refusal is dumped with the raw word, never decoded as a match"
@@ -4132,7 +4143,7 @@ mod tests {
             "the raw reply length is visible: {err}"
         );
         assert!(
-            err.contains("decrypted plaintext 52 bytes"),
+            err.contains("decrypted plaintext 56 bytes"),
             "the decrypted length is visible: {err}"
         );
         assert!(
@@ -4163,7 +4174,7 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "command 0x2f\nstatus 0x0e\n{}\nvalue absent\nreply length 76\nplaintext length 20\n{}",
+                "command 0x2f\nstatus 0x0e\n{}\nmatched handle absent\nreply length 76\nplaintext length 20\n{}",
                 verdict_line(0x1122_3344),
                 plaintext_dump(&plaintext)
             )
@@ -4177,7 +4188,7 @@ mod tests {
     fn enroll_then_verify_reports_a_no_match_after_naming_the_template_and_tears_down() {
         let mut usb = FakeUsb::with_sensor();
         usb.completion_after = Some(2);
-        usb.match_plaintext = Some(match_plaintext(VERDICT_NO_MATCH, Some(&MATCH_VALUE)));
+        usb.match_plaintext = Some(match_plaintext(VERDICT_NO_MATCH, Some(MATCHED_HANDLE)));
         let shutdown = SignalFlag::new();
 
         let (code, out, err) = run_with(&["enroll-then-verify"], &mut usb, &shutdown);
@@ -4196,9 +4207,9 @@ mod tests {
             cmd::IDENTIFY,
             0,
             VERDICT_NO_MATCH,
-            Some(&MATCH_VALUE),
+            Some(MATCHED_HANDLE),
             108,
-            52
+            56
         )));
         assert_eq!(
             sent_commands(&usb)
@@ -4348,12 +4359,14 @@ mod tests {
         );
     }
 
-    fn match_plaintext(word: u32, value: Option<&[u8; 20]>) -> Vec<u8> {
-        let len = if value.is_some() { 52 } else { 28 };
+    fn match_plaintext(word: u32, handle: Option<u32>) -> Vec<u8> {
+        let len = if handle.is_some() { 56 } else { 28 };
         let mut plaintext = vec![0u8; len];
+        plaintext[4..8].copy_from_slice(&4u32.to_le_bytes());
         plaintext[8..12].copy_from_slice(&word.to_le_bytes());
-        if let Some(value) = value {
-            plaintext[32..52].copy_from_slice(value);
+        if let Some(handle) = handle {
+            plaintext[16..20].copy_from_slice(&4u32.to_le_bytes());
+            plaintext[20..24].copy_from_slice(&handle.to_le_bytes());
         }
         plaintext
     }
@@ -4409,7 +4422,7 @@ mod tests {
         command: u16,
         status: u32,
         word: u32,
-        value: Option<&[u8; 20]>,
+        handle: Option<u32>,
         reply: usize,
         plaintext: usize,
     ) -> String {
@@ -4418,11 +4431,11 @@ mod tests {
             VERDICT_NO_MATCH => "no match",
             _ => "no match, unexpected word",
         };
-        let bytes = match_plaintext(word, value);
+        let bytes = match_plaintext(word, handle);
         assert_eq!(bytes.len(), plaintext, "the fixture length matches");
-        let value = match value {
-            Some(value) => format!("value {}", hex(value)),
-            None => "value absent".to_owned(),
+        let value = match handle {
+            Some(handle) => format!("matched handle {handle:#010x}"),
+            None => "matched handle absent".to_owned(),
         };
         format!(
             "command 0x{command:02x}\nstatus 0x{status:02x}\nverdict {word} ({meaning})\n{value}\n\
@@ -4445,7 +4458,7 @@ mod tests {
             format!(
                 "{}{}",
                 cancel_probe_lines(0x00, 1, 1),
-                verify_output(cmd::VERIFY, 0, VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
+                verify_output(cmd::VERIFY, 0, VERDICT_MATCH, Some(MATCHED_HANDLE), 108, 56)
             ),
             "the experiment lines, then the verdict, value and lengths"
         );
@@ -4550,7 +4563,7 @@ mod tests {
             format!(
                 "{}{}",
                 cancel_probe_lines(0x85, 1, 1),
-                verify_output(cmd::VERIFY, 0, VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
+                verify_output(cmd::VERIFY, 0, VERDICT_MATCH, Some(MATCHED_HANDLE), 108, 56)
             ),
             "the first arm's 0x85 is printed, and the default re-arms at the same sequence"
         );
@@ -4593,7 +4606,7 @@ mod tests {
             format!(
                 "{}{}",
                 cancel_probe_lines(0x00, 1, 2),
-                verify_output(cmd::VERIFY, 0, VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
+                verify_output(cmd::VERIFY, 0, VERDICT_MATCH, Some(MATCHED_HANDLE), 108, 56)
             ),
             "the older reading keeps the counter and re-arms at N+1"
         );
@@ -4616,7 +4629,7 @@ mod tests {
     #[test]
     fn cancel_then_verify_reports_a_no_match_with_its_own_exit_code() {
         let mut usb = FakeUsb::with_sensor();
-        usb.match_plaintext = Some(match_plaintext(0, Some(&MATCH_VALUE)));
+        usb.match_plaintext = Some(match_plaintext(0, Some(MATCHED_HANDLE)));
         let shutdown = SignalFlag::new();
 
         let (code, out, err) = run_with(&["cancel-then-verify"], &mut usb, &shutdown);
@@ -4632,9 +4645,9 @@ mod tests {
                     cmd::VERIFY,
                     0,
                     VERDICT_NO_MATCH,
-                    Some(&MATCH_VALUE),
+                    Some(MATCHED_HANDLE),
                     108,
-                    52
+                    56
                 )
             )
         );
@@ -4796,9 +4809,9 @@ mod tests {
                 cmd::IDENTIFY_HANDLES,
                 0,
                 VERDICT_MATCH,
-                Some(&MATCH_VALUE),
+                Some(MATCHED_HANDLE),
                 108,
-                52
+                56
             ),
             "the verdict, the value and both lengths"
         );
@@ -4851,7 +4864,7 @@ mod tests {
             out,
             format!(
                 "match template id {template}\n{}",
-                verify_output(cmd::VERIFY, 0, VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52)
+                verify_output(cmd::VERIFY, 0, VERDICT_MATCH, Some(MATCHED_HANDLE), 108, 56)
             ),
             "the decode names the command that went on the wire"
         );
@@ -4929,9 +4942,9 @@ mod tests {
                 cmd::IDENTIFY_HANDLES,
                 0x89,
                 VERDICT_MATCH,
-                Some(&MATCH_VALUE),
+                Some(MATCHED_HANDLE),
                 108,
-                52
+                56
             ),
             "the raw status and the decoded verdict are both printed"
         );
@@ -4954,7 +4967,7 @@ mod tests {
     fn verify_reports_the_special_cased_0x89_status_with_a_zero_verdict_as_no_match() {
         let mut usb = FakeUsb::with_sensor();
         usb.match_status = 0x89;
-        usb.match_plaintext = Some(match_plaintext(VERDICT_NO_MATCH, Some(&MATCH_VALUE)));
+        usb.match_plaintext = Some(match_plaintext(VERDICT_NO_MATCH, Some(MATCHED_HANDLE)));
         let shutdown = SignalFlag::new();
 
         let (code, out, err) = run_with(&["verify"], &mut usb, &shutdown);
@@ -4968,9 +4981,9 @@ mod tests {
                 cmd::IDENTIFY_HANDLES,
                 0x89,
                 VERDICT_NO_MATCH,
-                Some(&MATCH_VALUE),
+                Some(MATCHED_HANDLE),
                 108,
-                52
+                56
             ),
             "the verdict comes from the body, not from the status"
         );
@@ -5007,9 +5020,9 @@ mod tests {
                 cmd::IDENTIFY_HANDLES,
                 0,
                 VERDICT_MATCH,
-                Some(&MATCH_VALUE),
+                Some(MATCHED_HANDLE),
                 108,
-                52
+                56
             ),
             "the real announcement still drives the reply"
         );
@@ -5036,9 +5049,9 @@ mod tests {
                 cmd::IDENTIFY_HANDLES,
                 0,
                 VERDICT_MATCH,
-                Some(&MATCH_VALUE),
+                Some(MATCHED_HANDLE),
                 108,
-                52
+                56
             ),
             "the real finger event still drives the match"
         );
@@ -5078,9 +5091,9 @@ mod tests {
                 cmd::IDENTIFY_HANDLES,
                 0,
                 VERDICT_MATCH,
-                Some(&MATCH_VALUE),
+                Some(MATCHED_HANDLE),
                 108,
-                52
+                56
             ),
             "the decoded stdout is unchanged by the diagnostic line"
         );
@@ -5095,7 +5108,7 @@ mod tests {
     #[test]
     fn verify_reports_a_no_match_with_its_own_exit_code_and_the_same_detail() {
         let mut usb = FakeUsb::with_sensor();
-        usb.match_plaintext = Some(match_plaintext(0, Some(&MATCH_VALUE)));
+        usb.match_plaintext = Some(match_plaintext(0, Some(MATCHED_HANDLE)));
         let shutdown = SignalFlag::new();
 
         let (code, out, err) = run_with(&["verify"], &mut usb, &shutdown);
@@ -5110,11 +5123,11 @@ mod tests {
                 cmd::IDENTIFY_HANDLES,
                 0,
                 VERDICT_NO_MATCH,
-                Some(&MATCH_VALUE),
+                Some(MATCHED_HANDLE),
                 108,
-                52
+                56
             ),
-            "a no-match carries the value when the reply supplies it"
+            "a no-match still reports the handle when the reply supplies it"
         );
         assert!(sent_command(&usb, cmd::CANCEL_CAPTURE).is_some());
         assert!(sent_command(&usb, cmd::CLOSE_SESSION).is_some());
@@ -5134,7 +5147,7 @@ mod tests {
             out,
             verify_output(cmd::IDENTIFY_HANDLES, 0, VERDICT_NO_MATCH, None, 76, 28)
         );
-        assert!(out.contains("value absent"), "{out}");
+        assert!(out.contains("matched handle absent"), "{out}");
     }
 
     #[test]
@@ -5235,7 +5248,7 @@ mod tests {
     #[test]
     fn verify_prints_an_unexpected_verdict_word_and_still_exits_no_match() {
         let mut usb = FakeUsb::with_sensor();
-        usb.match_plaintext = Some(match_plaintext(2, Some(&MATCH_VALUE)));
+        usb.match_plaintext = Some(match_plaintext(2, Some(MATCHED_HANDLE)));
         let shutdown = SignalFlag::new();
 
         let (code, out, err) = run_with(&["verify"], &mut usb, &shutdown);
@@ -5244,7 +5257,7 @@ mod tests {
         assert_eq!(err, "");
         assert_eq!(
             out,
-            verify_output(cmd::IDENTIFY_HANDLES, 0, 2, Some(&MATCH_VALUE), 108, 52),
+            verify_output(cmd::IDENTIFY_HANDLES, 0, 2, Some(MATCHED_HANDLE), 108, 56),
             "an undefined word is printed raw and never treated as a match"
         );
     }

@@ -291,28 +291,34 @@ pub fn match_reply(session: &Session, status: u32, plaintext: &[u8]) -> Vec<u8> 
     body
 }
 
-/// A synthetic match plaintext: the verdict word at `+8`, and the optional value at `+32`.
+/// The template handle a synthetic successful identify reports.
+pub const MATCHED_HANDLE: u32 = 0x00f2_361f;
+
+/// A synthetic identify plaintext: `(0,4,word)` and, when named, `(0,4,handle)`.
 ///
-/// Without a value the plaintext is 28 bytes, long enough for the word but too short for the
-/// 20-byte value. Pass an explicit length through [`match_plaintext_with_len`] to exercise the
-/// too-short-for-the-word case.
-pub fn match_plaintext(word: u32, value: Option<&[u8; 20]>) -> Vec<u8> {
-    match value {
-        Some(_) => match_plaintext_with_len(word, value, 52),
+/// Measured on 2026-10-29: a match is `(0,4,1) (0,4,0x00f2361f)` followed by the 32-byte token.
+/// Without a handle the fixture keeps only the first entry, which is long enough for the verdict
+/// word but carries no second entry. Pass an explicit length through [`match_plaintext_with_len`]
+/// to exercise the too-short-for-the-word case.
+pub fn match_plaintext(word: u32, handle: Option<u32>) -> Vec<u8> {
+    match handle {
+        Some(_) => match_plaintext_with_len(word, handle, 56),
         None => match_plaintext_with_len(word, None, 28),
     }
 }
 
-/// A synthetic match plaintext of exactly `len` bytes.
-pub fn match_plaintext_with_len(word: u32, value: Option<&[u8; 20]>, len: usize) -> Vec<u8> {
+/// A synthetic identify plaintext of exactly `len` bytes.
+pub fn match_plaintext_with_len(word: u32, handle: Option<u32>, len: usize) -> Vec<u8> {
     let mut plaintext = vec![0u8; len];
     if len >= 12 {
+        plaintext[4..8].copy_from_slice(&4u32.to_le_bytes());
         plaintext[8..12].copy_from_slice(&word.to_le_bytes());
     }
-    if let Some(value) = value
-        && len >= 52
+    if let Some(handle) = handle
+        && len >= 24
     {
-        plaintext[32..52].copy_from_slice(value);
+        plaintext[16..20].copy_from_slice(&4u32.to_le_bytes());
+        plaintext[20..24].copy_from_slice(&handle.to_le_bytes());
     }
     plaintext
 }

@@ -208,30 +208,30 @@ only the vendor list. **The corrected request has not been measured on this sens
 
 ## Match replies
 
-**`0x59`, but no verdict yet.** On 2026-10-28 (`target/hardware-acceptance-20261028-201206.log`)
-the `0x73` request as the audited (CV2) reference builds it was refused with `0x59` for both an
-enrolled and an unenrolled finger. Completing its final `(3, 20)` entry with a template id changed
-the status to `0x0E`; the corrected vendor request above is **not yet measured**, so the verdict
-word, the value at `+32` and the no-match reply remain unobserved.
+**Measured 2026-10-29.** A fresh enrolment committed template handle `0x00f2361f` (the `0x6E`
+reply's second entry, `(0,4,0x00f2361f)`, next to `(3,0)`), and `verify --handle 0x00f2361f`
+answered:
 
-A hardware run must record, for a match and for a no-match:
+```text
+status 0x00
+plaintext (56 bytes): (0,4,1) (0,4,0x00f2361f) then 32 token bytes
+```
 
-- the verdict word at plaintext `+8`, exactly as the sensor sent it;
-- whether a 20-byte value is present at plaintext `+32` (that is, whether the decrypted plaintext
-  is at least 52 bytes) and, if present, whether it equals the value the enrolled print returned;
-- the exact wrapped reply body length and the exact decrypted plaintext length.
+So the verdict word is at plaintext `+8` (1 = match), the matched template handle at `+20`, and
+there is no 20-byte value at `+32` — that offset lands inside the token.
 
-A non-zero `0x73` status must also record its raw reply length and, when the body decrypts, the
-decrypted plaintext length and hex. `cvctl` prints those diagnostics; a `0x59` that still carried a
-body is then visible instead of being reduced to the status alone. The probe prints the decrypted
-plaintext in 16-byte rows plus a `type=… len=… value=…` TLV scan on success and on a refusal, so a
-`0x0E` that carried a body is captured too. `cvctl enroll --show-commit` does the same for the
-`0x6E` commit reply, whose type-3 blob and type-0 `u32` are the next hardware measurement.
+Other statuses measured the same day:
 
-The question is load-bearing: if a no-match reply already carries the enrolled finger's value at
-`+32`, then flipping the verdict word would pass an id comparison, and ticket 10's binding would
-not be a defence. Until the run is written down here, the driver assumes nothing about the value.
-Do not fill these fields in from the reference or by inference.
+- A handle from a commit made before several power cycles was refused with **`0x59`** (invalid
+  parameter), so a template handle does not survive a power cycle in the request.
+- The hash form (`0x73 --template <enrolment id>`) answered **`0x0E`** with a 32-byte body; it is
+  not a match, and its exact meaning is unestablished.
+- `0x73` without a hash is not accepted: the bulk OUT was acknowledged, no announcement ever came,
+  and the sensor needed a power cycle.
+
+Still to measure: the **no-match** reply (an unenrolled finger with a valid handle) and the status
+word it carries. `cvctl` prints the verdict word, the matched handle, both lengths and the TLV scan
+for any answered status.
 
 ## Binding
 

@@ -61,7 +61,7 @@ pub use transcript::{
 };
 pub use transport::{FailingTransport, ScriptedOutcome, ScriptedTransport, Transport};
 pub use verify::{
-    MATCH_VALUE_LEN, Match, MatchError, VALUE_OFFSET, VERDICT_MATCH, VERDICT_NO_MATCH,
+    MATCH_VALUE_LEN, MATCHED_HANDLE_OFFSET, Match, MatchError, VERDICT_MATCH, VERDICT_NO_MATCH,
     VERDICT_OFFSET, Verdict, Verification, Verify, VerifyError, request_tlv,
 };
 

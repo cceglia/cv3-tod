@@ -396,11 +396,8 @@ pub const ENROLMENT_ID: [u8; 20] = [
     0xb0, 0xb1, 0xb2, 0xb3,
 ];
 
-/// The 20-byte value the scripted verify reply carries at plaintext `+32`.
-pub const MATCH_VALUE: [u8; 20] = [
-    0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf,
-    0xd0, 0xd1, 0xd2, 0xd3,
-];
+/// The template handle the scripted identify reply reports, at plaintext `+20`.
+pub const MATCHED_HANDLE: u32 = 0x00f2_361f;
 
 /// A scripted sensor that answers the `0x23` / `0x24` / `0x02` / `0x66` / `0x68` / `0x04` frames,
 /// so the probe's whole handshake, secure-session and capture lifecycle run offline. It records
@@ -571,9 +568,11 @@ impl HandshakeSensor {
 
     fn match_reply(&self, command: u16) -> Reply {
         let plaintext = self.match_plaintext.clone().unwrap_or_else(|| {
-            let mut plaintext = vec![0u8; 52];
+            let mut plaintext = vec![0u8; 56];
+            plaintext[4..8].copy_from_slice(&4u32.to_le_bytes());
             plaintext[8..12].copy_from_slice(&1u32.to_le_bytes());
-            plaintext[32..52].copy_from_slice(&MATCH_VALUE);
+            plaintext[16..20].copy_from_slice(&4u32.to_le_bytes());
+            plaintext[20..24].copy_from_slice(&MATCHED_HANDLE.to_le_bytes());
             plaintext
         });
         Reply {

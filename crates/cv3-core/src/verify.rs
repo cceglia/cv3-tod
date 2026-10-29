@@ -1,63 +1,56 @@
 //! Verification: the wrapped match request, and the capture-then-match composition.
 //!
 //! ```text
-//! host → sensor  0x66 wrapped, attr 0x47   arm a capture (a [`Capture`])
+//! host → sensor  0x66 wrapped, attr 0x47   arm a capture, mode 2 (a [`Capture`])
 //! sensor → host                             the finger event
-//! host → sensor  0x73 wrapped, attr 0x47   identify (or 0x72 for the one-to-one verify)
-//! sensor → host  wrapped reply             status 0x00 or 0x89,
-//!                                          verdict word at plaintext +8,
-//!                                          20-byte value at plaintext +32 when long enough
+//! host → sensor  0x2F wrapped, attr 0x47   identify against the u32 handle array
+//!                 (0x73 when a 20-byte hash is supplied)
+//! sensor → host  wrapped reply             measured: status 0x00, word 1 at plaintext +8,
+//!                                          matched handle at +20, then the 32-byte token
 //! ```
 //!
 //! # The request
 //!
-//! Disassembly of the vendor's ControlVault 3 blob shows two commands:
-//!
-//! - **`cv_do_fingerprint_identify`** is the vendor's one-to-many match. Its Linux path
-//!   (`cvif_fingerprint_identify`) calls `cv_fingerprint_identify(handle, 0x48, 0x53e2, 0, count,
-//!   ids, …)`, so the request names an array of **`u32` template handles**. Its command depends on
-//!   the hash argument: **`0x73`** with a hash pointer, **`0x2F`** without one (both with attr
-//!   `0x47`). `0x73` without the hash hangs the sensor: measured 2026-10-29, the bulk OUT was
-//!   accepted and no announcement followed.
-//! - **`0x72` verify** (`cv_do_fingerprint_verify`) is the one-to-one variant.
-//!
-//! `cv_do_fingerprint_identify` builds its parameter list as
+//! Disassembly of the vendor's ControlVault 3 blob shows the identify request built by
+//! `cv_do_fingerprint_identify`, and its Linux path (`cvif_fingerprint_identify`) calling
+//! `cv_fingerprint_identify(handle, 0x48, 0x53e2, 0, count, ids, …)`:
 //!
 //! ```text
 //! (0, 4, handle) (0, 4, 0x48) (0, 4, 0x53e2) (0, 4, 0)
-//! (2, 4 * count, count × u32 handle)
+//! (2, 4 * count, count × u32 template handles)
 //! (3, 20, hash)                     only when a hash pointer is supplied
 //! ```
 //!
-//! and each wire entry is `u32 type | u32 size | value bytes` (confirmed by `InitParam_List` and
-//! `cvhDecapsulateCmd`). [`request_tlv`] builds exactly that list. The vendor always adds the
-//! type-2 entry, so it is present even when the caller names no handle; what a zero-size entry
-//! asks the sensor to do is not established, and the next hardware run measures it.
+//! Each wire entry is `u32 type | u32 size | value bytes`, confirmed by `InitParam_List` and
+//! `cvhDecapsulateCmd`. [`request_tlv`] builds exactly that list.
+//!
+//! The command follows the hash: `0x73` when a hash is supplied, `0x2F` when it is not. Measured
+//! 2026-10-29: `0x73` with a handle array and no hash is acknowledged on bulk OUT and never
+//! announced, and it leaves the sensor needing a power cycle; the corrected `0x2F` answered
+//! immediately. `0x2F` with attr `0x42` is the inventory query ticket 16 owns.
 //!
 //! The constants this driver used before (`0x148` and `0x7b0ad3`) do not exist in the blob at all.
 //! They came from the audited reference, which targets ControlVault 2; `0x53e2` occurs exactly
-//! once in the blob, as the argument above. **The corrected request has not been measured on this
-//! sensor yet.** The 2026-10-28 runs only established that the old CV2-shaped request was refused
-//! (`0x59`), and that completing its last entry changed the status to `0x0E`.
+//! once in the blob, as the argument above.
 //!
-//! The vendor's verify special-cases status `0x89` next to `0x00`, so the driver accepts both as
-//! "the sensor answered" and decodes the body. That is all `0x89` is taken to mean: the verdict
-//! still comes from the plaintext, and [`Verdict::status`] reports the raw status so a hardware run
-//! shows which one the sensor used.
+//! # The reply
 //!
-//! The reply is wrapped and carries no MAC. Its plaintext is read at fixed offsets for the verdict
-//! word and value, never by scanning for them; the whole plaintext is also kept for the probe's
-//! diagnostic dump. A reply too short for the verdict word is [`MatchError::MissingVerdict`],
-//! deliberately not a no-match.
+//! The reply is wrapped and carries no MAC. A successful identify was measured on 2026-10-29 as
+//! status `0x00` with the plaintext
+//! `(0,4,1) (0,4,0x00f2361f)` followed by the 32-byte token: the verdict word at `+8` and the
+//! matched template handle at `+20`. The reference's "20-byte value at `+32`" is the token, not a
+//! value; [`Verdict::matched_handle`] replaces it, and [`Verdict::plaintext`] keeps the whole reply
+//! for the probe's dump.
 //!
-//! # What the verdict is not
+//! The verdict word is read at a fixed offset, never by scanning. A reply too short for it is
+//! [`MatchError::MissingVerdict`], deliberately not a no-match. Status `0x89` is accepted next to
+//! `0x00` because the vendor special-cases it; the verdict still comes from the plaintext.
 //!
-//! The 20-byte value at `+32` is reported as [`Verdict::value`]; its meaning is unestablished and
-//! it is not interpreted here as an id or a binding. The reference calls it a biometric-derived
-//! hash; the SPEC says the driver assumes nothing about it until ticket 09 measures it. The id
-//! comparison that makes a match belong to a specific print is ticket 10's work and is not
-//! implemented here: [`Verdict::matched`] is derived from the verdict word alone, and a later
-//! ticket must not mistake the value for a binding.
+//! # What the handle is not
+//!
+//! The matched handle names the template the sensor compared against. It is not compared with the
+//! caller's handles here: that binding is ticket 10's work, and [`Verdict::matched`] still comes
+//! from the verdict word alone.
 //!
 //! # Teardown
 //!
@@ -76,12 +69,16 @@ use crate::operation::Operation;
 use crate::proto::{self, attr, cmd};
 use crate::session::{Session, TOKEN_LEN, Teardown, UnwrapError, WrapError};
 
-/// Length of the 20-byte value at plaintext `+32`, and of the optional hash entry in the request.
+/// Length of the optional hash entry in the request, and of the enrolment id it carries.
 pub const MATCH_VALUE_LEN: usize = 20;
 /// Offset of the little-endian verdict word inside the decrypted plaintext.
 pub const VERDICT_OFFSET: usize = 8;
-/// Offset of the 20-byte value inside the decrypted plaintext.
-pub const VALUE_OFFSET: usize = 32;
+/// Offset of the matched template handle inside the decrypted identify plaintext.
+///
+/// Measured 2026-10-29: the reply is `(0,4,verdict) (0,4,handle)` followed by the 32-byte token, so
+/// the handle is the second entry's value at `+20`. The reference's "20-byte value at +32" was the
+/// token, not a value.
+pub const MATCHED_HANDLE_OFFSET: usize = 20;
 /// The verdict word that means "match".
 pub const VERDICT_MATCH: u32 = 1;
 /// The verdict word that means "no match".
@@ -163,8 +160,11 @@ pub struct Verdict {
     pub word: u32,
     /// `word == 1`. The flag alone; no id comparison is performed here.
     pub matched: bool,
-    /// The twenty bytes at plaintext `+32`, when the plaintext carries them.
-    pub value: Option<[u8; MATCH_VALUE_LEN]>,
+    /// The template handle the sensor matched, the second `(0,4,…)` entry's value.
+    ///
+    /// Measured 2026-10-29 on a successful identify: plaintext `(0,4,1) (0,4,0x00f2361f)` plus the
+    /// 32-byte token. A no-match reply does not carry it.
+    pub matched_handle: Option<u32>,
     /// The full decrypted plaintext, for the probe's diagnostic dump.
     ///
     /// Success always carries it; the type is optional so a caller can build a verdict-shaped
@@ -425,19 +425,13 @@ impl Match {
         }
 
         let word = le32(&plaintext, VERDICT_OFFSET);
-        let value = if plaintext_len >= VALUE_OFFSET + MATCH_VALUE_LEN {
-            let mut value = [0u8; MATCH_VALUE_LEN];
-            value.copy_from_slice(&plaintext[VALUE_OFFSET..VALUE_OFFSET + MATCH_VALUE_LEN]);
-            Some(value)
-        } else {
-            None
-        };
+        let matched_handle = matched_handle(&plaintext);
         let verdict = Verdict {
             command: self.command,
             status,
             word,
             matched: word == VERDICT_MATCH,
-            value,
+            matched_handle,
             plaintext: Some(plaintext),
             plaintext_len,
             reply_len,
@@ -448,6 +442,24 @@ impl Match {
             None => self.finish(Err(MatchError::AlreadyFinished)),
         }
     }
+}
+
+/// The second `(0,4,…)` entry's value, when the reply carries it.
+///
+/// The entry is read at fixed offsets like the verdict word rather than by scanning: the only
+/// `(0,4)` pair the sensor sends is the verdict and the matched handle, and a reply that is merely
+/// long enough must not turn token bytes into an id.
+fn matched_handle(plaintext: &[u8]) -> Option<u32> {
+    let first_entry_len = 8 + (le32(plaintext, 4) as usize);
+    let second = first_entry_len;
+    if plaintext.len() < second + 8
+        || le32(plaintext, second) != 0
+        || le32(plaintext, second + 4) != 4
+        || plaintext.len() < second + 12
+    {
+        return None;
+    }
+    Some(le32(plaintext, second + 8))
 }
 
 fn le32(bytes: &[u8], offset: usize) -> u32 {

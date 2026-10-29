@@ -9,7 +9,7 @@
 mod common;
 
 use common::{
-    HANDLE, MATCH_TLV_BASE_LEN, MATCH_VALUE, SAMPLE_HASH, arm_frame, capture_reply,
+    HANDLE, MATCH_TLV_BASE_LEN, MATCH_VALUE, MATCHED_HANDLE, SAMPLE_HASH, arm_frame, capture_reply,
     command_frame_at_with, fixed_iv, match_frame, match_frame_at, match_frame_at_with,
     match_frame_with, match_plaintext, match_plaintext_len, match_plaintext_with_len, match_reply,
     match_tlv, opened_session, sample_hash_plaintext,
@@ -75,7 +75,7 @@ fn push_capture(transport: &mut ScriptedTransport, session: &cv3_core::Session) 
 fn push_match(transport: &mut ScriptedTransport, session: &cv3_core::Session, word: u32) {
     transport.push(ScriptedOutcome::Reply {
         status: 0,
-        body: match_reply(session, 0, &match_plaintext(word, Some(&MATCH_VALUE))),
+        body: match_reply(session, 0, &match_plaintext(word, Some(MATCHED_HANDLE))),
     });
 }
 
@@ -94,8 +94,8 @@ fn a_verify_arms_waits_matches_and_reports_the_reply() {
 
     assert_eq!(verification.verdict.word, 1);
     assert!(verification.verdict.matched);
-    assert_eq!(verification.verdict.value, Some(MATCH_VALUE));
-    assert_eq!(verification.verdict.plaintext_len, 52);
+    assert_eq!(verification.verdict.matched_handle, Some(MATCHED_HANDLE));
+    assert_eq!(verification.verdict.plaintext_len, 56);
     assert_eq!(
         verification.verdict.reply_len,
         frame::HEADER_LEN + 64,
@@ -128,7 +128,7 @@ fn the_verify_frame_is_the_vendors_fifty_six_byte_list_at_plaintext_len_96() {
 
     transport.push(ScriptedOutcome::Reply {
         status: 0,
-        body: match_reply(&session, 0, &match_plaintext(1, Some(&MATCH_VALUE))),
+        body: match_reply(&session, 0, &match_plaintext(1, Some(MATCHED_HANDLE))),
     });
     let mut operation = Match::new(session, match_iv());
     let verification = run(&mut operation, &mut transport).expect("the reply decodes");
@@ -172,7 +172,7 @@ fn the_verify_frame_is_the_vendors_fifty_six_byte_list_at_plaintext_len_96() {
         plaintext[tlv_len + 32..].iter().all(|byte| *byte == 0),
         "the rest of the plaintext is zero padding after the token"
     );
-    assert_eq!(verification.verdict.plaintext_len, 52);
+    assert_eq!(verification.verdict.plaintext_len, 56);
     assert_eq!(verification.verdict.command, cmd::VERIFY);
     assert_eq!(verification.verdict.status, 0);
 }
@@ -201,7 +201,7 @@ fn the_identify_command_reuses_the_request_and_changes_only_its_command_word() {
 
     transport.push(ScriptedOutcome::Reply {
         status: 0,
-        body: match_reply(&session, 0, &match_plaintext(1, Some(&MATCH_VALUE))),
+        body: match_reply(&session, 0, &match_plaintext(1, Some(MATCHED_HANDLE))),
     });
     let mut operation = Match::new(session, match_iv())
         .with_template_id(Some(template))
@@ -334,7 +334,7 @@ fn a_match_can_name_the_template_id_the_enrolment_committed() {
 
     transport.push(ScriptedOutcome::Reply {
         status: 0,
-        body: match_reply(&session, 0, &match_plaintext(1, Some(&MATCH_VALUE))),
+        body: match_reply(&session, 0, &match_plaintext(1, Some(MATCHED_HANDLE))),
     });
     let mut operation = Match::new(session, match_iv()).with_template_id(Some(template));
     run(&mut operation, &mut transport).expect("the reply decodes");
@@ -368,7 +368,7 @@ fn a_verify_can_name_the_template_id_for_its_composed_match() {
 fn a_match_reply_decodes_the_word_value_and_both_lengths() {
     let mut transport = ScriptedTransport::default();
     let session = opened_session(&mut transport);
-    let reply = match_reply(&session, 0, &match_plaintext(1, Some(&MATCH_VALUE)));
+    let reply = match_reply(&session, 0, &match_plaintext(1, Some(MATCHED_HANDLE)));
 
     transport.push(ScriptedOutcome::Reply {
         status: 0,
@@ -379,9 +379,9 @@ fn a_match_reply_decodes_the_word_value_and_both_lengths() {
 
     assert_eq!(verification.verdict.word, 1);
     assert!(verification.verdict.matched);
-    assert_eq!(verification.verdict.value, Some(MATCH_VALUE));
+    assert_eq!(verification.verdict.matched_handle, Some(MATCHED_HANDLE));
     assert_eq!(verification.verdict.reply_len, reply.len());
-    assert_eq!(verification.verdict.plaintext_len, 52);
+    assert_eq!(verification.verdict.plaintext_len, 56);
     assert_eq!(verification.session.next_sequence(), 2);
     transport.assert_exhausted();
 }
@@ -390,7 +390,7 @@ fn a_match_reply_decodes_the_word_value_and_both_lengths() {
 fn a_no_match_reply_is_decoded_in_the_same_detail_even_with_the_value_present() {
     let mut transport = ScriptedTransport::default();
     let session = opened_session(&mut transport);
-    let reply = match_reply(&session, 0, &match_plaintext(0, Some(&MATCH_VALUE)));
+    let reply = match_reply(&session, 0, &match_plaintext(0, Some(MATCHED_HANDLE)));
 
     transport.push(ScriptedOutcome::Reply {
         status: 0,
@@ -402,12 +402,12 @@ fn a_no_match_reply_is_decoded_in_the_same_detail_even_with_the_value_present() 
     assert_eq!(verification.verdict.word, 0);
     assert!(!verification.verdict.matched);
     assert_eq!(
-        verification.verdict.value,
-        Some(MATCH_VALUE),
+        verification.verdict.matched_handle,
+        Some(MATCHED_HANDLE),
         "a no-match may carry the same value; the caller must see it"
     );
     assert_eq!(verification.verdict.reply_len, reply.len());
-    assert_eq!(verification.verdict.plaintext_len, 52);
+    assert_eq!(verification.verdict.plaintext_len, 56);
 }
 
 #[test]
@@ -442,7 +442,10 @@ fn a_no_match_reply_without_the_value_reports_it_absent() {
     let verification = run(&mut operation, &mut transport).expect("a no-match is a valid reply");
 
     assert!(!verification.verdict.matched);
-    assert_eq!(verification.verdict.value, None, "no 20 bytes at +32");
+    assert_eq!(
+        verification.verdict.matched_handle, None,
+        "no 20 bytes at +32"
+    );
     assert_eq!(verification.verdict.plaintext_len, 28);
     assert_eq!(verification.verdict.reply_len, reply.len());
 }
@@ -507,7 +510,7 @@ fn a_sensor_status_on_the_match_reply_tears_down_and_is_distinct() {
 fn the_zero_eight_nine_status_the_vendor_special_cases_is_answered_and_one_means_matched() {
     let mut transport = ScriptedTransport::default();
     let session = opened_session(&mut transport);
-    let reply = match_reply(&session, 0x89, &match_plaintext(1, Some(&MATCH_VALUE)));
+    let reply = match_reply(&session, 0x89, &match_plaintext(1, Some(MATCHED_HANDLE)));
 
     transport.push(ScriptedOutcome::Reply {
         status: 0x89,
@@ -527,9 +530,9 @@ fn the_zero_eight_nine_status_the_vendor_special_cases_is_answered_and_one_means
         verification.verdict.matched,
         "the verdict comes from the body"
     );
-    assert_eq!(verification.verdict.value, Some(MATCH_VALUE));
+    assert_eq!(verification.verdict.matched_handle, Some(MATCHED_HANDLE));
     assert_eq!(verification.verdict.reply_len, reply.len());
-    assert_eq!(verification.verdict.plaintext_len, 52);
+    assert_eq!(verification.verdict.plaintext_len, 56);
     assert_eq!(
         transport.sent().len(),
         4,
@@ -545,7 +548,7 @@ fn the_zero_eight_nine_status_with_a_zero_verdict_word_is_a_no_match() {
 
     transport.push(ScriptedOutcome::Reply {
         status: 0x89,
-        body: match_reply(&session, 0x89, &match_plaintext(0, Some(&MATCH_VALUE))),
+        body: match_reply(&session, 0x89, &match_plaintext(0, Some(MATCHED_HANDLE))),
     });
     let mut operation = Match::new(session, match_iv());
     let verification =
@@ -557,14 +560,14 @@ fn the_zero_eight_nine_status_with_a_zero_verdict_word_is_a_no_match() {
         !verification.verdict.matched,
         "a zero verdict word is a no-match whatever the status"
     );
-    assert_eq!(verification.verdict.value, Some(MATCH_VALUE));
+    assert_eq!(verification.verdict.matched_handle, Some(MATCHED_HANDLE));
 }
 
 #[test]
 fn a_status_other_than_zero_and_zero_eight_nine_is_still_a_sensor_status() {
     let mut transport = ScriptedTransport::default();
     let session = opened_session(&mut transport);
-    let reply = match_reply(&session, 0x8f, &match_plaintext(1, Some(&MATCH_VALUE)));
+    let reply = match_reply(&session, 0x8f, &match_plaintext(1, Some(MATCHED_HANDLE)));
 
     transport.push(ScriptedOutcome::Reply {
         status: 0x8f,
@@ -589,7 +592,7 @@ fn a_status_other_than_zero_and_zero_eight_nine_is_still_a_sensor_status() {
             command: cmd::VERIFY,
             status: 0x8f,
             reply_len: reply.len(),
-            plaintext: Some(match_plaintext(1, Some(&MATCH_VALUE))),
+            plaintext: Some(match_plaintext(1, Some(MATCHED_HANDLE))),
         }
     );
     transport.assert_exhausted();
@@ -618,7 +621,7 @@ fn the_measured_zero_five_nine_status_keeps_the_reply_for_diagnostics() {
     let session = opened_session(&mut transport);
 
     // The 2026-10-28 sensor answered the match with 0x59 and a body that decrypts.
-    let reply = match_reply(&session, 0x59, &match_plaintext(0, Some(&MATCH_VALUE)));
+    let reply = match_reply(&session, 0x59, &match_plaintext(0, Some(MATCHED_HANDLE)));
     transport.push(ScriptedOutcome::Reply {
         status: 0x59,
         body: reply.clone(),
@@ -634,14 +637,14 @@ fn the_measured_zero_five_nine_status_keeps_the_reply_for_diagnostics() {
         text.contains(&format!("raw reply {} bytes", reply.len())),
         "{text}"
     );
-    assert!(text.contains("decrypted plaintext 52 bytes"), "{text}");
+    assert!(text.contains("decrypted plaintext 56 bytes"), "{text}");
     assert_eq!(
         error,
         MatchError::SensorStatus {
             command: cmd::VERIFY,
             status: 0x59,
             reply_len: reply.len(),
-            plaintext: Some(match_plaintext(0, Some(&MATCH_VALUE))),
+            plaintext: Some(match_plaintext(0, Some(MATCHED_HANDLE))),
         }
     );
     let sent = transport.sent();
@@ -915,7 +918,7 @@ fn a_finished_match_is_inert() {
     let session = opened_session(&mut transport);
     transport.push(ScriptedOutcome::Reply {
         status: 0,
-        body: match_reply(&session, 0, &match_plaintext(1, Some(&MATCH_VALUE))),
+        body: match_reply(&session, 0, &match_plaintext(1, Some(MATCHED_HANDLE))),
     });
     let mut operation = Match::new(session, match_iv());
     let _ = run(&mut operation, &mut transport);

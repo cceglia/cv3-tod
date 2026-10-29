@@ -50,7 +50,11 @@ fn push_arm(transport: &mut ScriptedTransport, session: &Session) {
 fn push_match(transport: &mut ScriptedTransport, session: &Session) {
     transport.push(ScriptedOutcome::Reply {
         status: 0,
-        body: match_reply(session, 0, &match_plaintext(1, Some(&common::MATCH_VALUE))),
+        body: match_reply(
+            session,
+            0,
+            &match_plaintext(1, Some(common::MATCHED_HANDLE)),
+        ),
     });
 }
 
@@ -110,9 +114,9 @@ fn one_session_arms_cancels_and_then_verifies_with_the_documented_frames_and_seq
             status: 0,
             word: 1,
             matched: true,
-            value: Some(common::MATCH_VALUE),
-            plaintext: Some(match_plaintext(1, Some(&common::MATCH_VALUE))),
-            plaintext_len: 52,
+            matched_handle: Some(common::MATCHED_HANDLE),
+            plaintext: Some(match_plaintext(1, Some(common::MATCHED_HANDLE))),
+            plaintext_len: 56,
             reply_len: HEADER_LEN + 64,
         }
     );
