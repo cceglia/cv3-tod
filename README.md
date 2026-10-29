@@ -3,12 +3,26 @@
 A Linux driver project for the Dell/Broadcom **ControlVault 3** fingerprint sensor (BCM58200, USB
 `0a5c:5843`): a Rust protocol core and probe, with a thin C shim for the libfprint TOD interface.
 
-Status: protocol probe plus an enumeration-only libfprint TOD plugin. The Rust core speaks the
-sensor's ECDH handshake and secure session and performs capture, enrolment and verification;
-`cvctl` drives it against the sensor directly. `crates/cv3-tod` makes the sensor appear to
-`fprintd` as a reader but opens no session yet. Still missing: the plugin's session and operations,
-binding a match to the print that was enrolled (ticket 10), and the template inventory with list
-and delete. Until those land this is a probe, not a login driver.
+Status: a working libfprint TOD plugin plus the protocol probe. The core speaks the sensor's ECDH
+handshake and secure session and performs capture, enrolment, verification and identification;
+`crates/cv3-tod` drives it through `fprintd` (open/close, enrol with a binding confirmation, verify
+with the id binding, cancel) and through libfprint for identification. The sensor's template
+inventory is **undecoded** (ticket 16), so listing and deletion are not implemented and the driver
+declares no storage feature; prints live on the host. The stock driver's list vfunc is a no-op too.
+
+## What a match proves
+
+A match means the sensor compared the presented finger with the template whose handle is recorded
+in the print and answered with that same handle. It does **not** mean:
+
+- that the other end of the cable is genuine: the channel authenticates neither side;
+- that a reply is fresh: the MAC key is a fixed constant published in the protocol, so the MAC proves
+  the frame was built by something that knows the protocol, not that the sender is the sensor;
+- that a replayed reply is detected: binding checks the reply's content, not when it was made;
+- that the confirmation touch at enrolment was the same finger as the twelve samples.
+
+An unknown print-payload version, a foreign payload and an unbound print are refused rather than
+guessed. What the driver does not claim is as important as what it does.
 
 ## What the probe can do
 
@@ -164,17 +178,17 @@ meaning (`verdict 1 (match)`, `verdict 2 (no match, unexpected word)`), the matc
 `value absent`), the raw reply length and the decrypted plaintext length, and then the decrypted
 plaintext in 16-byte hex rows with a `type=… len=… value=…` TLV scan. A refused request prints the
 same command/status/length dump so a `0x0E` that still carried a body is visible. The verdict still
-comes from the decoded body, whatever the status. The value's meaning is not established, and
-`verify` does not yet compare it with anything: ticket 10 owns id binding.
+comes from the decoded body, whatever the status. With `--handle`, the probe also prints
+`binding accepted` only when the reply carries that exact handle, and exits 9 when it does not.
 
 `cvctl enroll-then-verify` is the ticket-09 measurement tool: it enrols and commits, prints the
 template id and its source, then takes one more touch and sends the match request in the **same
 secure session**, printing the command, status, verdict and plaintext dump the way `verify` does.
 Its default is `0x73`; `--command 72` swaps in the one-to-one verify. `--handle` adds template
 handles to the composed match. It answers whether a capture and match immediately after a commit
-are accepted and what value that reply carries. It deliberately does not compare the value with the
-enrolment id — ticket 10 owns binding — so a match here proves only that the sensor matched some
-enrolled template.
+are accepted and what value that reply carries. When the commit reply names a handle it matches on
+that handle, records it in the versioned `CV3P` print payload and prints whether the confirmation
+accepted the print.
 
 `--show-commit` on `enroll` and `enroll-then-verify` prints the decrypted `0x6E` commit reply: the
 raw reply length, the plaintext length, 16-byte hex rows and the TLV scan. The vendor's commit
@@ -182,9 +196,10 @@ saves its reply through an out list of a type-3 blob and a type-0 `u32`; that `u
 handle identify later names, so this is the measurement tickets 06/07/09/20 need. Recordings stay
 wire-only: the plaintext is printed, never recorded.
 
-`cvctl inventory` is ticket 16's first step: it reports the two lengths, the decrypted plaintext
-and a best-effort TLV scan of the `0x2F` reply, without assuming the reply lists stored templates.
-Whether the command reports anything about stored templates at all is still unestablished. It is a
+`cvctl inventory` reports the two lengths, the decrypted plaintext and a best-effort TLV scan of the
+`0x2F` reply, without assuming the reply lists stored templates. Measured 2026-10-29: the query is
+refused with status `0x0E` and a 44-byte body that does not decrypt, before and after an enrolment,
+and the stock driver implements `list` as a no-op. The format stays **undecoded**; it is a
 measurement tool, not shipping behaviour.
 
 `--commit-sample-hash` on `enroll` and `enroll-then-verify` commits with the last submitted sample
