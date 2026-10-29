@@ -5,11 +5,14 @@ persists across a `fprintd` restart.
 
 **Blocked by:** 12 (session through fprintd), 06 (enrolment)
 
-**Status:** in-progress
+**Status:** ready-for-human
 
-- [ ] `fprintd-enroll` completes an enrolment end to end, reporting up to thirteen declared stages: the
-      samples the sensor accepts plus the binding confirmation, fewer when the sensor completes early
-- [ ] The enrolled print survives a `fprintd` restart
+- [x] `fprintd-enroll` completes an enrolment end to end, reporting up to thirteen declared stages:
+      the samples the sensor accepts plus the binding confirmation, fewer when the sensor completes
+      early (measured 2026-10-29: twelve accepted stages, retries in between, confirmation, then
+      `Enroll result: enroll-completed`).
+- [x] The enrolled print survives a `fprintd` restart (measured: `fprintd-list` still shows
+      `right-index-finger` after `systemctl restart fprintd`).
 - [x] The persisted print carries the enrolment id (or the sample hash used in its place) and the match
       id; an unknown payload version is rejected rather than guessed
 - [x] A failed or skipped confirmation fails the enrolment and stores no print, and the driver reports
@@ -45,3 +48,21 @@ persists across a `fprintd` restart.
   that twelve accepted samples plus the confirmation are what a real finger produces.
 - That `fpi-data` set as an `ay` GVariant is what fprintd's storage writes back and `fprintd-verify`
   (ticket 14) can read.
+
+## Comments
+
+Hardware 2026-10-29, after two ownership fixes:
+
+- `cv3_tod` reached twelve accepted samples (with `enroll-retry-scan` retries in between), then the
+  confirmation touch, and `fprintd-enroll` printed `Enroll result: enroll-completed`;
+- `fprintd-list` showed `right-index-finger` and still showed it after `systemctl restart fprintd`.
+
+Two bugs surfaced on hardware and are pinned by comments and the class harness:
+
+1. `fpi_device_enroll_progress` takes ownership of the `GError` and rejects a print passed with an
+   error. The retry path passed the template and cleared the error itself, aborting fprintd with
+   `free(): invalid pointer`.
+2. `fpi_device_get_enroll_data` returns a borrowed print (transfer none) while
+   `fpi_device_enroll_complete` takes ownership (transfer full). Passing the borrowed pointer made
+   completion consume the task's reference and the task free it again: SEGV in `g_object_unref`
+   right after stage 13. The shim passes `g_object_ref(print)`, as libfprint's own drivers do.
