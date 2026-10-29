@@ -24,9 +24,9 @@ so anything speaking fprintd's protocol works.
 - The class declared exactly `FP_DEVICE_FEATURE_VERIFY` at this ticket. The ticket-11 `CAPTURE`
   placeholder and the probe's `fpi_device_update_features` withdrawal are gone (ticket 20 later
   added `IDENTIFY`, giving `VERIFY|IDENTIFY`): libfprint only needs a non-empty mask,
-  and VERIFY is it. `CAPTURE`, `IDENTIFY`, `STORAGE`, `STORAGE_LIST` and `STORAGE_DELETE` stay
-  undeclared, and their vfuncs stay NULL. Enrolment is still advertised by the stage count, because
-  libfprint 1.95 has no `FP_DEVICE_FEATURE_ENROLL`.
+  and VERIFY was it at this ticket. `CAPTURE`, `STORAGE`, `STORAGE_LIST`, `STORAGE_DELETE` and
+  `STORAGE_CLEAR` stay undeclared, and their vfuncs stay NULL. Enrolment is still advertised by the
+  stage count, because libfprint 1.95 has no `FP_DEVICE_FEATURE_ENROLL`.
 - `verify` reads the print's `fpi-data` with `g_object_get`, finds the bytes with
   `g_variant_get_fixed_array` and hands pointer and length to Rust
   (`cv3_tod_verify_start`). Nothing in C reads a field of the record: `PrintPayload::decode` decides,
