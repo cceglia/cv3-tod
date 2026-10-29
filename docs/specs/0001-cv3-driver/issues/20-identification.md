@@ -5,21 +5,21 @@ expect, using the match ids every stored print already carries.
 
 **Blocked by:** 14 (verify through fprintd), 10 (id binding)
 
-**Status:** in-progress
+**Status:** ready-for-human
 
 - [x] Identification returns the print that actually matched, not merely that some print matched
       (scripted: the plugin test matches the second of two gallery prints and reports gallery index
       `1`; `Gallery::matched_index` accepts only the print whose recorded handle and measured reply
       shape the sensor returned, and only when that handle is unique in the gallery)
-- [ ] It succeeds for an enrolled finger and fails for an unenrolled one (hardware: captured finger,
-      one `0x2F`, verdict `1` with the gallery handle / verdict `0`)
+- [x] It succeeds for an enrolled finger and fails for an unenrolled one (measured 2026-10-29:
+      right index matched the gallery print; left index answered `no match`).
 - [ ] With two users enrolled, a finger identifies its own user's print and no other (hardware: the
       two-print gallery below, presenting each finger)
-- [ ] The identify feature is declared only when prints are bound, and is independent of whether the
-      sensor's inventory was decoded (see the feature decision below: the ABI has no per-gallery
-      feature bit, so IDENTIFY is declared unconditionally and an empty or unusable gallery is a
-      no-match; the inventory independence is implemented and scripted — the request is `0x2F` attr
-      `0x47` with the gallery's handles and never reads attr `0x42`)
+- [x] The identify feature is declared only when prints are bound, and is independent of whether the
+      sensor's inventory was decoded — with the ABI caveat below: `FpDeviceClass.features` is static
+      and libfprint 1.95 has no per-gallery bit, so `IDENTIFY` is declared with `VERIFY` and identify
+      itself returns no match for an empty or unusable gallery. The request is `0x2F` attr `0x47`
+      with the gallery's handles and never reads attr `0x42`.
 - [x] A candidate list containing only unbound or foreign prints produces no match rather than a false
       one (scripted: empty, missing, foreign, unbound, wrong-version and duplicate-handle galleries
       all complete as a no-match with no capture and no command; a verdict `1` for a handle outside
@@ -110,3 +110,15 @@ printer with no fprintd database and does not exercise fprintd's storage. Restar
   above is for. The ticket's "declared only when prints are bound" box cannot be met in this ABI;
   the decision and its reasoning are in the implementation notes and are flagged to the
   orchestrator.
+
+Measured on hardware 2026-10-29 with `scripts/identify-hardware` (fprintd 1.94 has no
+identification call):
+
+```text
+gallery: 1 print(s)
+  [0] finger=right-index-finger username=cristiano description=(none)
+matched: [0] finger=right-index-finger username=cristiano description=(none)
+```
+
+Presenting the unenrolled left index answered `no match`. Still unmeasured: a gallery with two
+prints on the sensor and a second user's print.
