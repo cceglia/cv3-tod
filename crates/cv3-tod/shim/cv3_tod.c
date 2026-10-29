@@ -477,7 +477,12 @@ cv3_tod_dispatch (FpDevice *device, Cv3Action action)
                   return;
                 }
               cv3_tod_set_print_payload (print, payload, len);
-              fpi_device_enroll_complete (device, print, NULL);
+              /* `fpi_device_get_enroll_data` hands back a borrowed print (transfer none), while
+               * `fpi_device_enroll_complete` takes ownership (transfer full). Passing the borrowed
+               * pointer makes the completion consume the task's reference, and the task frees it
+               * again when the operation ends: a double unref, SEGV in fprintd. libfprint's own
+               * drivers pass `g_object_ref (print)` here for the same reason. */
+              fpi_device_enroll_complete (device, g_object_ref (print), NULL);
             }
           else
             {
