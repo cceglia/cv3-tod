@@ -242,10 +242,19 @@ scan for any answered status. Still unmeasured: whether the handle survives a po
 
 ## Binding
 
-Not yet established. Ticket 09 owns the binding facts: whether the sensor accepts a capture and a
-match immediately after a commit, what the 20-byte value at the match reply's `+32` is, and whether
-it is stable across sessions. Nothing in this document should be read as a finding until that
-ticket records it here.
+Measured 2026-10-29:
+
+- **The matched id is the template handle.** The match reply's second entry is the `0x6E` reply's
+  `(0,4,…)` value, not a biometric-derived hash.
+- **The handle survives a power cycle.** Template `0x00f2361f` was enrolled, the machine was
+  rebooted, and `verify --handle 0x00f2361f` still answered `status 0x00`, `verdict 1`,
+  `(0,4,1)(0,4,0x00f2361f)`.
+- **A no-match carries the same shape with zeros**: `(0,4,0)(0,4,0)`.
+- **There is no 20-byte value at `+32`**: the reference's value was the token.
+
+Ticket 09 still owes: a capture and match immediately after a commit in one session (the probe's
+`enroll-then-verify` now uses the commit reply's handle for that confirmation), and the same
+measurement for a second finger to show the handle is per-template.
 
 ## Inventory
 
