@@ -506,6 +506,7 @@ impl Enrol {
             Ok(CapturedSample {
                 sample_hash,
                 session,
+                ..
             }) => {
                 self.session = Some(session);
                 self.last_sample_hash = Some(sample_hash);

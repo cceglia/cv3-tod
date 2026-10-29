@@ -17,7 +17,7 @@ this is a probe, not a login driver.
 | `devices` | Finds the sensor and prints its stable USB location. |
 | `handshake` | Runs `0x23`/`0x24`, derives the session key and releases the handle. |
 | `open` / `close` | Opens the wrapped `0x02` session and releases it with plain `0x04`. |
-| `capture` | Arms `0x66`, waits for the finger, reads the sample hash and tears the session down. |
+| `capture` | Arms `0x66`, waits for the finger, reads the sample hash and tears the session down. `--hex` also prints the decrypted arm reply: its lengths, hex rows and TLV scan. |
 | `inventory` | Sends the wrapped `0x2F` inventory query and dumps its reply: the raw and plaintext lengths, the plaintext in 16-byte rows and a best-effort TLV scan. It is the ticket-16 measurement tool and does not yet decode the reply. |
 | `enroll` | Discards, starts, captures, submits, commits and prints the template id it now holds. `--commit-sample-hash` forces the last sample hash into the commit; `--show-commit` prints the decrypted `0x6E` reply, its lengths and TLV scan. |
 | `enroll-then-verify` | Enrols and commits, then takes one confirmation touch and matches it in the **same session**. It is the ticket-09 measurement tool: it reports whether a match immediately after a commit works and what value comes back, and it is **not** a binding check. `--commit-sample-hash` forces the last sample hash into the commit and the confirmation match; `--show-commit` dumps the commit reply; `--handle` adds `u32` template handles. |
@@ -84,7 +84,7 @@ formatting, clippy, the workspace tests, and `cargo-deny` for RustSec advisories
 | 10 | a transport failure during a command operation; distinct from a finger timeout |
 | 128 + signal | interrupted by a catchable signal (for example 130 for `SIGINT`) |
 
-`capture` prints the sample hash on success and always runs the cancel-then-close teardown before
+`capture` prints the sample hash on success (and, with `--hex`, the decrypted arm reply) and always runs the cancel-then-close teardown before
 exiting. `verify` sends `0x73`, the vendor's one-to-many identify: the request is the parameter
 list measured from `cv_do_fingerprint_identify` — `(0,4,handle)`, `(0,4,0x48)`, `(0,4,0x53e2)`,
 `(0,4,0)`, `(2,4*count,handles…)` and, only with `--template`, `(3,20,hash)`. `--handle` supplies

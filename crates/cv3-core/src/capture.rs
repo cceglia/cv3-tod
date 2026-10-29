@@ -8,7 +8,7 @@
 //! ```text
 //! host → sensor  0x66 wrapped, attr 0x47   TLV 36 bytes, plaintext 80 bytes
 //!                                       (0,4,handle) (0,4,2) (0,4,0x23)
-//! sensor → host  wrapped reply             20-byte sample hash somewhere in the plaintext
+//! sensor → host  wrapped reply             parameters plus a 20-byte sample hash (kept for the dump)
 //! sensor → host  interrupt event 0x03      the finger was read
 //! ```
 //!
@@ -95,6 +95,8 @@ fn le32(bytes: &[u8], offset: usize) -> u32 {
 pub struct CapturedSample {
     /// The 20-byte sample hash the sensor returned for this capture.
     pub sample_hash: [u8; SAMPLE_HASH_LEN],
+    /// The whole decrypted arm reply, so the probe can dump its parameters.
+    pub plaintext: Vec<u8>,
     /// The session, still open, at the sequence the next wrapped command must carry.
     pub session: Session,
 }
@@ -282,10 +284,12 @@ impl ArmCapture {
         };
         let mut sample_hash = [0u8; SAMPLE_HASH_LEN];
         sample_hash.copy_from_slice(value);
+        let plaintext = reply.plaintext;
 
         match self.session.take() {
             Some(session) => self.finish(Ok(ArmOutcome::Armed(CapturedSample {
                 sample_hash,
+                plaintext,
                 session,
             }))),
             None => self.finish(Err(CaptureError::AlreadyFinished)),
@@ -350,6 +354,7 @@ enum CaptureState {
     /// The arm owns the session until it reports the sample.
     Arming(ArmCapture),
     WaitingFinger {
+        plaintext: Vec<u8>,
         sample_hash: [u8; SAMPLE_HASH_LEN],
     },
     /// The original error is held until the best-effort teardown has run.
@@ -427,10 +432,14 @@ impl Capture {
         match result {
             Ok(ArmOutcome::Armed(CapturedSample {
                 sample_hash,
+                plaintext,
                 session,
             })) => {
                 self.session = Some(session);
-                self.state = CaptureState::WaitingFinger { sample_hash };
+                self.state = CaptureState::WaitingFinger {
+                    sample_hash,
+                    plaintext,
+                };
                 Action::WaitFinger
             }
             Ok(ArmOutcome::AlreadyPending(session)) => {
@@ -470,10 +479,14 @@ impl Operation for Capture {
                 Action::Finish(result) => self.on_armed(result),
                 Action::WaitFinger => self.finish(Err(CaptureError::UnexpectedEvent)),
             },
-            CaptureState::WaitingFinger { sample_hash } => match event {
+            CaptureState::WaitingFinger {
+                sample_hash,
+                plaintext,
+            } => match event {
                 Event::Finger => match self.session.take() {
                     Some(session) => self.finish(Ok(CapturedSample {
                         sample_hash,
+                        plaintext,
                         session,
                     })),
                     None => self.finish(Err(CaptureError::AlreadyFinished)),

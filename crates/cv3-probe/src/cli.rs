@@ -542,6 +542,9 @@ enum CaptureFailure {
     Capture(CaptureError),
 }
 
+/// What one whole capture produced: the sample hash, the decrypted arm reply and the teardown.
+type CaptureRun = ([u8; SAMPLE_HASH_LEN], Vec<u8>, Result<(), TeardownError>);
+
 /// Opens the secure session, arms one capture, waits for the finger, then tears the session down.
 ///
 /// A successful capture returns the sample hash and the teardown's own best-effort result; a
@@ -552,7 +555,7 @@ fn capture_over(
     secrets: RunSecrets,
     open_iv: [u8; cv3_core::crypto::BLOCK_LEN],
     capture_iv: [u8; cv3_core::crypto::BLOCK_LEN],
-) -> Result<([u8; SAMPLE_HASH_LEN], Result<(), TeardownError>), CaptureFailure> {
+) -> Result<CaptureRun, CaptureFailure> {
     let run = handshake_over(transport, secrets, true).map_err(CaptureFailure::Handshake)?;
     let mut open = OpenSession::new(run.session, open_iv);
     let session = drive(&mut open, transport).map_err(CaptureFailure::Open)?;
@@ -561,11 +564,12 @@ fn capture_over(
     match drive(&mut capture, transport) {
         Ok(CapturedSample {
             sample_hash,
+            plaintext,
             session,
         }) => {
             let mut teardown = Teardown::new(session.handle);
             drop(session);
-            Ok((sample_hash, drive(&mut teardown, transport)))
+            Ok((sample_hash, plaintext, drive(&mut teardown, transport)))
         }
         Err(error) => Err(CaptureFailure::Capture(error)),
     }
@@ -867,8 +871,12 @@ fn capture(
     });
 
     let code = match outcome {
-        Ok((sample_hash, teardown)) => {
+        Ok((sample_hash, plaintext, teardown)) => {
             let _ = writeln!(out, "sample hash {}", hex(&sample_hash));
+            if dump_hex {
+                let _ = writeln!(out, "capture plaintext length {}", plaintext.len());
+                print_plaintext_dump(&plaintext, out);
+            }
             if let Err(error) = teardown {
                 let _ = writeln!(err, "cvctl: {error}");
             }
@@ -3011,6 +3019,27 @@ mod tests {
             sent_command(&usb, cmd::CLOSE_SESSION),
             Some(frame::build_close_handle(TEST_HANDLE)),
             "the handle is released after the cancel"
+        );
+    }
+
+    #[test]
+    fn capture_hex_dumps_the_decrypted_arm_reply() {
+        let mut usb = FakeUsb::with_sensor();
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["capture", "--hex"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert_eq!(
+            out.lines().next(),
+            Some(format!("sample hash {}", hex(&SAMPLE_HASH)).as_str())
+        );
+        assert!(out.contains("capture plaintext length 28"), "{out}");
+        assert!(out.contains("plaintext:\n"), "{out}");
+        assert!(out.contains("type=0 len=20"), "{out}");
+        assert!(
+            out.contains(&hex(&SAMPLE_HASH)),
+            "the arm reply's own value is in the dump: {out}"
         );
     }
 
