@@ -161,6 +161,11 @@ pub struct EnrolledTemplate {
     pub source: TemplateSource,
     /// Samples the sensor accepted.
     pub accepted_samples: usize,
+    /// The template handle the sensor stored, when the `0x6E` reply named one.
+    ///
+    /// Measured 2026-10-29: the reply is `(3,0) (0,4,0x00f2361f)` plus the 32-byte token, so the
+    /// second entry is the handle identify later names. It survived a power cycle on that sensor.
+    pub handle: Option<u32>,
     /// The decrypted `0x6E` reply body, for the probe's `--show-commit` dump.
     ///
     /// This is reply data, not key material, and recordings stay wire-only. It is empty when the
@@ -710,11 +715,13 @@ impl Enrol {
                     }
                 };
                 let commit_reply_len = body.len();
+                let handle = commit_handle(&commit_plaintext);
                 match self.session.take() {
                     Some(session) => self.finish(Ok(EnrolledTemplate {
                         template_id,
                         source,
                         accepted_samples: self.progress.accepted_samples,
+                        handle,
                         commit_plaintext,
                         commit_reply_len,
                         session,
@@ -740,6 +747,25 @@ impl Enrol {
             }),
         }
     }
+}
+
+/// The `(0,4,handle)` entry of a commit reply, when the reply carries one.
+///
+/// The reply is scanned rather than indexed because the first entry is the type-3 blob the vendor
+/// declares with length zero; only a type-0 entry with a four-byte value is the handle.
+fn commit_handle(plaintext: &[u8]) -> Option<u32> {
+    let scan = crate::tlv::scan_tlv(plaintext);
+    scan.entries
+        .iter()
+        .find(|entry| entry.tag == 0 && entry.value.len() == 4)
+        .map(|entry| {
+            u32::from_le_bytes([
+                entry.value[0],
+                entry.value[1],
+                entry.value[2],
+                entry.value[3],
+            ])
+        })
 }
 
 /// Routes one wrapped reply through the session's single sequence predicate.

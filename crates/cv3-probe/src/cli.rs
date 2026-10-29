@@ -100,6 +100,8 @@ enum Command<'a> {
         show_commit: bool,
         /// The match request's command; the default depends on the arguments.
         command: u16,
+        /// Whether `command` came from the caller rather than the default.
+        command_explicit: bool,
         /// `u32` template handles for the request's type-2 array, in order.
         handles: Vec<u32>,
     },
@@ -241,6 +243,7 @@ fn parse(args: &[String]) -> Option<Command<'_>> {
                 } else {
                     cmd::IDENTIFY_HANDLES
                 }),
+                command_explicit: flags.command.is_some(),
                 handles: flags.handles,
             })
         }
@@ -425,12 +428,14 @@ pub fn run(
             commit_sample_hash,
             show_commit,
             command,
+            command_explicit,
             handles,
         }) => {
             let flags = EnrollThenVerifyFlags {
                 commit_sample_hash,
                 show_commit,
                 command,
+                command_explicit,
                 handles: &handles,
             };
             enroll_then_verify(backend, shutdown, hex, flags, out, err)
@@ -1283,6 +1288,8 @@ struct EnrollThenVerifyFlags<'a> {
     commit_sample_hash: bool,
     show_commit: bool,
     command: u16,
+    /// Whether `command` came from the caller rather than the default.
+    command_explicit: bool,
     handles: &'a [u32],
 }
 
@@ -1300,6 +1307,7 @@ struct EnrollThenVerifyOptions<'a> {
     commit_sample_hash: bool,
     show_commit: bool,
     match_command: u16,
+    command_explicit: bool,
     handles: &'a [u32],
 }
 
@@ -1326,6 +1334,7 @@ fn enroll_then_verify_over(
         commit_sample_hash,
         show_commit,
         match_command,
+        command_explicit,
         handles,
     } = options;
     let run =
@@ -1336,6 +1345,7 @@ fn enroll_then_verify_over(
     let EnrolledTemplate {
         template_id,
         source,
+        handle,
         commit_plaintext,
         commit_reply_len,
         session,
@@ -1352,12 +1362,25 @@ fn enroll_then_verify_over(
         };
         print_commit_dump(&report, out);
     }
-    let _ = writeln!(out, "match template id {}", hex(&template_id));
+    // The commit reply names the handle identify matches on. Use it unless the caller named
+    // handles or a command themselves; the hash form stays the fallback when the reply has none.
+    let (match_command, handles, template_id) = match (command_explicit, handles, handle) {
+        (false, [], Some(handle)) => {
+            let _ = writeln!(out, "commit handle {handle:#010x}");
+            (cmd::IDENTIFY_HANDLES, vec![handle], None)
+        }
+        _ => (match_command, handles.to_vec(), Some(template_id)),
+    };
+    if let Some(template_id) = template_id {
+        let _ = writeln!(out, "match template id {}", hex(&template_id));
+    } else if let Some(handle) = handles.first() {
+        let _ = writeln!(out, "match handle {handle:#010x}");
+    }
 
     let mut verify = Verify::new(session, capture_iv, match_iv)
-        .with_template_id(Some(template_id))
+        .with_template_id(template_id)
         .with_command(match_command);
-    for handle in handles {
+    for handle in &handles {
         verify = verify.with_template_handle(*handle);
     }
     match drive(&mut verify, transport) {
@@ -1398,6 +1421,7 @@ fn enroll_then_verify(
         commit_sample_hash: flags.commit_sample_hash,
         show_commit: flags.show_commit,
         match_command: flags.command,
+        command_explicit: flags.command_explicit,
         handles: flags.handles,
     };
 
@@ -4057,7 +4081,15 @@ mod tests {
         assert_eq!(err, "");
         assert!(out.contains("commit reply length 76"), "{out}");
         assert!(out.contains("type=0 len=4 value=44332211"), "{out}");
-        assert!(out.contains("match template id"), "{out}");
+        assert!(
+            out.contains("commit handle 0x11223344"),
+            "the reply's u32 is the handle identify uses: {out}"
+        );
+        assert!(
+            out.contains("match handle 0x11223344"),
+            "the confirmation matches on that handle: {out}"
+        );
+        assert!(out.contains("command 0x2f"), "{out}");
     }
 
     #[test]
