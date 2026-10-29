@@ -46,8 +46,8 @@ pub trait UsbIo {
     /// Answers a `CV_GET_HOST_TIMESTAMP_INTERRUPT` with the packed host timestamp.
     ///
     /// This is a vendor device control request, not a bulk frame: it never appears in a transcript
-    /// and never touches the command path. The real transport calls it from its interrupt
-    /// demultiplexing and once at session start.
+    /// and never touches the command path. The real transport calls it only from its interrupt
+    /// demultiplexing, when the sensor asks for the clock.
     fn sync_timestamp(&mut self, packed: u32) -> Result<(), UsbError>;
 
     /// The timestamp syncs sent since the last call, for `--hex`.

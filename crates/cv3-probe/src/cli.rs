@@ -584,9 +584,8 @@ fn with_transport<R>(
     err: &mut dyn Write,
     run_operation: impl FnOnce(&mut dyn Transport) -> R,
 ) -> (R, Option<std::io::Error>) {
-    // The session-start sync happened before the operation; show it before the first frame. Syncs
-    // that answer a type-5 event happen below the transport seam, so they are shown after it.
-    dump_timestamps(channel, dump_hex, err);
+    // The session sends no timestamp at open: the transport answers a type-5 event when the
+    // sensor raises it, below the transport seam, so the dump shows those after the operation.
     let outcome = match record {
         Some(path) => {
             let recording = RecordingTransport::new(channel.exchange(), command);
@@ -2567,7 +2566,10 @@ mod tests {
             .lines()
             .filter(|line| line.starts_with("* timestamp "))
             .count();
-        assert_eq!(timestamps, 1, "the session-start sync is shown: {err}");
+        assert_eq!(
+            timestamps, 0,
+            "no timestamp is sent at session start: {err}"
+        );
         assert_eq!(
             err.lines().count(),
             sent.len() * 2 + timestamps,
@@ -4882,18 +4884,17 @@ mod tests {
     }
 
     #[test]
-    fn a_command_session_sends_one_timestamp_sync_on_open() {
+    fn a_command_session_sends_no_timestamp_sync_on_open() {
         let mut usb = FakeUsb::with_sensor();
         let shutdown = SignalFlag::new();
 
         let (code, _out, err) = run_with(&["handshake"], &mut usb, &shutdown);
 
         assert_eq!(code, EXIT_OK, "{err}");
-        assert_eq!(err, "", "a successful sync is silent without --hex");
-        assert_eq!(
-            usb.syncs.borrow().len(),
-            1,
-            "the session-start sync runs before the handshake"
+        assert_eq!(err, "", "{err}");
+        assert!(
+            usb.syncs.borrow().is_empty(),
+            "the sensor asks for the clock; the host does not volunteer it"
         );
     }
 
@@ -4914,8 +4915,8 @@ mod tests {
         );
         assert_eq!(
             usb.syncs.borrow().len(),
-            2,
-            "one sync at session start and one for the type-5 event"
+            1,
+            "the type-5 event is answered once"
         );
     }
 
@@ -4936,28 +4937,8 @@ mod tests {
         );
         assert_eq!(
             usb.syncs.borrow().len(),
-            2,
-            "one sync at session start and one for the type-5 event"
-        );
-    }
-
-    #[test]
-    fn a_failed_session_start_timestamp_sync_is_logged_and_the_command_still_runs() {
-        let mut usb = FakeUsb::with_sensor();
-        usb.sync_error = Some(UsbError::Stall);
-        let shutdown = SignalFlag::new();
-
-        let (code, out, err) = run_with(&["verify"], &mut usb, &shutdown);
-
-        assert_eq!(code, EXIT_OK, "the sync is best effort: {err}");
-        assert!(
-            err.contains("timestamp sync failed: endpoint stalled"),
-            "{err}"
-        );
-        assert_eq!(
-            out,
-            verify_output(cmd::IDENTIFY, 0, VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52),
-            "stdout is unchanged"
+            1,
+            "the type-5 event is answered once"
         );
     }
 
@@ -4976,8 +4957,9 @@ mod tests {
     }
 
     #[test]
-    fn hex_shows_the_session_start_timestamp_as_a_host_control_line() {
+    fn hex_shows_a_type_5_timestamp_as_a_host_control_line() {
         let mut usb = FakeUsb::with_sensor();
+        usb.timestamp_before_announcement = true;
         let shutdown = SignalFlag::new();
 
         let (code, out, err) = run_with(&["verify", "--hex"], &mut usb, &shutdown);

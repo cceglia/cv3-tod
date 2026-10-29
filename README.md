@@ -142,8 +142,8 @@ its short fingerprint is printed, because the key is freshly generated for the r
 writes every host frame and every device reply body to **stderr** as lowercase hex, prefixed `> `
 and `< ` (`< empty` for a reply with no body, `< finger` for the finger event). The host timestamp
 request the sensor can raise on interrupt type 5 is answered in the USB transport; it has no bulk
-frame, so the dump shows it as `* timestamp <packed:08x>`. That sync is also sent once at session
-start. The decoded output on stdout is unchanged. The flag is a transport wrapper over the core's
+frame, so the dump shows it as `* timestamp <packed:08x>`. It is sent only when the sensor asks:
+the host never volunteers it before a command. The decoded output on stdout is unchanged. The flag is a transport wrapper over the core's
 `Transport` seam, so no operation changes.
 
 A catchable signal (`SIGINT`, `SIGTERM`, `SIGHUP`) during the finger wait cancels that transfer,

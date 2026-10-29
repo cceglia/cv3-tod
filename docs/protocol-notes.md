@@ -37,9 +37,10 @@ timezone. The field widths and positions are what the controller consumes, so th
 otherwise identical. The year field is six bits (2000..2063) and saturates at either end.
 
 `cvctl` answers type-5 events in the USB transport — during both the reply-announcement read and
-the finger wait, with a bounded number of retries — and sends one sync before the handshake so a
-run starts with a synced clock even when no type-5 event arrives. With `--hex` the host-side
-control appears as `* timestamp <packed:08x>`, alongside the `>`/`<` bulk lines.
+the finger wait, with a bounded number of retries. It does **not** send the sync unprompted: on
+2026-10-29 an unsolicited sync at session start timed out and the handshake that followed also
+timed out, so the probe now waits for the sensor to ask. With `--hex` the host-side control appears
+as `* timestamp <packed:08x>`, alongside the `>`/`<` bulk lines.
 
 ## Measured on 2026-10-28
 
