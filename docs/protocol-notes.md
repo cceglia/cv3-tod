@@ -229,9 +229,16 @@ Other statuses measured the same day:
 - `0x73` without a hash is not accepted: the bulk OUT was acknowledged, no announcement ever came,
   and the sensor needed a power cycle.
 
-Still to measure: the **no-match** reply (an unenrolled finger with a valid handle) and the status
-word it carries. `cvctl` prints the verdict word, the matched handle, both lengths and the TLV scan
-for any answered status.
+The **no-match** reply was measured the same day, with the same handle and an unenrolled finger:
+
+```text
+status 0x00
+plaintext (56 bytes): (0,4,0) (0,4,0) then 32 token bytes
+```
+
+So a no-match is status `0x00`, verdict word `0`, matched handle `0`, with the same shape and
+lengths as a match. `cvctl` prints the verdict word, the matched handle, both lengths and the TLV
+scan for any answered status. Still unmeasured: whether the handle survives a power cycle.
 
 ## Binding
 
