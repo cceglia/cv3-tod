@@ -24,5 +24,6 @@ an answer is a result: record what was observed and stop.
 - [x] The findings are written into the project's own protocol notes, not only next to the reference
       implementation, including the failed hypotheses.
 - [x] A plain recommendation follows: bind by this value, or abandon the binding design and say what the
-      driver can honestly claim instead. The value is a per-template handle, stable across reboots and
-      not satisfied by another finger, so the driver binds by it (ticket 10).
+      driver can honestly claim instead. The value is a template handle, stable across reboots and not satisfied by
+      another finger (per-finger vs per-template for the same finger twice is unmeasured), so the
+      driver binds by it (ticket 10).

@@ -15,7 +15,8 @@ Time box: **two hardware sessions.** A negative result is as useful as a positiv
 - [ ] A successful delete is confirmed by verification: the finger no longer matches afterwards
 - [ ] A successful clear is confirmed the same way for every enrolled finger
 - [x] If nothing works, the attempted encodings and their replies are written into the project's
-      protocol notes and the outcome is stated as unsupported.
+      protocol notes (or, when no encoding could be derived, that finding is) and the outcome is
+      stated as unsupported.
 
 ## Outcome: unsupported
 

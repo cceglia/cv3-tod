@@ -78,8 +78,8 @@ by CI. It `g_module_open`s the built object, reads the live class (identity, id 
 `FP_DEVICE_ERROR_NOT_SUPPORTED`, neither says "already open", and two `fp_device_close_sync` calls
 return safely. Against the pre-fix object the second open fails with GUsb's
 `G_USB_DEVICE_ERROR_ALREADY_OPEN`, so the harness pins the behaviour rather than the source text.
-Installing under the real TOD directory and running `fprintd-list`/`fprintd-enroll` as root is the
-remaining manual box.
+The real TOD directory was exercised on 2026-10-29 (see the transcript below); no manual box
+remains.
 
 Measured on hardware 2026-10-29 with the plugin at
 `/usr/lib/x86_64-linux-gnu/libfprint-2/tod-1/libfprint-2-tod-1-cv3.so`:
