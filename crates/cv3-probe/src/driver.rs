@@ -8,7 +8,8 @@
 //!
 //! The finger wait reads the interrupt endpoint separately from a command's announcement: the
 //! event value `0x03` becomes [`Event::Finger`], any other value is a typed unexpected-event
-//! transport failure, and a timeout is [`Event::Transport`] carrying [`TransportError::Timeout`].
+//! transport failure; a timeout names the transfer that timed out, because a sensor that refuses
+//! the bulk OUT and one that accepts it but never announces a reply need different next steps.
 //! A finger wait abandoned because the probe was asked to stop is [`UsbError::Cancelled`], which
 //! becomes [`Event::Cancelled`] rather than a transport error, so the core tears the session down.
 //! That is the only transfer the probe cancels; a command transfer never is, and a cancellation
@@ -75,11 +76,21 @@ fn failure_event(error: ExchangeError) -> Event {
 /// Maps a transport failure onto the core's own type.
 pub fn transport_error(error: ExchangeError) -> TransportError {
     match error {
-        ExchangeError::Out(error)
-        | ExchangeError::Interrupt(error)
-        | ExchangeError::Bulk(error)
-        | ExchangeError::Finger(error) => map_usb(error),
+        ExchangeError::Out(error) => transfer_error("sending the command", error),
+        ExchangeError::Interrupt(error) => {
+            transfer_error("waiting for the reply announcement", error)
+        }
+        ExchangeError::Bulk(error) => transfer_error("reading the reply body", error),
+        ExchangeError::Finger(error) => map_usb(error),
         other => TransportError::Other(other.to_string()),
+    }
+}
+
+/// Keeps the USB failure's meaning, except that a timeout says which transfer timed out.
+fn transfer_error(transfer: &str, error: UsbError) -> TransportError {
+    match error {
+        UsbError::Timeout => TransportError::Other(format!("{transfer} timed out")),
+        other => map_usb(other),
     }
 }
 
@@ -250,7 +261,12 @@ mod tests {
     fn a_transport_failure_becomes_the_core_transport_event() {
         let mut io = ScriptedIo::replies(vec![Err(ExchangeError::Out(UsbError::Timeout))]);
 
-        assert_eq!(drive(&mut io), Event::Transport(TransportError::Timeout));
+        assert_eq!(
+            drive(&mut io),
+            Event::Transport(TransportError::Other(
+                "sending the command timed out".to_owned()
+            ))
+        );
     }
 
     #[test]
