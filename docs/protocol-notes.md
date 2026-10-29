@@ -175,8 +175,18 @@ parameter list as:
 Each wire entry is `u32 type | u32 size | value bytes`, with no padding beyond the value bytes.
 `InitParam_List` and `cvhDecapsulateCmd` confirm that shape. The public Linux path
 `cvif_fingerprint_identify` (0x2b2e0) calls `cv_fingerprint_identify(handle, 0x48, 0x53e2, 0,
-count, ids, …)`, so the array values are `u32` template handles, not 20-byte ids, and the request
-is sent as command `0x73`.
+count, ids, …)`, so the array values are `u32` template handles, not 20-byte ids.
+
+The command depends on the hash argument, not on the caller's intent: at `0x24348`
+`cv_do_fingerprint_identify` tests the hash pointer, and
+
+- **with** a hash pointer it sends **`0x73`** (the request then also carries `(3, 20, hash)`);
+- **without** one it sends **`0x2F`** (`push 0x2f` at `0x24590`), with the same parameter list and
+  attr `0x47`.
+
+Sending `0x73` without the hash is what this driver did on 2026-10-29: the sensor ACKed the bulk
+OUT and then never announced a reply (60 s), so the request is only valid for the hash form. A
+`0x2F` with attr `0x42` is a different request — the inventory query ticket 16 owns.
 
 The lengths are therefore `56 + 4 * count + (28 when a hash follows)`:
 

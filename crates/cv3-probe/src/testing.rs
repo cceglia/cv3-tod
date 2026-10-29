@@ -15,6 +15,13 @@ use crate::signals::{Shutdown, SignalFlag};
 use crate::timestamp::{self, TimestampInterrupt};
 
 /// The sensor the ticket's hardware reports: bus 3, port 8.
+/// Whether a frame is the identify-without-hash request rather than the inventory query.
+///
+/// Both use command `0x2F`; the vendor sends identify with attr `0x47` and the query with `0x42`.
+fn is_identify_handles(command: u16, attribute: u8) -> bool {
+    command == cmd::IDENTIFY_HANDLES && attribute == attr::CAPTURE
+}
+
 pub fn sensor() -> FoundSensor {
     FoundSensor {
         vendor: 0x0a5c,
@@ -610,6 +617,11 @@ impl HandshakeSensor {
             frame.get(8).copied().unwrap_or(0),
             frame.get(9).copied().unwrap_or(0),
         ]);
+        // 0x2F is both the identify-without-hash request and the inventory query: the attribute
+        // tells them apart, exactly as the wire does.
+        if is_identify_handles(command, frame.get(10).copied().unwrap_or(0)) {
+            return self.match_reply(command);
+        }
         match command {
             cmd::CHALLENGE => {
                 let body = self.challenge.clone().unwrap_or_else(|| {
@@ -716,6 +728,14 @@ impl UsbIo for HandshakeSensor {
             frame.get(8).copied().unwrap_or(0),
             frame.get(9).copied().unwrap_or(0),
         ]);
+        if is_identify_handles(command, frame.get(10).copied().unwrap_or(0)) {
+            if let Some(error) = &self.match_command_error {
+                return Err(error.clone());
+            }
+            self.remember_match_tlv(frame);
+            self.pending = Some(self.reply_to(frame));
+            return Ok(());
+        }
         match command {
             cmd::CHALLENGE => {
                 if let Some(error) = &self.challenge_command_error {

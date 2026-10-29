@@ -27,10 +27,15 @@ pub mod cmd {
     pub const COMMIT_ENROLMENT: u16 = 0x6E;
     /// Verify one captured finger against one template: the vendor's `cv_do_fingerprint_verify`.
     pub const VERIFY: u16 = 0x72;
-    /// Identify the captured finger against the sensor's store: the vendor's one-to-many
-    /// `cv_do_fingerprint_identify`, whose request carries `u32` template handles.
+    /// Identify with a 20-byte hash: the vendor's `cv_do_fingerprint_identify` sends this when its
+    /// caller supplies a hash pointer, with attr `0x47`.
     pub const IDENTIFY: u16 = 0x73;
-    /// Query the sensor's template inventory (reply format not yet decoded).
+    /// Identify without a hash: match the captured finger against the template handles the request
+    /// names. The vendor's `cv_do_fingerprint_identify` sends this same parameter list with `0x2F`
+    /// when it has no hash pointer, and the sensor refused it silently as `0x73`.
+    pub const IDENTIFY_HANDLES: u16 = 0x2F;
+    /// Query the sensor's template inventory: the same opcode as [`IDENTIFY_HANDLES`] with attr
+    /// `0x42` instead of `0x47`. Its reply format is not yet decoded.
     pub const INVENTORY: u16 = 0x2F;
 }
 

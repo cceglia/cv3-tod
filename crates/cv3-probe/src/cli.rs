@@ -61,8 +61,8 @@ const USAGE: &str = "usage: cvctl devices
        cvctl capture [--hex]
        cvctl inventory [--hex]
        cvctl enroll [--commit-sample-hash] [--show-commit] [--hex]
-       cvctl enroll-then-verify [--commit-sample-hash] [--show-commit] [--command <72|73>] [--handle <u32>]... [--hex]
-       cvctl verify [--template <40 hex>] [--handle <u32>]... [--command <72|73>] [--hex]
+       cvctl enroll-then-verify [--commit-sample-hash] [--show-commit] [--command <2f|72|73>] [--handle <u32>]... [--hex]
+       cvctl verify [--template <40 hex>] [--handle <u32>]... [--command <2f|72|73>] [--hex]
        cvctl cancel-then-verify [--retry-next] [--hex]
        cvctl replay <file>";
 
@@ -98,7 +98,7 @@ enum Command<'a> {
         hex: bool,
         commit_sample_hash: bool,
         show_commit: bool,
-        /// The match request's command: `0x73` identify by default.
+        /// The match request's command; the default depends on the arguments.
         command: u16,
         /// `u32` template handles for the request's type-2 array, in order.
         handles: Vec<u32>,
@@ -108,7 +108,7 @@ enum Command<'a> {
         template: Option<[u8; cv3_core::verify::MATCH_VALUE_LEN]>,
         /// `u32` template handles for the request's type-2 array, in order.
         handles: Vec<u32>,
-        /// The match request's command: `0x73` identify by default.
+        /// The match request's command; the default depends on the arguments.
         command: u16,
     },
     CancelThenVerify {
@@ -236,7 +236,11 @@ fn parse(args: &[String]) -> Option<Command<'_>> {
                 hex: flags.hex,
                 commit_sample_hash: flags.commit_sample_hash,
                 show_commit: flags.show_commit,
-                command: flags.command.unwrap_or(cmd::IDENTIFY),
+                command: flags.command.unwrap_or(if flags.handles.is_empty() {
+                    cmd::IDENTIFY
+                } else {
+                    cmd::IDENTIFY_HANDLES
+                }),
                 handles: flags.handles,
             })
         }
@@ -253,7 +257,11 @@ fn parse(args: &[String]) -> Option<Command<'_>> {
             Some(Command::Verify {
                 hex: flags.hex,
                 template: flags.template,
-                command: flags.command.unwrap_or(cmd::IDENTIFY),
+                command: flags.command.unwrap_or(if flags.template.is_some() {
+                    cmd::IDENTIFY
+                } else {
+                    cmd::IDENTIFY_HANDLES
+                }),
                 handles: flags.handles,
             })
         }
@@ -369,6 +377,7 @@ fn parse_command(text: &str) -> Option<u16> {
     match text {
         "72" => Some(cmd::VERIFY),
         "73" => Some(cmd::IDENTIFY),
+        "2f" => Some(cmd::IDENTIFY_HANDLES),
         _ => None,
     }
 }
@@ -3899,17 +3908,65 @@ mod tests {
     }
 
     #[test]
-    fn both_match_commands_default_to_identify() {
-        for subcommand in ["verify", "enroll-then-verify"] {
-            let args: Vec<String> = [subcommand.to_owned()].to_vec();
-            match parse(&args) {
+    fn the_default_command_follows_the_hash() {
+        // The vendor sends 0x73 only when it has a 20-byte hash; without one it sends 0x2F with
+        // the same parameter list. The probe mirrors that choice instead of picking one command.
+        for (args, expected) in [
+            (vec!["verify"], cmd::IDENTIFY_HANDLES),
+            (vec!["verify", "--handle", "7"], cmd::IDENTIFY_HANDLES),
+            (
+                vec!["verify", "--template", &hex(&ENROLMENT_ID)],
+                cmd::IDENTIFY,
+            ),
+            (vec!["enroll-then-verify"], cmd::IDENTIFY),
+            (
+                vec!["enroll-then-verify", "--handle", "7"],
+                cmd::IDENTIFY_HANDLES,
+            ),
+        ] {
+            let owned: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+            match parse(&owned) {
                 Some(Command::Verify { command, .. })
                 | Some(Command::EnrollThenVerify { command, .. }) => {
-                    assert_eq!(command, cmd::IDENTIFY, "{subcommand} defaults to 0x73");
+                    assert_eq!(command, expected, "{args:?}");
                 }
-                other => panic!("{subcommand} did not parse: {:?}", other.is_some()),
+                _ => panic!("{args:?} did not parse"),
             }
         }
+    }
+
+    #[test]
+    fn command_2f_sends_the_identify_without_a_hash() {
+        let mut usb = FakeUsb::with_sensor();
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(&["verify", "--command", "2f"], &mut usb, &shutdown);
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert!(out.contains("command 0x2f"), "{out}");
+        assert_eq!(
+            sent_command(&usb, cmd::IDENTIFY_HANDLES)
+                .expect("0x2f was sent")
+                .get(8..10),
+            Some(&[0x2fu8, 0x00][..])
+        );
+        assert!(sent_command(&usb, cmd::IDENTIFY).is_none());
+    }
+
+    #[test]
+    fn verify_with_a_hash_defaults_to_0x73() {
+        let mut usb = FakeUsb::with_sensor();
+        let shutdown = SignalFlag::new();
+
+        let (code, out, err) = run_with(
+            &["verify", "--template", &hex(&ENROLMENT_ID)],
+            &mut usb,
+            &shutdown,
+        );
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert!(out.contains("command 0x73"), "{out}");
+        assert!(sent_command(&usb, cmd::IDENTIFY_HANDLES).is_none());
     }
 
     #[test]
@@ -4055,14 +4112,14 @@ mod tests {
         let (code, out, err) = run_with(&["verify"], &mut usb, &shutdown);
 
         assert_eq!(code, EXIT_OTHER);
-        assert!(out.contains("command 0x73"), "{out}");
+        assert!(out.contains("command 0x2f"), "{out}");
         assert!(out.contains("status 0x59"), "{out}");
         assert!(out.contains("reply length 108"), "{out}");
         assert!(out.contains("plaintext length 52"), "{out}");
         assert_eq!(
             out,
             format!(
-                "command 0x73\nstatus 0x59\n{}\nvalue {}\nreply length 108\nplaintext length 52\n{}",
+                "command 0x2f\nstatus 0x59\n{}\nvalue {}\nreply length 108\nplaintext length 52\n{}",
                 verdict_line(0),
                 hex(&MATCH_VALUE),
                 plaintext_dump(&plaintext)
@@ -4106,7 +4163,7 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "command 0x73\nstatus 0x0e\n{}\nvalue absent\nreply length 76\nplaintext length 20\n{}",
+                "command 0x2f\nstatus 0x0e\n{}\nvalue absent\nreply length 76\nplaintext length 20\n{}",
                 verdict_line(0x1122_3344),
                 plaintext_dump(&plaintext)
             )
@@ -4735,7 +4792,14 @@ mod tests {
         assert_eq!(err, "");
         assert_eq!(
             out,
-            verify_output(cmd::IDENTIFY, 0, VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52),
+            verify_output(
+                cmd::IDENTIFY_HANDLES,
+                0,
+                VERDICT_MATCH,
+                Some(&MATCH_VALUE),
+                108,
+                52
+            ),
             "the verdict, the value and both lengths"
         );
         assert_eq!(
@@ -4745,18 +4809,18 @@ mod tests {
                 cmd::CHALLENGE_RESPONSE,
                 cmd::OPEN_SESSION,
                 cmd::ARM_CAPTURE,
-                cmd::IDENTIFY,
+                cmd::IDENTIFY_HANDLES,
                 cmd::CANCEL_CAPTURE,
                 cmd::CLOSE_SESSION,
             ],
             "a successful verify tears down with 0x68 then 0x04 before exiting"
         );
 
-        let request = sent_command(&usb, cmd::IDENTIFY).expect("0x73 was sent");
+        let request = sent_command(&usb, cmd::IDENTIFY_HANDLES).expect("0x2f was sent");
         assert_eq!(
             &request[8..10],
-            &[0x73, 0x00],
-            "the default is the vendor's one-to-many identify"
+            &[0x2f, 0x00],
+            "without a hash the default is the vendor's identify-by-handles"
         );
         assert_eq!(request[10], attr::CAPTURE);
         assert_eq!(request[11], 0x02, "the request is wrapped");
@@ -4862,7 +4926,7 @@ mod tests {
         assert_eq!(
             out,
             verify_output(
-                cmd::IDENTIFY,
+                cmd::IDENTIFY_HANDLES,
                 0x89,
                 VERDICT_MATCH,
                 Some(&MATCH_VALUE),
@@ -4878,7 +4942,7 @@ mod tests {
                 cmd::CHALLENGE_RESPONSE,
                 cmd::OPEN_SESSION,
                 cmd::ARM_CAPTURE,
-                cmd::IDENTIFY,
+                cmd::IDENTIFY_HANDLES,
                 cmd::CANCEL_CAPTURE,
                 cmd::CLOSE_SESSION,
             ],
@@ -4901,7 +4965,7 @@ mod tests {
         assert_eq!(
             out,
             verify_output(
-                cmd::IDENTIFY,
+                cmd::IDENTIFY_HANDLES,
                 0x89,
                 VERDICT_NO_MATCH,
                 Some(&MATCH_VALUE),
@@ -4939,7 +5003,14 @@ mod tests {
         assert_eq!(err, "", "the request is answered silently");
         assert_eq!(
             out,
-            verify_output(cmd::IDENTIFY, 0, VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52),
+            verify_output(
+                cmd::IDENTIFY_HANDLES,
+                0,
+                VERDICT_MATCH,
+                Some(&MATCH_VALUE),
+                108,
+                52
+            ),
             "the real announcement still drives the reply"
         );
         assert_eq!(
@@ -4961,7 +5032,14 @@ mod tests {
         assert_eq!(err, "", "the request is answered silently");
         assert_eq!(
             out,
-            verify_output(cmd::IDENTIFY, 0, VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52),
+            verify_output(
+                cmd::IDENTIFY_HANDLES,
+                0,
+                VERDICT_MATCH,
+                Some(&MATCH_VALUE),
+                108,
+                52
+            ),
             "the real finger event still drives the match"
         );
         assert_eq!(
@@ -4996,7 +5074,14 @@ mod tests {
         assert_eq!(code, EXIT_OK, "{err}");
         assert_eq!(
             out,
-            verify_output(cmd::IDENTIFY, 0, VERDICT_MATCH, Some(&MATCH_VALUE), 108, 52),
+            verify_output(
+                cmd::IDENTIFY_HANDLES,
+                0,
+                VERDICT_MATCH,
+                Some(&MATCH_VALUE),
+                108,
+                52
+            ),
             "the decoded stdout is unchanged by the diagnostic line"
         );
         let packed = err
@@ -5022,7 +5107,7 @@ mod tests {
         assert_eq!(
             out,
             verify_output(
-                cmd::IDENTIFY,
+                cmd::IDENTIFY_HANDLES,
                 0,
                 VERDICT_NO_MATCH,
                 Some(&MATCH_VALUE),
@@ -5047,7 +5132,7 @@ mod tests {
         assert_eq!(err, "");
         assert_eq!(
             out,
-            verify_output(cmd::IDENTIFY, 0, VERDICT_NO_MATCH, None, 76, 28)
+            verify_output(cmd::IDENTIFY_HANDLES, 0, VERDICT_NO_MATCH, None, 76, 28)
         );
         assert!(out.contains("value absent"), "{out}");
     }
@@ -5159,7 +5244,7 @@ mod tests {
         assert_eq!(err, "");
         assert_eq!(
             out,
-            verify_output(cmd::IDENTIFY, 0, 2, Some(&MATCH_VALUE), 108, 52),
+            verify_output(cmd::IDENTIFY_HANDLES, 0, 2, Some(&MATCH_VALUE), 108, 52),
             "an undefined word is printed raw and never treated as a match"
         );
     }

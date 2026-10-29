@@ -13,9 +13,12 @@
 //!
 //! Disassembly of the vendor's ControlVault 3 blob shows two commands:
 //!
-//! - **`0x73` identify** (`cv_do_fingerprint_identify`) is the vendor's one-to-many match. Its
-//!   Linux path (`cvif_fingerprint_identify`) calls `cv_fingerprint_identify(handle, 0x48, 0x53e2,
-//!   0, count, ids, …)`, so the request names an array of **`u32` template handles**.
+//! - **`cv_do_fingerprint_identify`** is the vendor's one-to-many match. Its Linux path
+//!   (`cvif_fingerprint_identify`) calls `cv_fingerprint_identify(handle, 0x48, 0x53e2, 0, count,
+//!   ids, …)`, so the request names an array of **`u32` template handles**. Its command depends on
+//!   the hash argument: **`0x73`** with a hash pointer, **`0x2F`** without one (both with attr
+//!   `0x47`). `0x73` without the hash hangs the sensor: measured 2026-10-29, the bulk OUT was
+//!   accepted and no announcement followed.
 //! - **`0x72` verify** (`cv_do_fingerprint_verify`) is the one-to-one variant.
 //!
 //! `cv_do_fingerprint_identify` builds its parameter list as
