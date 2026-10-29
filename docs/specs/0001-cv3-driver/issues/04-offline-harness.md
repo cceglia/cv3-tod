@@ -7,15 +7,17 @@ sensor that can produce any reply sequence, and recording and replay of a real o
 
 **Status:** ready-for-human
 
-- [ ] A scripted-sensor transport drives the core through an arbitrary reply sequence, a finger event,
-      a cancellation and a transport error, and is what the core tests use
-- [ ] The same contract tests — reply, empty reply, error, cancellation, timeout — run against the
-      scripted, replay and failure-injecting transports
-- [ ] `cvctl` records a session to a file and replays it, reproducing the same outcome with no
-      hardware attached
+- [x] A scripted-sensor transport drives the core through an arbitrary reply sequence, a finger event,
+      a cancellation and a transport error, and is what the core tests use.
+- [x] The same contract tests — reply, empty reply, error, cancellation, timeout — run against the
+      scripted, replay and failure-injecting transports.
+- [x] `cvctl` records a session to a file and replays it, reproducing the same outcome with no
+      hardware attached (measured 2026-10-29: same handle and nonce lengths; a fresh host key, so the
+      key fingerprint differs by design and the note says so).
 - [ ] The frame parser has a fuzz target that finds no panics across random and structured buffers
-- [ ] Fixtures committed to the repository are synthetic and contain no real sensor material; raw
-      captures stay out of version control
+- [x] Fixtures committed to the repository are synthetic and contain no real sensor material; raw
+      captures stay out of version control (`git ls-files '*.cvrec'` is empty; the recording lives in
+      `/tmp`).
 
 ## Comments
 
@@ -28,3 +30,7 @@ unticked until someone runs it.
 
 Hardware: `sudo ./target/debug/cvctl handshake --record /tmp/h.cvrec`, then
 `./target/debug/cvctl replay /tmp/h.cvrec`.
+
+The fuzz box stays unticked: `cargo fuzz` and a nightly toolchain are not installed here, so
+`cargo +nightly fuzz run frame_parser` was not executed. The deterministic no-panic corpus and the
+committed target are present.
