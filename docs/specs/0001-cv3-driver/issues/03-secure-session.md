@@ -5,15 +5,18 @@ sequenced and correctly MACed command, and `cvctl close` tears it down.
 
 **Blocked by:** 02 (handshake)
 
-**Status:** ready-for-human
+**Status:** done
 
-- [ ] `cvctl open` reports success only on a zero sensor status, and prints the handle
-- [ ] A deliberately wrong wrap sequence is rejected by the sensor and surfaces as a distinct sequence
-      error, not as a generic failure
-- [ ] `cvctl close` closes the session and a subsequent open succeeds
-- [ ] A failed open leaves no session handle behind: the next open does not fail as "already open"
-- [ ] Closing is idempotent — closing an already closed session is harmless
-- [ ] Success and failure paths are covered by scripted-transport tests, not only on hardware
+- [x] `cvctl open` reports success only on a zero sensor status, and prints the handle (measured
+      2026-10-29: `handle 0x2402cab0`, `secure session open`).
+- [x] A deliberately wrong wrap sequence is rejected by the sensor and surfaces as a distinct sequence
+      error, not as a generic failure (measured: status `0x0f` and exit 5).
+- [x] `cvctl close` closes the session and a subsequent open succeeds (measured).
+- [x] A failed open leaves no session handle behind: the next open does not fail as "already open"
+      (measured: open after `--bad-sequence` succeeded).
+- [x] Closing is idempotent — closing an already closed session is harmless (scripted close paths and
+      repeated `cvctl close`).
+- [x] Success and failure paths are covered by scripted-transport tests, not only on hardware.
 
 ## Comments
 
