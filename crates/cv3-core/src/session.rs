@@ -220,14 +220,16 @@ impl Session {
         self.next_sequence = sequence;
     }
 
-    /// Rewinds the wrap sequence by one, for a re-arm at the same sequence after a cancel.
+    /// Rewinds the wrap sequence by one.
     ///
-    /// **Measured behaviour of this sensor, 2026-10-28.** After the first `0x66` arm at sequence N
-    /// answered `0x00` and a mid-session `0x68` cancelled the capture, a re-arm at N+1 was rejected
-    /// with `0x0F`; the sensor still expected the arm at N. This method is what
-    /// `cvctl cancel-then-verify` uses before its re-arm. The alternative reading (retry at N+1) is
-    /// recorded in `docs/protocol-notes.md` and can still be measured with
-    /// `cvctl cancel-then-verify --retry-next`.
+    /// **Measured behaviour of this sensor, 2026-10-28, superseded 2026-10-29.** The earlier run
+    /// saw a re-arm at N succeed after a mid-session `0x68`; on 2026-10-29 the same sequence and
+    /// N+1 were both rejected with `0x0F`, and N+2 was accepted. The sensor therefore expects the
+    /// cancel reply to have advanced the sequence, and the probe's default rewind is wrong for this
+    /// firmware. `cvctl cancel-then-verify --rearm-sequence N` can try any value; see
+    /// `docs/protocol-notes.md` for the full run, including that the verify after an N+2 re-arm
+    /// timed out and wedged the sensor. The shipping plugin never re-arms: it closes the session
+    /// after a cancel.
     ///
     /// The caller invokes this only after a wrapped reply that advanced the counter (the arm's
     /// `0x00` or `0x85` with a body), so the counter never starts at zero here.

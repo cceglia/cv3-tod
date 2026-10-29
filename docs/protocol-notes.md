@@ -285,3 +285,22 @@ only dumps the reply; that is not a decoded format.
 
 Not yet established. Ticket 21 owns whether a delete command exists at all. Until then, deletion is
 reported as unsupported rather than emulated.
+
+## Cancelling a capture: the sequence after `0x68` (measured 2026-10-29)
+
+`cvctl cancel-then-verify` opened one session, armed at sequence 1, sent the mid-session `0x68`,
+then tried a re-arm:
+
+| re-arm sequence | result |
+|---|---|
+| 1 (the recorded rewind) | `0x66` rejected with `0x0F` |
+| 2 (`--retry-next`) | `0x66` rejected with `0x0F` |
+| 3 (`--rearm-sequence 3`) | `0x66` **accepted** |
+
+So this sensor expects the cancel reply to have advanced the sequence — the normal next after the
+arm and the cancel is 3, not 2 — and the `0x0F` at 1 and 2 is a stale-sequence rejection, not a
+property of the capture. The re-arm at 3 was followed by the `0x72` verify, which never received an
+announcement and wedged the command interface (bulk OUT timeout; recovered with the USB
+`authorized` toggle). A cancelled session is therefore **not reusable**: the shipping driver closes
+it and the next operation opens a fresh one. The previous 2026-10-28 reading (re-arm at N) is
+superseded, and no verify-after-cancel path is shipped.
