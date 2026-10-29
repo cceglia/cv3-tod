@@ -5,7 +5,7 @@ session teardown, so the plugin is wired end to end before any biometric behavio
 
 **Blocked by:** 11 (plugin loads)
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] Claiming the device through `fprintd` opens the secure session and releasing it closes the
       session cleanly (measured 2026-10-29: two Claims reached `EnlistStart` and a following

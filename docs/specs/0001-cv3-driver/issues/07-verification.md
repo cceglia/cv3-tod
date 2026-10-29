@@ -5,7 +5,7 @@ no-match against an enrolment that is already on the sensor.
 
 **Blocked by:** 05 (capture), 06 (enrolment)
 
-**Status:** in-progress
+**Status:** done
 
 - [x] `cvctl verify` reports a match for a finger enrolled by ticket 06
 - [x] It reports no match for a finger that is not enrolled
@@ -13,8 +13,10 @@ no-match against an enrolment that is already on the sensor.
       that follows it, and the reply's exact length
 - [x] The reply to a **no-match** is captured and recorded in the same detail: same shape, verdict
       `0`, handle `0`
-- [ ] A capture timeout and a transport error produce distinct outcomes, with the session closed
-- [ ] Both outcomes are covered by scripted-transport tests
+- [x] A capture timeout and a transport error produce distinct outcomes, with the session closed
+      (`verify_capture_timeout_and_transport_error_are_distinct`).
+- [x] Both outcomes are covered by scripted-transport tests
+      (`verify_with_a_match_transport_error_is_not_a_finger_timeout`).
 
 ## Comments
 

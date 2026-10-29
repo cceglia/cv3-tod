@@ -5,7 +5,7 @@ so anything speaking fprintd's protocol works.
 
 **Blocked by:** 13 (enrol through fprintd), 10 (id binding)
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] `fprintd-verify` reports a match for a print enrolled through fprintd by ticket 13
       (measured 2026-10-29: `verify-match`).

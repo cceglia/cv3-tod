@@ -5,7 +5,7 @@ prints fprintd holds.
 
 **Blocked by:** 16 (inventory decoding), 13 (enrol through fprintd)
 
-**Status:** ready-for-human
+**Status:** done
 
 - [ ] `fprintd-list` shows the templates that exist on the sensor, matched to the stored prints
       (not possible: the inventory is undecoded, ticket 16).

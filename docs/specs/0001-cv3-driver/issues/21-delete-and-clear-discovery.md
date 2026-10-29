@@ -5,7 +5,7 @@ command, established before anything promises deletion to a user.
 
 **Blocked by:** 16 (inventory decoding)
 
-**Status:** ready-for-human
+**Status:** done
 
 Time box: **two hardware sessions.** A negative result is as useful as a positive one and closes ticket
 18 cleanly.

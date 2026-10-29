@@ -5,7 +5,7 @@ case a screen locker hits every time it times out.
 
 **Blocked by:** 14 (verify through fprintd), 08 (cancellation and the wrap-sequence rule)
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] Cancelling a verification through `fprintd` returns promptly instead of waiting for the finger
       timeout (measured 2026-10-29: Ctrl+C exited immediately while `Verifying:` was waiting).

@@ -5,7 +5,7 @@ is decoded so that enrolling a finger reveals which id the sensor assigned to it
 
 **Blocked by:** 06 (enrolment)
 
-**Status:** ready-for-human
+**Status:** done
 
 Time box: **three hardware sessions or one calendar week, whichever comes first.** Reaching it without a
 decoded format is a legitimate outcome: record what the replies look like and stop. Tickets 17, 18 and

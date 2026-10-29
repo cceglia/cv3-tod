@@ -6,7 +6,7 @@ does not include listing, deletion or identification.
 
 **Blocked by:** 14 (verify through fprintd), 15 (cancel through fprintd)
 
-**Status:** in-progress
+**Status:** ready-for-human
 
 - [ ] `sudo` authenticates with a fingerprint through `pam_fprintd`, with the password still available
       as fallback

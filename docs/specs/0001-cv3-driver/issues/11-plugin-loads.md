@@ -6,7 +6,7 @@ this ticket records the load milestone and its failure path as it was then.
 
 **Blocked by:** 03 (secure session)
 
-**Status:** ready-for-human
+**Status:** done
 
 **Manual acceptance (needs root):** with the plugin in the real TOD directory and `fprintd`
 restarted, all of these hold:

@@ -5,7 +5,7 @@ persists across a `fprintd` restart.
 
 **Blocked by:** 12 (session through fprintd), 06 (enrolment)
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] `fprintd-enroll` completes an enrolment end to end, reporting up to thirteen declared stages:
       the samples the sensor accepts plus the binding confirmation, fewer when the sensor completes

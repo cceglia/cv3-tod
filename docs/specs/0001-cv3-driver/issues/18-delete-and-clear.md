@@ -8,7 +8,7 @@ stops working, and clearing empties the store.
 If ticket 21 finds no command, this ticket reports the operation as unsupported and closes with that
 finding.
 
-**Status:** ready-for-human
+**Status:** done
 
 - [ ] Deleting a fingerprint removes it from the sensor, and that finger no longer matches afterwards
 - [ ] Clearing removes every template, and no enrolled finger matches afterwards
