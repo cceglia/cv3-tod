@@ -5,10 +5,10 @@
 # what libfprint actually calls. This script checks the real object:
 #
 #   1. g_module_open()s it, resolves `fpi_tod_shared_driver_get_type` and reads the class: identity,
-#      id table, the one feature the driver declares (VERIFY) and the vfuncs libfprint
-#      dereferences without a NULL test (`open`, `close`, `enroll`, `verify`) — a NULL in any of
-#      those is a segfault inside fprintd, which runs as root. The vfuncs for the features the
-#      driver does not declare (capture, identify, list, delete, clear_storage) must stay NULL.
+#      id table, the two features the driver declares (VERIFY and IDENTIFY) and the vfuncs libfprint
+#      dereferences (`open`, `close`, `enroll`, `verify`, and `identify` because it is declared) — a
+#      NULL in any of those is a segfault inside fprintd, which runs as root. The vfuncs for the
+#      features the driver does not declare (capture, list, delete, clear_storage) must stay NULL.
 #   2. Drives fprintd's Claim/Release on that class with tests/fake_gusb.c linked into the harness
 #      (`-Wl,--export-dynamic` so its symbols interpose for the plugin). The fake scripts the
 #      sensor's reply frames at fpi_usb_transfer_submit and models libgusb's open/close/claim
@@ -29,7 +29,9 @@
 #     logged and the interface and handle released;
 #   - a verification of a print with no stored record fails with DATA_NOT_FOUND and of one with an
 #     unknown record version with DATA_INVALID, both before writing a frame, while a print carrying
-#     the real record reaches the core and writes the 0x66 capture arm.
+#     the real record reaches the core and writes the 0x66 capture arm;
+#   - an identification over an empty or unusable gallery is a successful no-match with no error
+#     and no frame, while a real record reaches the core and writes the 0x66 capture arm.
 #
 # Usage: scripts/check-tod-class.sh [path/to/plugin.so]
 #   default path: target/release/libcv3_tod.so
@@ -77,7 +79,9 @@ cc -o "$work/tod-class-open" "$tests/tod_class_open.c" "$tests/fake_gusb.c" \
 # cancellation machinery but stubs the Rust boundary, because the fake cannot fabricate the wrapped
 # reply that precedes the finger wait. It proves the command/wait cancellable split, that the wait
 # is libfprint's own cancellable, that the action finishes only after the command's result, and
-# that a cancelled wait completes with G_IO_ERROR_CANCELLED and no match callback.
+# that a cancelled wait completes with G_IO_ERROR_CANCELLED and no match callback. It also stubs an
+# identification that reports gallery position 1 (and one that reports no match) to prove the shim
+# reports the exact FpPrint from the gallery, or NULL, with no error.
 cc -o "$work/tod-shim-dispatch" "$tests/tod_shim_dispatch.c" "$tests/fake_gusb.c" \
     -I "$root/crates/cv3-tod/shim" \
     $(pkg-config --cflags libfprint-2-tod-1 gmodule-2.0) \

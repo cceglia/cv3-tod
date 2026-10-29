@@ -26,6 +26,7 @@ use cv3_core::capture::CaptureError;
 use cv3_core::enrol::EnrolError;
 use cv3_core::event::{Action, TransportError};
 use cv3_core::handshake::{Handshake, HandshakeError};
+use cv3_core::identify::{Gallery, GalleryEntry, Identify, IdentifyError, IdentifyOutcome};
 use cv3_core::operation::Operation;
 use cv3_core::print::{PRINT_PAYLOAD_LEN, PrintPayload};
 use cv3_core::session::{CloseError, CloseSession, OpenError, OpenSession, Session};
@@ -50,7 +51,8 @@ pub enum OutcomeKind {
     Busy = 3,
     /// The sensor left the bus.
     Removed = 4,
-    /// A verification the sensor answered, but not with a match for the print asked about.
+    /// A verification or identification the sensor answered, but not with a match for the print or
+    /// gallery asked about.
     ///
     /// Not an error: `fprintd` reports "no match" and the user may try again.
     NoMatch = 5,
@@ -392,6 +394,7 @@ enum Job {
     /// A live session, kept until the close releases its handle and zeroed key.
     Session(Session),
     Verifying(Box<VerifyRun>),
+    Identifying(Box<IdentifyRun>),
     Enrolling(Box<EnrolRun>),
     Closing(CloseRun),
     Finished,
@@ -449,6 +452,54 @@ impl VerifyRun {
             // happen, and reporting it beats panicking inside fprintd.
             FlowStep::Unsupported => VerifyStep::Finished {
                 output: Err(VerifyError::UnexpectedEvent),
+                failure: None,
+            },
+        }
+    }
+}
+
+/// One step of a whole identification: perform this transfer, or report the final outcome.
+enum IdentifyStep {
+    Transfer(Transfer),
+    Finished {
+        output: Result<IdentifyOutcome, IdentifyError>,
+        /// The last transport failure, which selects the `libfprint` error.
+        failure: Option<IoFailure>,
+    },
+}
+
+/// Drives one [`Identify`] against the gallery the client supplied.
+///
+/// The core decodes the gallery's payloads and asks the sensor about every usable handle in one
+/// `0x2F`; the matched handle is mapped back to the caller's gallery position. Nothing here reads
+/// the sensor's inventory, and nothing depends on whether it was decoded.
+struct IdentifyRun {
+    flow: Flow<Identify>,
+}
+
+impl IdentifyRun {
+    fn new(session: Session, gallery: Gallery, ivs: VerifyIvs) -> Self {
+        Self {
+            flow: Flow::new(Identify::new(session, gallery, ivs.capture, ivs.matching)),
+        }
+    }
+
+    fn start(&mut self) -> IdentifyStep {
+        Self::classify(self.flow.start())
+    }
+
+    fn on_io_result(&mut self, reply: IoReply) -> IdentifyStep {
+        Self::classify(self.flow.on_io_result(reply))
+    }
+
+    fn classify(step: FlowStep<Result<IdentifyOutcome, IdentifyError>>) -> IdentifyStep {
+        match step {
+            FlowStep::Transfer(transfer) => IdentifyStep::Transfer(transfer),
+            FlowStep::Finished { output, failure } => IdentifyStep::Finished { output, failure },
+            // An identification asks for the finger wait, which `Flow` performs; this cannot
+            // happen, and reporting it beats panicking inside fprintd.
+            FlowStep::Unsupported => IdentifyStep::Finished {
+                output: Err(IdentifyError::UnexpectedEvent),
                 failure: None,
             },
         }
@@ -519,6 +570,8 @@ pub struct Plugin {
     reported: Reported,
     /// The bound payload of the last successful enrolment, until the shim takes it.
     payload: Option<[u8; PRINT_PAYLOAD_LEN]>,
+    /// The gallery position of the last successful identification, until the shim takes it.
+    matched: Option<usize>,
 }
 
 impl Default for Plugin {
@@ -534,6 +587,7 @@ impl Plugin {
             progress: VecDeque::new(),
             reported: Reported::default(),
             payload: None,
+            matched: None,
         }
     }
 
@@ -571,6 +625,10 @@ impl Plugin {
             Job::Verifying(mut run) => {
                 let step = run.on_io_result(reply);
                 self.after_verify_step(*run, step)
+            }
+            Job::Identifying(mut run) => {
+                let step = run.on_io_result(reply);
+                self.after_identify_step(*run, step)
             }
             Job::Enrolling(mut run) => {
                 let step = run.on_io_result(reply);
@@ -635,9 +693,53 @@ impl Plugin {
                 "cv3: verification needs an open sensor session",
             ));
         };
+        self.matched = None;
         let mut run = VerifyRun::new(session, print, ivs);
         let step = run.start();
         self.after_verify_step(run, step)
+    }
+
+    /// Starts an identification over the gallery the client supplied, on the live session.
+    ///
+    /// Each entry is one print's position in the client's gallery and its `fpi-data` bytes. The
+    /// core decodes the payloads: usable bound prints become the candidate handles of one `0x2F`
+    /// request, and the matched handle is mapped back to that print's gallery position for
+    /// [`Self::take_match`]. A gallery with no usable print is a no-match without a capture or a
+    /// command, and leaves the session untouched. Nothing here reads the sensor's inventory or
+    /// depends on it.
+    pub fn identify_start(&mut self, entries: &[(usize, &[u8])]) -> Step {
+        match VerifyIvs::generate() {
+            Ok(ivs) => self.identify_start_with(entries, ivs),
+            Err(error) => Step::Finished(Outcome::error(
+                OutcomeKind::General,
+                format!("cv3: cannot start the identification: {error}"),
+            )),
+        }
+    }
+
+    /// Starts an identification with the given IVs. Test support for a deterministic run.
+    pub fn identify_start_with(&mut self, entries: &[(usize, &[u8])], ivs: VerifyIvs) -> Step {
+        if !matches!(self.job, Job::Session(_)) {
+            return Step::Finished(Outcome::error(
+                OutcomeKind::General,
+                "cv3: identification needs an open sensor session",
+            ));
+        }
+        let gallery_entries: Vec<GalleryEntry<'_>> = entries
+            .iter()
+            .map(|(index, payload)| GalleryEntry::new(*index, payload))
+            .collect();
+        let gallery = Gallery::from_entries(&gallery_entries);
+        let Job::Session(session) = std::mem::replace(&mut self.job, Job::Finished) else {
+            return Step::Finished(Outcome::error(
+                OutcomeKind::General,
+                "cv3: identification needs an open sensor session",
+            ));
+        };
+        self.matched = None;
+        let mut run = IdentifyRun::new(session, gallery, ivs);
+        let step = run.start();
+        self.after_identify_step(run, step)
     }
 
     /// Starts a whole enrolment on the live session and returns the first transfer.
@@ -671,6 +773,7 @@ impl Plugin {
         self.progress.clear();
         self.reported = Reported::default();
         self.payload = None;
+        self.matched = None;
         let mut run = EnrolRun::new(EnrolAndBind::new(
             session,
             ivs.enrol,
@@ -689,6 +792,14 @@ impl Plugin {
     /// The bound payload of a completed enrolment, once.
     pub fn take_payload(&mut self) -> Option<[u8; PRINT_PAYLOAD_LEN]> {
         self.payload.take()
+    }
+
+    /// The gallery position of a completed identification's match, once.
+    ///
+    /// `None` means the last identification found no match (or has not run). The shim uses the
+    /// position to report the exact `FpPrint` the client supplied, which libfprint requires.
+    pub fn take_match(&mut self) -> Option<usize> {
+        self.matched.take()
     }
 
     /// Releases a live session and returns the `0x04` transfer, or finishes at once when there is
@@ -719,6 +830,13 @@ impl Plugin {
                 Step::Finished(Outcome {
                     kind: OutcomeKind::Ok,
                     message: "cv3: close requested during a verification".to_owned(),
+                })
+            }
+            Job::Identifying(_) => {
+                self.job = Job::Finished;
+                Step::Finished(Outcome {
+                    kind: OutcomeKind::Ok,
+                    message: "cv3: close requested during an identification".to_owned(),
                 })
             }
             Job::Enrolling(_) => {
@@ -802,6 +920,56 @@ impl Plugin {
                     // nothing is left to hand back.
                     self.job = Job::Finished;
                     Step::Finished(outcome_from_verify(&error, io_failure))
+                }
+            },
+        }
+    }
+
+    fn after_identify_step(&mut self, run: IdentifyRun, step: IdentifyStep) -> Step {
+        match step {
+            IdentifyStep::Transfer(transfer) => {
+                self.job = Job::Identifying(Box::new(run));
+                Step::transfer(transfer)
+            }
+            IdentifyStep::Finished {
+                output,
+                failure: io_failure,
+            } => match output {
+                Ok(IdentifyOutcome::Matched { index, session, .. }) => {
+                    // The session stays open for the next operation; the shim reports the print at
+                    // this gallery position, which is the exact object libfprint handed us.
+                    self.job = Job::Session(session);
+                    self.matched = Some(index);
+                    Step::Finished(Outcome::ok())
+                }
+                Ok(IdentifyOutcome::NoMatch { verdict, session }) => {
+                    self.job = Job::Session(session);
+                    self.matched = None;
+                    Step::Finished(Outcome::error(
+                        OutcomeKind::NoMatch,
+                        format!(
+                            "cv3: no print in the gallery matched: verdict {}, matched handle {}",
+                            verdict.word,
+                            match verdict.matched_handle {
+                                Some(handle) => format!("{handle:#010x}"),
+                                None => "absent".to_owned(),
+                            },
+                        ),
+                    ))
+                }
+                Ok(IdentifyOutcome::EmptyGallery { session }) => {
+                    self.job = Job::Session(session);
+                    self.matched = None;
+                    Step::Finished(Outcome::error(
+                        OutcomeKind::NoMatch,
+                        "cv3: no print in the gallery carries a usable bound record, so nothing \
+                         was captured",
+                    ))
+                }
+                Err(error) => {
+                    // The capture or match tore the session down before reporting.
+                    self.job = Job::Finished;
+                    Step::Finished(outcome_from_identify(&error, io_failure))
                 }
             },
         }
@@ -1024,6 +1192,24 @@ fn bind_kind(error: &BindError, io: Option<IoFailure>) -> OutcomeKind {
 /// device error (the transport or the protocol failed). The `Accepts` refusal and the payload
 /// checks are decided before this point; only the sensor's answer is classified here.
 fn outcome_from_verify(error: &VerifyError, io: Option<IoFailure>) -> Outcome {
+    outcome_from_match_like(error, io, "verification")
+}
+
+/// What `libfprint` is told when an identification did not produce a matched gallery print.
+///
+/// The no-match outcomes are decided before this point (they are successful sensor answers); a
+/// failure here is always a device or protocol error, classified like verification's.
+fn outcome_from_identify(error: &IdentifyError, io: Option<IoFailure>) -> Outcome {
+    match error {
+        IdentifyError::Verify(error) => outcome_from_match_like(error, io, "identification"),
+        IdentifyError::UnexpectedEvent | IdentifyError::AlreadyFinished => Outcome::error(
+            OutcomeKind::General,
+            format!("cv3: identification failed: {error}"),
+        ),
+    }
+}
+
+fn outcome_from_match_like(error: &VerifyError, io: Option<IoFailure>, subject: &str) -> Outcome {
     match error {
         // The user did not get a finger down in time: nothing about the sensor is wrong, so this
         // is the retry vocabulary rather than a device error.
@@ -1038,7 +1224,7 @@ fn outcome_from_verify(error: &VerifyError, io: Option<IoFailure>) -> Outcome {
         VerifyError::Capture(CaptureError::Cancelled)
         | VerifyError::Match(MatchError::Cancelled) => Outcome::error(
             OutcomeKind::Cancelled,
-            "cv3: the verification was cancelled",
+            format!("cv3: the {subject} was cancelled"),
         ),
         VerifyError::Capture(CaptureError::Transport(error))
         | VerifyError::Match(MatchError::Transport(error)) => {
@@ -1047,7 +1233,7 @@ fn outcome_from_verify(error: &VerifyError, io: Option<IoFailure>) -> Outcome {
                 _ => OutcomeKind::General,
             };
             let kind = io_kind(io, fallback);
-            Outcome::error(kind, format!("cv3: verification failed: {error}"))
+            Outcome::error(kind, format!("cv3: {subject} failed: {error}"))
         }
         // The sensor answered or refused in a way this driver does not accept: a protocol
         // failure, not a general one.
@@ -1066,7 +1252,7 @@ fn outcome_from_verify(error: &VerifyError, io: Option<IoFailure>) -> Outcome {
             | MatchError::MalformedReply(_),
         ) => Outcome::error(
             OutcomeKind::Proto,
-            format!("cv3: verification failed: {error}"),
+            format!("cv3: {subject} failed: {error}"),
         ),
         VerifyError::Capture(
             CaptureError::Build(_) | CaptureError::UnexpectedEvent | CaptureError::AlreadyFinished,
@@ -1077,7 +1263,7 @@ fn outcome_from_verify(error: &VerifyError, io: Option<IoFailure>) -> Outcome {
         | VerifyError::UnexpectedEvent
         | VerifyError::AlreadyFinished => Outcome::error(
             OutcomeKind::General,
-            format!("cv3: verification failed: {error}"),
+            format!("cv3: {subject} failed: {error}"),
         ),
     }
 }
@@ -2983,6 +3169,446 @@ mod tests {
                 assert!(outcome.message.contains("session"), "{}", outcome.message);
             }
             other => panic!("expected a finished verification, got {other:?}"),
+        }
+        assert!(transfers.is_empty());
+    }
+
+    // ---- Identification through the session ---------------------------------------------------
+
+    const FIRST_GALLERY_HANDLE: u32 = 0x0070_69a9;
+    const SECOND_GALLERY_HANDLE: u32 = 0x002f_1a08;
+
+    /// Starts an identification over `payloads` and drives it against scripted transport results.
+    fn drive_identify(
+        plugin: &mut Plugin,
+        payloads: &[&[u8]],
+        script: &mut VecDeque<IoReply>,
+    ) -> (Step, Vec<Transfer>) {
+        let entries: Vec<(usize, &[u8])> = payloads
+            .iter()
+            .enumerate()
+            .map(|(index, payload)| (index, *payload))
+            .collect();
+        let first = plugin.identify_start_with(&entries, verify_ivs());
+        drive(plugin, first, script)
+    }
+
+    /// The decrypted TLV of one command frame, read with the session key the test already has.
+    fn request_tlv_of(key: &[u8; SESSION_KEY_LEN], frame: &[u8]) -> Vec<u8> {
+        let mut iv = [0u8; 16];
+        iv.copy_from_slice(&frame[24..40]);
+        let plaintext =
+            cv3_core::crypto::decrypt_cbc(key, &iv, &frame[44..]).expect("the request decrypts");
+        let tlv_len = u32::from_le_bytes(frame[40..44].try_into().expect("four bytes")) as usize;
+        plaintext[..tlv_len].to_vec()
+    }
+
+    /// The last `0x2F` frame the run wrote, decrypted to its parameter list.
+    fn identify_request(key: &[u8; SESSION_KEY_LEN], transfers: &[Transfer]) -> Vec<u8> {
+        let frame = transfers
+            .iter()
+            .rfind(|transfer| command_of_opt(transfer) == Some(cmd::IDENTIFY_HANDLES))
+            .and_then(|transfer| match transfer {
+                Transfer::Out { frame, .. } => Some(frame.as_slice()),
+                _ => None,
+            })
+            .expect("the identification wrote a 0x2F");
+        request_tlv_of(key, frame)
+    }
+
+    #[test]
+    fn identification_matches_the_gallery_print_whose_handle_the_sensor_names() {
+        let (mut plugin, key) = opened_for_verification();
+        let first = bound_payload(FIRST_GALLERY_HANDLE);
+        let second = bound_payload(SECOND_GALLERY_HANDLE);
+        let mut script = VecDeque::new();
+        push_confirmation(&mut script, &key, 1, SECOND_GALLERY_HANDLE);
+
+        let (step, transfers) = drive_identify(&mut plugin, &[&first, &second], &mut script);
+
+        assert_eq!(step, Step::Finished(Outcome::ok()));
+        assert_eq!(
+            plugin.take_match(),
+            Some(1),
+            "the second gallery print, not merely some print"
+        );
+        assert_eq!(plugin.take_match(), None, "the position is handed out once");
+        assert_eq!(
+            verify_commands(&transfers),
+            [cmd::ARM_CAPTURE, cmd::IDENTIFY_HANDLES],
+            "one capture, one match request for the whole gallery"
+        );
+        assert_eq!(
+            identify_request(&key, &transfers),
+            cv3_core::verify::request_tlv(
+                HANDLE,
+                &[FIRST_GALLERY_HANDLE, SECOND_GALLERY_HANDLE],
+                None
+            ),
+            "the type-2 array carries every candidate handle"
+        );
+        let match_frame = transfers
+            .iter()
+            .rfind(|transfer| command_of_opt(transfer) == Some(cmd::IDENTIFY_HANDLES))
+            .and_then(|transfer| match transfer {
+                Transfer::Out { frame, .. } => Some(frame),
+                _ => None,
+            })
+            .expect("a match frame");
+        assert_eq!(
+            match_frame[10],
+            attr::CAPTURE,
+            "attr 0x47 is the match request, not the inventory query's 0x42"
+        );
+        assert!(
+            matches!(plugin.job, Job::Session(_)),
+            "a match leaves the session usable"
+        );
+
+        let mut close = empty_reply().into_iter().collect();
+        let (step, close_transfers) = close_run(&mut plugin, &mut close);
+        assert_eq!(step, Step::Finished(Outcome::ok()));
+        assert_eq!(command_of(&close_transfers[0]), cmd::CLOSE_SESSION);
+    }
+
+    #[test]
+    fn a_handle_outside_the_gallery_is_a_no_match_that_keeps_the_session() {
+        let (mut plugin, key) = opened_for_verification();
+        let gallery = bound_payload(FIRST_GALLERY_HANDLE);
+        let mut script = VecDeque::new();
+        push_confirmation(&mut script, &key, 1, 0x0bad_f00d);
+
+        let (step, _) = drive_identify(&mut plugin, &[&gallery], &mut script);
+
+        match step {
+            Step::Finished(outcome) => {
+                assert_eq!(outcome.kind, OutcomeKind::NoMatch);
+                assert!(outcome.message.contains("no print"), "{}", outcome.message);
+                assert!(
+                    outcome.message.contains("0x0badf00d"),
+                    "the message names the handle the sensor matched: {}",
+                    outcome.message
+                );
+            }
+            other => panic!("expected a finished identification, got {other:?}"),
+        }
+        assert_eq!(plugin.take_match(), None);
+        assert!(matches!(plugin.job, Job::Session(_)));
+
+        let mut close = empty_reply().into_iter().collect();
+        let (step, close_transfers) = close_run(&mut plugin, &mut close);
+        assert_eq!(step, Step::Finished(Outcome::ok()));
+        assert_eq!(command_of(&close_transfers[0]), cmd::CLOSE_SESSION);
+    }
+
+    #[test]
+    fn an_empty_gallery_is_a_no_match_without_a_capture() {
+        let (mut plugin, _) = opened_for_verification();
+
+        let (step, transfers) = drive_identify(&mut plugin, &[], &mut VecDeque::new());
+
+        match step {
+            Step::Finished(outcome) => {
+                assert_eq!(outcome.kind, OutcomeKind::NoMatch);
+                assert!(outcome.message.contains("no print"), "{}", outcome.message);
+            }
+            other => panic!("expected a finished identification, got {other:?}"),
+        }
+        assert!(transfers.is_empty(), "nothing was captured: {transfers:?}");
+        assert_eq!(plugin.take_match(), None);
+        assert!(
+            matches!(plugin.job, Job::Session(_)),
+            "an unusable gallery never touched the session"
+        );
+    }
+
+    #[test]
+    fn a_gallery_of_unusable_records_is_a_no_match_without_a_capture() {
+        let (mut plugin, _) = opened_for_verification();
+        let mut foreign = bound_payload(FIRST_GALLERY_HANDLE);
+        foreign[0] = b'X';
+        let mut unbound = bound_payload(SECOND_GALLERY_HANDLE);
+        unbound[5] &= !0x01;
+        let short = bound_payload(SECOND_GALLERY_HANDLE)[..BOUND_RECORD_LEN - 1].to_vec();
+
+        let (step, transfers) = drive_identify(
+            &mut plugin,
+            &[&[], &foreign, &unbound, &short],
+            &mut VecDeque::new(),
+        );
+
+        match step {
+            Step::Finished(outcome) => assert_eq!(outcome.kind, OutcomeKind::NoMatch),
+            other => panic!("expected a finished identification, got {other:?}"),
+        }
+        assert!(transfers.is_empty(), "nothing was sent: {transfers:?}");
+        assert_eq!(plugin.take_match(), None);
+        assert!(matches!(plugin.job, Job::Session(_)));
+    }
+
+    #[test]
+    fn a_duplicated_handle_is_never_a_match_for_either_print() {
+        let (mut plugin, key) = opened_for_verification();
+        let first = bound_payload(FIRST_GALLERY_HANDLE);
+        let second = bound_payload(SECOND_GALLERY_HANDLE);
+
+        // Both copies name the same template: the gallery is ambiguous and nothing is captured.
+        let (step, transfers) =
+            drive_identify(&mut plugin, &[&first, &first], &mut VecDeque::new());
+        match step {
+            Step::Finished(outcome) => assert_eq!(outcome.kind, OutcomeKind::NoMatch),
+            other => panic!("expected a finished identification, got {other:?}"),
+        }
+        assert!(transfers.is_empty(), "the ambiguous handle was not sent");
+        assert_eq!(plugin.take_match(), None);
+
+        // A unique print next to the duplicated pair is still a candidate, but the duplicated
+        // handle the sensor names is not.
+        let mut script = VecDeque::new();
+        push_confirmation(&mut script, &key, 1, FIRST_GALLERY_HANDLE);
+        let (step, _) = drive_identify(&mut plugin, &[&first, &first, &second], &mut script);
+        match step {
+            Step::Finished(outcome) => assert_eq!(outcome.kind, OutcomeKind::NoMatch),
+            other => panic!("expected a finished identification, got {other:?}"),
+        }
+        assert_eq!(plugin.take_match(), None);
+        assert!(matches!(plugin.job, Job::Session(_)));
+
+        // The unique print still matches at its own gallery position.
+        let mut script = VecDeque::new();
+        push_confirmation(&mut script, &key, 1, SECOND_GALLERY_HANDLE);
+        let (step, _) = drive_identify(&mut plugin, &[&first, &first, &second], &mut script);
+        assert_eq!(step, Step::Finished(Outcome::ok()));
+        assert_eq!(plugin.take_match(), Some(2));
+    }
+
+    #[test]
+    fn a_zero_verdict_is_a_no_match_that_keeps_the_session() {
+        let (mut plugin, key) = opened_for_verification();
+        let gallery = bound_payload(FIRST_GALLERY_HANDLE);
+        let mut script = VecDeque::new();
+        push_confirmation(&mut script, &key, 0, 0);
+
+        let (step, _) = drive_identify(&mut plugin, &[&gallery], &mut script);
+
+        match step {
+            Step::Finished(outcome) => assert_eq!(outcome.kind, OutcomeKind::NoMatch),
+            other => panic!("expected a finished identification, got {other:?}"),
+        }
+        assert_eq!(plugin.take_match(), None);
+        assert!(matches!(plugin.job, Job::Session(_)));
+    }
+
+    #[test]
+    fn a_malformed_identification_reply_is_a_protocol_error_not_a_no_match() {
+        let (mut plugin, key) = opened_for_verification();
+        let gallery = bound_payload(FIRST_GALLERY_HANDLE);
+        let mut script = VecDeque::new();
+        script.extend(reply(wrapped_reply(
+            &key,
+            cmd::ARM_CAPTURE,
+            attr::CAPTURE,
+            &sample_hash_plaintext(),
+        )));
+        script.push_back(IoReply::Data(
+            cv3_core::proto::interrupt::FINGER.to_le_bytes().to_vec(),
+        ));
+        script.push_back(IoReply::Completed);
+        script.push_back(announcement(8));
+        script.push_back(IoReply::Data(vec![0u8; 8]));
+        script.extend(empty_reply());
+        script.extend(empty_reply());
+
+        let (step, transfers) = drive_identify(&mut plugin, &[&gallery], &mut script);
+
+        match step {
+            Step::Finished(outcome) => {
+                assert_eq!(outcome.kind, OutcomeKind::Proto);
+                assert!(
+                    outcome.message.contains("identification failed"),
+                    "{}",
+                    outcome.message
+                );
+                assert!(outcome.message.contains("malformed"), "{}", outcome.message);
+            }
+            other => panic!("expected a finished identification, got {other:?}"),
+        }
+        assert_eq!(plugin.take_match(), None);
+        assert!(
+            matches!(plugin.job, Job::Finished),
+            "the match's teardown closed the session"
+        );
+        assert_eq!(
+            verify_commands(&transfers).last(),
+            Some(&cmd::CLOSE_SESSION)
+        );
+    }
+
+    #[test]
+    fn a_transport_failure_at_each_identification_stage_is_reported() {
+        // The failure is injected at the arm's write, its announcement, its body, the finger read,
+        // the match's write, its announcement and its body, in that order.
+        for failure_at in 0..7 {
+            let (mut plugin, key) = opened_for_verification();
+            let gallery = bound_payload(FIRST_GALLERY_HANDLE);
+            let mut script = VecDeque::new();
+            match failure_at {
+                0 => script.push_back(IoReply::Failed(IoFailure::Disconnected)),
+                1 => {
+                    script.push_back(IoReply::Completed);
+                    script.push_back(IoReply::Failed(IoFailure::Stall));
+                }
+                2 => {
+                    script.push_back(IoReply::Completed);
+                    script.push_back(announcement(56));
+                    script.push_back(IoReply::Failed(IoFailure::Stall));
+                }
+                3 => {
+                    script.extend(reply(wrapped_reply(
+                        &key,
+                        cmd::ARM_CAPTURE,
+                        attr::CAPTURE,
+                        &sample_hash_plaintext(),
+                    )));
+                    script.push_back(IoReply::Failed(IoFailure::Stall));
+                }
+                4 => {
+                    script.extend(reply(wrapped_reply(
+                        &key,
+                        cmd::ARM_CAPTURE,
+                        attr::CAPTURE,
+                        &sample_hash_plaintext(),
+                    )));
+                    script.push_back(IoReply::Data(
+                        cv3_core::proto::interrupt::FINGER.to_le_bytes().to_vec(),
+                    ));
+                    script.push_back(IoReply::Failed(IoFailure::Stall));
+                }
+                5 => {
+                    script.extend(reply(wrapped_reply(
+                        &key,
+                        cmd::ARM_CAPTURE,
+                        attr::CAPTURE,
+                        &sample_hash_plaintext(),
+                    )));
+                    script.push_back(IoReply::Data(
+                        cv3_core::proto::interrupt::FINGER.to_le_bytes().to_vec(),
+                    ));
+                    script.push_back(IoReply::Completed);
+                    script.push_back(IoReply::Failed(IoFailure::Stall));
+                }
+                _ => {
+                    script.extend(reply(wrapped_reply(
+                        &key,
+                        cmd::ARM_CAPTURE,
+                        attr::CAPTURE,
+                        &sample_hash_plaintext(),
+                    )));
+                    script.push_back(IoReply::Data(
+                        cv3_core::proto::interrupt::FINGER.to_le_bytes().to_vec(),
+                    ));
+                    script.push_back(IoReply::Completed);
+                    script.push_back(announcement(56));
+                    script.push_back(IoReply::Failed(IoFailure::Stall));
+                }
+            }
+            script.extend(empty_reply());
+            script.extend(empty_reply());
+
+            let (step, transfers) = drive_identify(&mut plugin, &[&gallery], &mut script);
+
+            match step {
+                Step::Finished(outcome) => {
+                    let expected = if failure_at == 0 {
+                        OutcomeKind::Removed
+                    } else {
+                        OutcomeKind::General
+                    };
+                    assert_eq!(outcome.kind, expected, "failure {failure_at}");
+                    assert!(
+                        outcome.message.contains("identification failed"),
+                        "failure {failure_at}: {}",
+                        outcome.message
+                    );
+                }
+                other => panic!(
+                    "failure {failure_at}: expected a finished identification, got {other:?}"
+                ),
+            }
+            assert_eq!(plugin.take_match(), None, "failure {failure_at}");
+            assert!(
+                matches!(plugin.job, Job::Finished),
+                "failure {failure_at}: the teardown closed the session"
+            );
+            assert_eq!(
+                verify_commands(&transfers).last(),
+                Some(&cmd::CLOSE_SESSION),
+                "failure {failure_at}: the best-effort teardown ran"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cancelled_identification_tears_down_without_a_match() {
+        let (mut plugin, key) = opened_for_verification();
+        let gallery = bound_payload(FIRST_GALLERY_HANDLE);
+        let mut script = VecDeque::new();
+        script.extend(reply(wrapped_reply(
+            &key,
+            cmd::ARM_CAPTURE,
+            attr::CAPTURE,
+            &sample_hash_plaintext(),
+        )));
+        script.push_back(IoReply::Failed(IoFailure::Cancelled));
+        script.extend(empty_reply());
+        script.extend(empty_reply());
+
+        let (step, transfers) = drive_identify(&mut plugin, &[&gallery], &mut script);
+
+        match step {
+            Step::Finished(outcome) => {
+                assert_eq!(outcome.kind, OutcomeKind::Cancelled);
+                assert!(
+                    !matches!(outcome.kind, OutcomeKind::NoMatch | OutcomeKind::Retry),
+                    "a cancellation is not a verdict and not a retry"
+                );
+                assert!(outcome.message.contains("cancelled"), "{}", outcome.message);
+            }
+            other => panic!("expected a finished identification, got {other:?}"),
+        }
+        assert_eq!(
+            verify_commands(&transfers),
+            [cmd::ARM_CAPTURE, cmd::CANCEL_CAPTURE, cmd::CLOSE_SESSION],
+            "the teardown is complete and no 0x2F was sent"
+        );
+        assert_eq!(
+            transfers
+                .iter()
+                .filter(|transfer| matches!(transfer, Transfer::FingerIn { .. }))
+                .count(),
+            1,
+            "the cancelled wait is not retried"
+        );
+        assert_eq!(plugin.take_match(), None);
+        assert!(matches!(plugin.job, Job::Finished));
+
+        let (step, close_transfers) = close_run(&mut plugin, &mut VecDeque::new());
+        assert_eq!(step, Step::Finished(Outcome::ok()));
+        assert!(close_transfers.is_empty(), "the cancel already closed it");
+    }
+
+    #[test]
+    fn an_identification_needs_an_open_session() {
+        let mut plugin = Plugin::new();
+        let gallery = bound_payload(FIRST_GALLERY_HANDLE);
+        let (step, transfers) = drive_identify(&mut plugin, &[&gallery], &mut VecDeque::new());
+
+        match step {
+            Step::Finished(outcome) => {
+                assert_eq!(outcome.kind, OutcomeKind::General);
+                assert!(outcome.message.contains("session"), "{}", outcome.message);
+            }
+            other => panic!("expected a finished identification, got {other:?}"),
         }
         assert!(transfers.is_empty());
     }

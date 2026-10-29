@@ -10,8 +10,13 @@
  *  - the exported entry point resolves and returns a class carrying the identity and the id table
  *    the SPEC names;
  *  - every vfunc libfprint calls through the class pointer without a NULL guard (`open`, `close`,
- *    `enroll`, `verify`) is non-NULL: a NULL there is a segfault inside fprintd, which runs as
- *    root; the vfuncs for the features this driver does not declare stay NULL;
+ *    `enroll`, `verify`) is non-NULL, and `identify` is non-NULL because IDENTIFY is declared: a
+ *    NULL there is a segfault inside fprintd, which runs as root; the vfuncs for the features this
+ *    driver does not declare stay NULL;
+ *  - an identification over an empty gallery, or one whose prints carry no usable record, is a
+ *    real no-match with no error and no frame, while a real record reaches the core and its `0x66`
+ *    arm reaches the sensor. The matching result needs wrapped replies the fake cannot fabricate;
+ *    the Rust tests cover it and the hardware run confirms it;
  *  - a first Claim whose 0x24 reply is refused fails with FP_DEVICE_ERROR_PROTO, and before it
  *    reports the failure it writes the plain 0x04 that releases the handle the 0x23 reply named,
  *    releases interface 0 and closes the GUsb handle libfprint opened: no handle is left on the
@@ -118,12 +123,14 @@ check_identity (FpDeviceClass *klass)
          "scan type is press (got %d)", klass->scan_type);
 
   /* Enrolment is advertised by the stage count, not by a feature bit: libfprint 1.95 has no
-   * FP_DEVICE_FEATURE_ENROLL. The class must still carry one feature for construction, and the one
-   * this driver implements is VERIFY. */
+   * FP_DEVICE_FEATURE_ENROLL. The class must still carry one feature for construction, and the two
+   * this driver implements are VERIFY and IDENTIFY. IDENTIFY is static because libfprint has no
+   * per-gallery feature; the vfunc itself returns no match for an empty or unusable gallery. */
   check (klass->nr_enroll_stages == 13,
          "the class declares thirteen enrolment stages (got %d)", klass->nr_enroll_stages);
-  check (klass->features == FP_DEVICE_FEATURE_VERIFY,
-         "the class declares VERIFY and nothing else (got 0x%02x)", klass->features);
+  check (klass->features == (FP_DEVICE_FEATURE_VERIFY | FP_DEVICE_FEATURE_IDENTIFY),
+         "the class declares VERIFY and IDENTIFY and nothing else (got 0x%02x)",
+         klass->features);
 
   check (klass->id_table != NULL, "the class has an id table");
   if (klass->id_table != NULL)
@@ -139,11 +146,13 @@ check_identity (FpDeviceClass *klass)
 static void
 check_unconditional_vfuncs (FpDeviceClass *klass)
 {
-  /* libfprint 1.95 dereferences these four through the class pointer without testing for NULL. */
+  /* libfprint 1.95 dereferences these four through the class pointer without testing for NULL.
+   * identify is feature-guarded, but IDENTIFY is declared, so it must be set too. */
   check (klass->open != NULL, "open is set");
   check (klass->close != NULL, "close is set");
   check (klass->enroll != NULL, "enroll is set");
   check (klass->verify != NULL, "verify is set");
+  check (klass->identify != NULL, "identify is set because IDENTIFY is declared");
 }
 
 /* The features this driver does not declare must stay NULL, or libfprint would offer an operation
@@ -152,7 +161,6 @@ static void
 check_undeclared_vfuncs (FpDeviceClass *klass)
 {
   check (klass->capture == NULL, "capture is not offered");
-  check (klass->identify == NULL, "identify is not offered");
   check (klass->list == NULL, "list is not offered");
   check (klass->delete == NULL, "delete is not offered");
   check (klass->clear_storage == NULL, "clear_storage is not offered");
@@ -560,6 +568,126 @@ check_verify (GType type)
   g_object_unref (usb);
 }
 
+/* Identification on an open session, for what the fake can honestly show:
+ *
+ *  - an empty gallery is a real no-match: the driver reports NULL and completes without an error,
+ *    and writes no frame, so it never arms a capture for a gallery that cannot match;
+ *  - a gallery whose prints carry no record, or a record this driver cannot read, is the same
+ *    no-match rather than a data error: an unusable print is simply not a candidate;
+ *  - a gallery carrying the real record reaches the core, which writes the `0x66` capture arm and
+ *    fails on the sensor the fake does not answer, running its best-effort teardown.
+ *
+ * The matching identification itself needs wrapped replies the fake cannot fabricate without the
+ * session key; the Rust scripted tests cover the exact-print mapping and the hardware run confirms
+ * the sensor.
+ */
+static void
+check_identify (GType type)
+{
+  static const guint8 record[30] = {
+    'C', 'V', '3', 'P', 1, 1,
+    0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5,
+    0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5,
+    0x1f, 0x36, 0xf2, 0x00,
+  };
+  static const guint8 foreign[4] = { 'N', 'O', 'P', 'E' };
+  FpDevice *device = g_object_new (type, NULL);
+  GUsbDevice *usb = g_object_new (G_USB_TYPE_DEVICE, NULL);
+  GTypeClass *base_class = g_type_class_ref (FP_TYPE_DEVICE);
+  gint private_offset = g_type_class_get_instance_private_offset (base_class);
+  GError *error = NULL;
+  GPtrArray *gallery;
+  FpPrint *print;
+  FpPrint *match = NULL;
+  guint frames_after_open;
+  gboolean identified;
+
+  g_object_ref (usb);
+  *(GUsbDevice **) ((char *) device + private_offset + 8) = usb;
+  g_type_class_unref (base_class);
+
+  fake_gusb_plan_verify ();
+  check (fp_device_open_sync (device, NULL, &error),
+         "the open before an identification succeeds (got error `%s`)",
+         error ? error->message : "-");
+  g_clear_error (&error);
+  frames_after_open = fake_gusb_out_count ();
+
+  /* An empty gallery: libfprint accepts an empty match, and the driver sends nothing. */
+  gallery = g_ptr_array_new_with_free_func (g_object_unref);
+  identified = fp_device_identify_sync (device, gallery, NULL, NULL, NULL, &match, NULL, &error);
+  check (identified, "an empty gallery completes successfully (got error `%s`)",
+         error ? error->message : "-");
+  check (error == NULL, "an empty gallery reports no error");
+  check (match == NULL, "an empty gallery yields no match");
+  check (fake_gusb_out_count () == frames_after_open,
+         "an empty gallery wrote no frame (got %u, expected %u)",
+         fake_gusb_out_count (), frames_after_open);
+  g_clear_object (&match);
+  g_clear_error (&error);
+  g_ptr_array_unref (gallery);
+
+  /* Prints with no record and with foreign bytes: no candidate, no match, no frames. */
+  gallery = g_ptr_array_new_with_free_func (g_object_unref);
+  g_ptr_array_add (gallery, fp_print_new (device));
+  print = fp_print_new (device);
+  g_object_set (print, "fpi-type", FPI_PRINT_RAW, NULL);
+  g_object_set (print, "fpi-data",
+                g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, foreign, sizeof foreign, 1),
+                NULL);
+  g_ptr_array_add (gallery, print);
+
+  identified = fp_device_identify_sync (device, gallery, NULL, NULL, NULL, &match, NULL, &error);
+  check (identified, "a gallery with no usable record completes successfully (got error `%s`)",
+         error ? error->message : "-");
+  check (error == NULL, "an unusable gallery is a no-match, not a data error");
+  check (match == NULL, "an unusable gallery yields no match");
+  check (fake_gusb_out_count () == frames_after_open,
+         "an unusable gallery wrote no frame (got %u)", fake_gusb_out_count ());
+  g_clear_object (&match);
+  g_clear_error (&error);
+  g_ptr_array_unref (gallery);
+
+  /* The real record reaches the core: the 0x66 arm reaches the unanswered sensor. */
+  print = fp_print_new (device);
+  g_object_set (print, "fpi-type", FPI_PRINT_RAW, NULL);
+  g_object_set (print, "fpi-data",
+                g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, record, sizeof record, 1),
+                NULL);
+  gallery = g_ptr_array_new_with_free_func (g_object_unref);
+  g_ptr_array_add (gallery, print);
+
+  identified = fp_device_identify_sync (device, gallery, NULL, NULL, NULL, &match, NULL, &error);
+  check (!identified, "an identification the sensor does not answer fails");
+  check (error != NULL && error->domain == FP_DEVICE_ERROR,
+         "the failed identification fails in the fp-device domain (got `%s`)",
+         error ? g_quark_to_string (error->domain) : "-");
+  check (error != NULL && g_strstr_len (error->message, -1, "identification failed") != NULL,
+         "the failed identification says it was the identification (got `%s`)",
+         error ? error->message : "-");
+  check (match == NULL, "a failed identification yields no match");
+  g_clear_object (&match);
+  g_clear_error (&error);
+  g_ptr_array_unref (gallery);
+
+  expect_commands ((const guint16[]) { 0x23, 0x24, 0x02, 0x66, 0x68, 0x04 }, 6,
+                   "the failed identification");
+  check (fake_gusb_is_open (), "the failed identification leaves the device open");
+  check (fake_gusb_interface_claimed (),
+         "the failed identification keeps interface 0 claimed");
+
+  check (fp_device_close_sync (device, NULL, &error),
+         "the device closes after a failed identification (got error `%s`)",
+         error ? error->message : "-");
+  g_clear_error (&error);
+  check (!fake_gusb_interface_claimed (),
+         "the close after a failed identification released interface 0");
+  check_command_submissions ("the failed identification");
+
+  g_object_unref (device);
+  g_object_unref (usb);
+}
+
 /* The bound record is stored as a GVariant of type `ay` under `fpi-data`, with `fpi-type` RAW.
  * Pin that this libfprint round-trips it through fp_print_serialize/fp_print_deserialize: the
  * driver's success path relies on exactly this representation, which no Rust test can check. */
@@ -664,6 +792,7 @@ main (int argc, char **argv)
   check_session (type);
   check_enrol_failure (type);
   check_verify (type);
+  check_identify (type);
   check_print_payload_round_trip (type);
   check_vanished_device (type);
   check_close_transfer_failure (type);

@@ -22,7 +22,9 @@
 //! the stages to report to `fpi_device_enroll_progress`, and [`cv3_tod_take_payload`] hands it the
 //! bound print record once the enrolment has succeeded. Verification takes the opposite direction:
 //! [`cv3_tod_verify_start`] receives the `fpi-data` bytes C read off the `FpPrint`, and Rust decodes
-//! the record and decides which match id to ask about.
+//! the record and decides which match id to ask about. Identification does the same for a whole
+//! gallery: [`cv3_tod_identify_start`] receives one entry per print (bytes and gallery position),
+//! and [`cv3_tod_take_match`] hands back the position Rust matched so C can report that exact print.
 
 use std::ptr;
 
@@ -125,6 +127,24 @@ pub struct Cv3Action {
 
 const _: () = assert!(std::mem::size_of::<Cv3Action>() == 296);
 const _: () = assert!(std::mem::offset_of!(Cv3Action, message) == 40);
+
+/// One print of an identification gallery, as `libfprint` handed it to the shim.
+///
+/// `data` points at the print's `fpi-data` bytes and `length` is their length; both are borrowed for
+/// the duration of [`cv3_tod_identify_start`], which decodes them synchronously. `index` is the
+/// print's position in libfprint's gallery, which is what the shim needs back to report the exact
+/// `FpPrint`. The C compiler checks the same size and offsets in `shim/cv3_tod.h`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Cv3GalleryEntry {
+    pub data: *const u8,
+    pub length: usize,
+    pub index: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<Cv3GalleryEntry>() == 24);
+const _: () = assert!(std::mem::offset_of!(Cv3GalleryEntry, length) == 8);
+const _: () = assert!(std::mem::offset_of!(Cv3GalleryEntry, index) == 16);
 
 /// One device's protocol state. Opaque to C.
 pub struct Cv3Tod {
@@ -507,6 +527,73 @@ pub unsafe extern "C" fn cv3_tod_verify_start(
     session.publish(step)
 }
 
+/// Starts an identification over the gallery `libfprint` supplied.
+///
+/// Each entry carries one print's gallery position and the bytes of its `fpi-data`; an entry with no
+/// bytes is a print without a record. Rust decodes every payload, keeps the usable bound prints and
+/// sends one `0x2F` naming their handles. A gallery with nothing usable finishes as a no-match
+/// without a transfer. The bytes are read synchronously and no pointer is kept.
+///
+/// # Safety
+///
+/// `tod` must be null or a live pointer from [`cv3_tod_create`]; `entries` must be null or point to
+/// `count` `Cv3GalleryEntry` values, and each non-null `data` must point to its `length` readable
+/// bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cv3_tod_identify_start(
+    tod: *mut Cv3Tod,
+    entries: *const Cv3GalleryEntry,
+    count: usize,
+) -> Cv3Action {
+    // SAFETY: the caller guarantees `tod` is live; `as_mut` is null safe.
+    let Some(session) = (unsafe { tod.as_mut() }) else {
+        return Cv3Action::error("cv3: the plugin session was not created");
+    };
+    // SAFETY: the caller guarantees `entries` points to `count` entries (or is null, which maps to
+    // an empty gallery; `from_raw_parts` is not called for a null pointer).
+    let entries: &[Cv3GalleryEntry] = if entries.is_null() || count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(entries, count) }
+    };
+    let gallery: Vec<(usize, &[u8])> = entries
+        .iter()
+        .map(|entry| {
+            let payload = if entry.data.is_null() || entry.length == 0 {
+                &[]
+            } else {
+                // SAFETY: the caller guarantees each entry's data is readable for its length.
+                unsafe { std::slice::from_raw_parts(entry.data, entry.length) }
+            };
+            (entry.index as usize, payload)
+        })
+        .collect();
+    let step = session.plugin.identify_start(&gallery);
+    session.publish(step)
+}
+
+/// Takes the gallery position of the last identification's match, once.
+///
+/// Returns `-1` when there was no match (or no identification ran), which the shim reports as a
+/// no-match. On a match the position indexes the gallery the shim handed to
+/// [`cv3_tod_identify_start`], so the shim can report that exact `FpPrint` to libfprint.
+///
+/// # Safety
+///
+/// `tod` must be null or a live pointer from [`cv3_tod_create`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cv3_tod_take_match(tod: *mut Cv3Tod) -> i64 {
+    // SAFETY: the caller guarantees `tod` is live; `as_mut` is null safe.
+    let Some(session) = (unsafe { tod.as_mut() }) else {
+        return -1;
+    };
+    session
+        .plugin
+        .take_match()
+        .and_then(|index| i64::try_from(index).ok())
+        .unwrap_or(-1)
+}
+
 /// Takes the next progress report for `fpi_device_enroll_progress`.
 ///
 /// Returns `0` when there is nothing to report, `1` for a completed stage and `2` for a rejected
@@ -580,6 +667,27 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Cv3Action, status), 32);
         assert_eq!(std::mem::offset_of!(Cv3Action, error_code), 36);
         assert_eq!(std::mem::offset_of!(Cv3Action, message), 40);
+    }
+
+    #[test]
+    fn the_gallery_entry_layout_is_the_one_the_shim_static_asserts() {
+        assert_eq!(std::mem::size_of::<Cv3GalleryEntry>(), 24);
+        assert_eq!(std::mem::offset_of!(Cv3GalleryEntry, data), 0);
+        assert_eq!(std::mem::offset_of!(Cv3GalleryEntry, length), 8);
+        assert_eq!(std::mem::offset_of!(Cv3GalleryEntry, index), 16);
+    }
+
+    #[test]
+    fn an_identify_start_or_match_take_without_a_session_is_an_error_not_a_panic() {
+        let mut session = Cv3Tod::new();
+        // SAFETY: `session` is live; a NULL entries pointer with zero count is explicitly allowed.
+        let action = unsafe { cv3_tod_identify_start(&mut session, ptr::null(), 0) };
+        assert_eq!(action.kind, ActionKind::Finish as u32);
+        assert_eq!(action.error_code, OutcomeKind::General as i32);
+        // SAFETY: `session` is live.
+        assert_eq!(unsafe { cv3_tod_take_match(&mut session) }, -1);
+        // SAFETY: a NULL state is explicitly allowed and reports no match.
+        assert_eq!(unsafe { cv3_tod_take_match(ptr::null_mut()) }, -1);
     }
 
     #[test]

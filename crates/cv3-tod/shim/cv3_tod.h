@@ -86,6 +86,23 @@ _Static_assert (G_STRUCT_OFFSET (Cv3Action, cancellable) == 7,
 _Static_assert (G_STRUCT_OFFSET (Cv3Action, message) == 40,
                 "Cv3Action.message must stay at offset 40");
 
+/* One print of an identification gallery. `data` is the print's `fpi-data`, borrowed for the
+ * duration of cv3_tod_identify_start (which decodes it synchronously); `index` is its position in
+ * libfprint's gallery, which the shim needs to report the exact FpPrint. */
+typedef struct
+{
+  const guint8 *data;
+  gsize         length;
+  guint32       index;
+} Cv3GalleryEntry;
+
+_Static_assert (sizeof (Cv3GalleryEntry) == 24,
+                "Cv3GalleryEntry must match cv3-tod's #[repr(C)] layout");
+_Static_assert (G_STRUCT_OFFSET (Cv3GalleryEntry, length) == 8,
+                "Cv3GalleryEntry.length must stay at offset 8");
+_Static_assert (G_STRUCT_OFFSET (Cv3GalleryEntry, index) == 16,
+                "Cv3GalleryEntry.index must stay at offset 16");
+
 Cv3Tod *cv3_tod_create (void);
 void cv3_tod_destroy (Cv3Tod *tod);
 Cv3Action cv3_tod_open_start (Cv3Tod *tod);
@@ -99,3 +116,7 @@ Cv3Action cv3_tod_enrol_start (Cv3Tod *tod);
 gint32 cv3_tod_take_progress (Cv3Tod *tod, gint32 *completed);
 gsize cv3_tod_take_payload (Cv3Tod *tod, guint8 *destination, gsize capacity);
 Cv3Action cv3_tod_verify_start (Cv3Tod *tod, const guint8 *payload, gsize length);
+Cv3Action cv3_tod_identify_start (Cv3Tod *tod,
+                                  const Cv3GalleryEntry *entries,
+                                  gsize count);
+gint64 cv3_tod_take_match (Cv3Tod *tod);

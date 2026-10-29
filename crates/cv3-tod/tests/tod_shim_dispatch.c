@@ -20,7 +20,9 @@
  *    produced by the `on_transfer` callback;
  *  - a cancelled finger wait completes the action with G_IO_ERROR_CANCELLED and never delivers a
  *    match callback (no no-match and no retry verdict);
- *  - the shim clears its `verifying` flag, so the next operation reaches the vfunc again.
+ *  - the shim clears its `verifying` flag, so the next operation reaches the vfunc again;
+ *  - a stubbed identification that reports gallery position 1 hands back the exact FpPrint at that
+ *    position, and a stubbed no-match hands back NULL with no error.
  *
  * The Rust plugin's part — the `0x68`/`0x04` teardown before the finish, no stored print and a
  * fresh open afterwards — is covered by the scripted tests in plugin.rs. What neither can show is
@@ -67,6 +69,9 @@ static int verify_starts;
 static int transfer_results;
 static int enrol_starts;
 static int enrol_results;
+static int identify_starts;
+/* The gallery position the stubbed identification reports, or -1 for a no-match. */
+static int identify_match_index = -1;
 static gboolean in_enrol;
 static guint8 command_buffer[16];
 static guint8 finger_buffer[64];
@@ -81,6 +86,8 @@ reset_stub (void)
   transfer_results = 0;
   enrol_starts = 0;
   enrol_results = 0;
+  identify_starts = 0;
+  identify_match_index = -1;
   in_enrol = FALSE;
   finish_after_wait_is_ok = FALSE;
 }
@@ -172,6 +179,27 @@ cv3_tod_take_payload (Cv3Tod *tod, guint8 *destination, gsize capacity)
   (void) destination;
   (void) capacity;
   return 0;
+}
+
+Cv3Action
+cv3_tod_identify_start (Cv3Tod *tod, const Cv3GalleryEntry *entries, gsize count)
+{
+  (void) tod;
+  (void) entries;
+  (void) count;
+
+  identify_starts++;
+  if (identify_match_index >= 0)
+    return finish_action (CV3_FINISH_OK, "");
+  return finish_action (CV3_FINISH_NO_MATCH, "cv3: no print in the gallery matched");
+}
+
+gint64
+cv3_tod_take_match (Cv3Tod *tod)
+{
+  (void) tod;
+
+  return identify_match_index;
 }
 
 static Cv3Action
@@ -479,6 +507,80 @@ check_cancelled_enrolment (GType type)
   g_object_unref (usb);
 }
 
+/* A match the stubbed boundary reports must be handed back as the exact FpPrint libfprint put in
+ * the gallery, and no-match must be a NULL match with no error. This is the C half of the
+ * identify report: the Rust tests decide which index matched, this check proves the shim turns that
+ * index into the gallery pointer libfprint accepts. */
+static void
+check_identify_reports_the_exact_gallery_print (GType type)
+{
+  FpDevice *device = g_object_new (type, NULL);
+  GUsbDevice *usb = g_object_new (G_USB_TYPE_DEVICE, NULL);
+  GTypeClass *base_class = g_type_class_ref (FP_TYPE_DEVICE);
+  gint private_offset = g_type_class_get_instance_private_offset (base_class);
+  GError *error = NULL;
+  GPtrArray *gallery;
+  FpPrint *first;
+  FpPrint *second;
+  FpPrint *matched = NULL;
+  int match_calls = 0;
+  gboolean identified;
+
+  g_object_ref (usb);
+  *(GUsbDevice **) ((char *) device + private_offset + 8) = usb;
+  g_type_class_unref (base_class);
+
+  reset_stub ();
+  identify_match_index = 1;
+  fake_gusb_plan_dispatch (NULL);
+  check (fp_device_open_sync (device, NULL, &error),
+         "the open before a stubbed identification succeeds (got error `%s`)",
+         error ? error->message : "-");
+  g_clear_error (&error);
+
+  first = fp_print_new (device);
+  second = fp_print_new (device);
+  gallery = g_ptr_array_new_with_free_func (g_object_unref);
+  g_ptr_array_add (gallery, first);
+  g_ptr_array_add (gallery, second);
+
+  identified = fp_device_identify_sync (device, gallery, NULL, match_cb, &match_calls,
+                                        &matched, NULL, &error);
+  check (identified, "a stubbed match identifies successfully (got error `%s`)",
+         error ? error->message : "-");
+  check (error == NULL, "a stubbed match reports no error");
+  check (matched == second,
+         "the reported match is the exact gallery print at the returned index");
+  check (match_calls == 1, "the match callback ran once (got %d)", match_calls);
+  check (identify_starts == 1, "the identify vfunc ran once (got %d)", identify_starts);
+  g_clear_object (&matched);
+  g_clear_error (&error);
+
+  /* No match: NULL and no error, which libfprint accepts as an empty result. */
+  identify_match_index = -1;
+  match_calls = 0;
+  identified = fp_device_identify_sync (device, gallery, NULL, match_cb, &match_calls,
+                                        &matched, NULL, &error);
+  check (identified, "a stubbed no-match completes successfully (got error `%s`)",
+         error ? error->message : "-");
+  check (error == NULL, "a stubbed no-match reports no error");
+  check (matched == NULL, "a stubbed no-match yields no print");
+  check (match_calls == 1, "the no-match reaches the callback once (got %d)", match_calls);
+  check (identify_starts == 2, "the identify vfunc ran twice (got %d)", identify_starts);
+  g_clear_object (&matched);
+  g_clear_error (&error);
+
+  g_ptr_array_unref (gallery);
+
+  check (fp_device_close_sync (device, NULL, &error),
+         "the device closes after the stubbed identifications (got error `%s`)",
+         error ? error->message : "-");
+  g_clear_error (&error);
+
+  g_object_unref (device);
+  g_object_unref (usb);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -507,6 +609,7 @@ main (int argc, char **argv)
   check_cancelled_verify (type, klass);
   check_cancelled_match_is_not_reported (type);
   check_cancelled_enrolment (type);
+  check_identify_reports_the_exact_gallery_print (type);
   g_type_class_unref (klass);
   g_module_close (module);
 

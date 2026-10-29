@@ -335,6 +335,15 @@ impl Match {
         self
     }
 
+    /// Adds every handle of an identification gallery to the request's type-2 array.
+    ///
+    /// [`crate::identify::Identify`] uses this so one request carries the whole candidate list;
+    /// the appended handles follow any already added here, in iteration order.
+    pub fn with_template_handles(mut self, handles: impl IntoIterator<Item = u32>) -> Self {
+        self.handles.extend(handles);
+        self
+    }
+
     /// Adds the optional `(3, 20, hash)` entry to the request.
     ///
     /// `None` omits the entry entirely, which is what the vendor builds when it has no hash
@@ -629,6 +638,15 @@ impl Verify {
     /// Adds one `u32` template handle to the composed [`Match`] request. Repeatable.
     pub fn with_template_handle(mut self, handle: u32) -> Self {
         self.handles.push(handle);
+        self
+    }
+
+    /// Adds every handle of an identification gallery to the composed [`Match`] request.
+    ///
+    /// One request carries the whole candidate list, which is what
+    /// [`crate::identify::Identify`] needs from a single capture.
+    pub fn with_template_handles(mut self, handles: impl IntoIterator<Item = u32>) -> Self {
+        self.handles.extend(handles);
         self
     }
 

@@ -12,7 +12,8 @@
  * transfer submitted with libfprint's cancellable; command transfers never are. Buffers always
  * belong to Rust; this file only passes them to fpi_usb_transfer_fill_*_full with a NULL free
  * function. Enrolment progress and the bound print record are taken through two small accessors,
- * and verification hands Rust the print's stored bytes as a pointer and a length, so no protocol
+ * verification hands Rust the print's stored bytes as a pointer and a length, and identification
+ * hands Rust the gallery's byte arrays with their gallery positions; Rust decodes both. No protocol
  * length or stage arithmetic lives here.
  */
 #include "drivers_api.h"
@@ -36,8 +37,11 @@ typedef struct _FpiDeviceCv3
   gboolean closing;
   gboolean enrolling;
   gboolean verifying;
+  gboolean identifying;
   /* The template print libfprint handed to the enroll vfunc; borrowed for the action only. */
   FpPrint *enroll_print;
+  /* The gallery libfprint handed to the identify vfunc, ref'd until the completion reports it. */
+  GPtrArray *identify_prints;
 } FpiDeviceCv3;
 
 typedef struct _FpiDeviceCv3Class
@@ -65,8 +69,8 @@ cv3_tod_probe (FpDevice *device)
   /* Nothing to discover that the class does not already declare, and this probe does not touch
    * USB. Enrolment needs no feature bit in this ABI: libfprint 1.95 has no
    * FP_DEVICE_FEATURE_ENROLL, so `fprintd` gates EnrollStart on the non-zero
-   * fp_device_get_nr_enroll_stages() the class sets from the core. Verification is the class's
-   * one feature bit. The probe therefore withdraws nothing. */
+   * fp_device_get_nr_enroll_stages() the class sets from the core. Verification and identification
+   * are the class's feature bits. The probe therefore withdraws nothing. */
   fpi_device_probe_complete (device, NULL, CV3_TOD_DEVICE_NAME, NULL);
 }
 
@@ -176,6 +180,13 @@ cv3_tod_release_interface (FpDevice *device)
   self->interface_claimed = FALSE;
 }
 
+/* Drops the reference the identify vfunc took on libfprint's gallery. */
+static void
+cv3_tod_clear_gallery (FpiDeviceCv3 *self)
+{
+  g_clear_pointer (&self->identify_prints, g_ptr_array_unref);
+}
+
 /* Ends a failed open: no capture can be pending, so nothing is cancelled. The interface and the
  * GUsb handle are released and the Rust state destroyed, so the next Claim starts clean and the
  * sensor has no handle left. */
@@ -188,6 +199,7 @@ cv3_tod_open_failed (FpDevice *device, gint32 kind, const gchar *message)
 
   self->opening = FALSE;
   cv3_tod_release_interface (device);
+  cv3_tod_clear_gallery (self);
 
   /* fpi_device_open_complete does not close the handle libfprint opened before the vfunc, and
    * fprintd does not close a device whose open failed; leaving it open makes every later Claim
@@ -213,6 +225,7 @@ cv3_tod_close_finished (FpDevice *device)
 
   self->closing = FALSE;
   cv3_tod_release_interface (device);
+  cv3_tod_clear_gallery (self);
 
   if (self->tod != NULL)
     {
@@ -271,6 +284,58 @@ cv3_tod_verify_finished (FpDevice *device, const Cv3Action *action)
     }
 
   fpi_device_verify_complete (device, error);
+}
+
+/* Ends an identification: reports the gallery print that matched, or an empty match.
+ *
+ * libfprint refs the reported print and checks that it is in the gallery it owns, so this passes the
+ * exact FpPrint at the index Rust returned — never a copy and never an invented print. A no-match
+ * reports NULL and completes without an error; an empty or unusable gallery takes the same path,
+ * because Rust sent no command at all. A retry is reported through identify_report with a retry
+ * error, which is libfprint's retry shape; a cancellation reports no verdict and completes with an
+ * error; every other finish is a device error.
+ */
+static void
+cv3_tod_identify_finished (FpDevice *device, const Cv3Action *action)
+{
+  FpiDeviceCv3 *self = CV3_TOD_DEVICE (device);
+  GError *error = NULL;
+  FpPrint *match = NULL;
+
+  switch (action->error_code)
+    {
+    case CV3_FINISH_OK:
+      {
+        gint64 index = self->tod != NULL ? cv3_tod_take_match (self->tod) : -1;
+
+        if (index >= 0 && self->identify_prints != NULL
+            && (guint64) index < self->identify_prints->len)
+          match = g_ptr_array_index (self->identify_prints, (guint) index);
+        else
+          g_warning ("cv3: identification finished without naming a gallery print");
+        /* Without an index this is a no-match, never some other gallery print. */
+        fpi_device_identify_report (device, match, NULL, NULL);
+      }
+      break;
+    case CV3_FINISH_NO_MATCH:
+      fpi_device_identify_report (device, NULL, NULL, NULL);
+      break;
+    case CV3_FINISH_RETRY:
+      fpi_device_identify_report (
+        device, NULL, NULL,
+        fpi_device_retry_new_msg (FP_DEVICE_RETRY_GENERAL, "%s", action->message));
+      break;
+    case CV3_FINISH_CANCELLED:
+      /* No report: a cancellation is not a verdict. libfprint's task is already cancelled. */
+      error = fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL, "%s", action->message);
+      break;
+    default:
+      error = fpi_device_error_new_msg (cv3_tod_error_for (action->error_code), "%s",
+                                        action->message);
+      break;
+    }
+
+  fpi_device_identify_complete (device, error);
 }
 
 static void
@@ -494,6 +559,26 @@ cv3_tod_dispatch (FpDevice *device, Cv3Action action)
             }
           cv3_tod_verify_finished (device, &action);
         }
+      else if (self->identifying)
+        {
+          self->identifying = FALSE;
+          /* A cancellation that landed during a non-cancellable command (or just after the core
+           * finished) must not become a matching print: complete with the cancellation and no
+           * report. The core's own cancelled outcome takes the same path. */
+          if (cv3_tod_action_cancelled (device)
+              && action.error_code != CV3_FINISH_CANCELLED)
+            {
+              cv3_tod_clear_gallery (self);
+              fpi_device_identify_complete (
+                device,
+                fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                          "cv3: the identification was cancelled"));
+              return;
+            }
+          cv3_tod_identify_finished (device, &action);
+          cv3_tod_clear_gallery (self);
+          return;
+        }
       else if (self->closing)
         {
           /* A close is best effort: a failed 0x04 is logged, then the interface and handle are
@@ -528,6 +613,15 @@ cv3_tod_dispatch (FpDevice *device, Cv3Action action)
         {
           self->verifying = FALSE;
           fpi_device_verify_complete (
+            device,
+            fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                      "cv3: a transfer action carried no buffer"));
+        }
+      else if (self->identifying)
+        {
+          self->identifying = FALSE;
+          cv3_tod_clear_gallery (self);
+          fpi_device_identify_complete (
             device,
             fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
                                       "cv3: a transfer action carried no buffer"));
@@ -579,6 +673,15 @@ cv3_tod_dispatch (FpDevice *device, Cv3Action action)
         {
           self->verifying = FALSE;
           fpi_device_verify_complete (
+            device,
+            fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                      "cv3: the core returned an unknown action"));
+        }
+      else if (self->identifying)
+        {
+          self->identifying = FALSE;
+          cv3_tod_clear_gallery (self);
+          fpi_device_identify_complete (
             device,
             fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
                                       "cv3: the core returned an unknown action"));
@@ -646,7 +749,9 @@ cv3_tod_open (FpDevice *device)
   self->closing = FALSE;
   self->enrolling = FALSE;
   self->verifying = FALSE;
+  self->identifying = FALSE;
   self->enroll_print = NULL;
+  cv3_tod_clear_gallery (self);
   if (self->tod != NULL)
     cv3_tod_destroy (self->tod);
   self->tod = cv3_tod_create ();
@@ -662,7 +767,9 @@ cv3_tod_close (FpDevice *device)
   self->closing = TRUE;
   self->enrolling = FALSE;
   self->verifying = FALSE;
+  self->identifying = FALSE;
   self->enroll_print = NULL;
+  cv3_tod_clear_gallery (self);
 
   if (self->tod == NULL)
     {
@@ -776,6 +883,79 @@ cv3_tod_verify (FpDevice *device)
   g_variant_unref (data);
 }
 
+/* One identification over the gallery fprintd supplies.
+ *
+ * libfprint's identify call hands a non-NULL GPtrArray of FpPrint (possibly empty). This reads each
+ * print's `fpi-data` the way verify does, but does not interpret it: it builds one (bytes, length,
+ * gallery index) entry per print and hands the array to Rust, which decodes the records, decides
+ * which prints can be matched and builds one `0x2F` with their handles. A print with no `fpi-data`,
+ * or one whose `fpi-data` is not a byte array, is passed as an empty entry and is simply not a
+ * candidate.
+ *
+ * The gallery is ref'd until the completion because the report must name the exact FpPrint
+ * libfprint put in it; libfprint checks that identity and drops a match that is not in the gallery.
+ * Identification never opens or closes the session and never reads the sensor's inventory.
+ */
+static void
+cv3_tod_identify (FpDevice *device)
+{
+  FpiDeviceCv3 *self = CV3_TOD_DEVICE (device);
+  GPtrArray *prints = NULL;
+  GPtrArray *variants;
+  GArray *entries;
+  guint count;
+
+  if (self->tod == NULL || self->opening || self->closing || self->enrolling
+      || self->verifying || self->identifying)
+    {
+      fpi_device_identify_complete (
+        device, fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_OPEN,
+                                          "cv3: the sensor session is not open"));
+      return;
+    }
+
+  fpi_device_get_identify_data (device, &prints);
+  cv3_tod_clear_gallery (self);
+  if (prints != NULL)
+    self->identify_prints = g_ptr_array_ref (prints);
+
+  entries = g_array_new (FALSE, FALSE, sizeof (Cv3GalleryEntry));
+  /* Both arrays keep the payload bytes alive until Rust has read them: the gallery ref keeps the
+   * prints (and so their `fpi-data` properties), and the variant refs cover the window of this
+   * call explicitly. Rust decodes the bytes synchronously and keeps no pointer. */
+  variants = g_ptr_array_new_with_free_func ((GDestroyNotify) g_variant_unref);
+
+  count = prints != NULL ? prints->len : 0;
+  for (guint i = 0; i < count; i++)
+    {
+      FpPrint *print = g_ptr_array_index (prints, i);
+      Cv3GalleryEntry entry = { .data = NULL, .length = 0, .index = i };
+      GVariant *data = NULL;
+
+      g_object_get (print, "fpi-data", &data, NULL);
+      if (data != NULL && g_variant_is_of_type (data, G_VARIANT_TYPE ("ay")))
+        {
+          gsize length = 0;
+
+          entry.data = g_variant_get_fixed_array (data, &length, 1);
+          entry.length = length;
+          g_ptr_array_add (variants, data);
+        }
+      else if (data != NULL)
+        {
+          g_variant_unref (data);
+        }
+      g_array_append_val (entries, entry);
+    }
+
+  self->identifying = TRUE;
+  cv3_tod_dispatch (device, cv3_tod_identify_start (
+                      self->tod, (const Cv3GalleryEntry *) entries->data,
+                      (gsize) entries->len));
+  g_ptr_array_unref (variants);
+  g_array_unref (entries);
+}
+
 static void
 cv3_tod_shim_class_init (FpiDeviceCv3Class *klass)
 {
@@ -786,12 +966,14 @@ cv3_tod_shim_class_init (FpiDeviceCv3Class *klass)
   device_class->type = FP_DEVICE_TYPE_USB;
   device_class->id_table = cv3_tod_id_table;
   device_class->scan_type = FP_SCAN_TYPE_PRESS;
-  /* Exactly the features this driver implements. libfprint 1.95 requires a class to advertise
-   * something and has no ENROLL flag, so enrolment rides on nr_enroll_stages below and VERIFY is
-   * the one bit here. This driver cannot capture an image, identify against several prints, or
-   * list, delete and clear the sensor's store, so those bits stay clear and the matching vfuncs
-   * stay NULL. */
-  device_class->features = FP_DEVICE_FEATURE_VERIFY;
+  /* Exactly the features this driver implements: VERIFY and IDENTIFY. libfprint 1.95 requires a
+   * class to advertise something and has no ENROLL flag, so enrolment rides on nr_enroll_stages
+   * below. The feature mask is static and there is no per-gallery bit, so IDENTIFY is declared
+   * unconditionally; the vfunc itself returns no match for an empty or unusable gallery, which is
+   * the honest reading of "identification is declared whenever prints are bound" in this ABI. This
+   * driver still cannot capture an image or list, delete and clear the sensor's store, so those
+   * bits stay clear and the matching vfuncs stay NULL. */
+  device_class->features = FP_DEVICE_FEATURE_VERIFY | FP_DEVICE_FEATURE_IDENTIFY;
   /* Up to twelve accepted samples plus the confirmation touch; the sensor may complete early. The
    * number comes from the core, so the class and the progress reports cannot disagree. */
   device_class->nr_enroll_stages = cv3_tod_enrol_stages ();
@@ -803,6 +985,7 @@ cv3_tod_shim_class_init (FpiDeviceCv3Class *klass)
   device_class->close = cv3_tod_close;
   device_class->enroll = cv3_tod_enroll;
   device_class->verify = cv3_tod_verify;
+  device_class->identify = cv3_tod_identify;
   /* No cancel vfunc: libfprint cancels the action's GCancellable itself, and the finger wait is
    * the only transfer submitted with it. Adding one here would be a second cancellation source
    * racing that cancellable; the class harness pins this NULL. */
@@ -818,5 +1001,7 @@ cv3_tod_shim_init (FpiDeviceCv3 *self)
   self->closing = FALSE;
   self->enrolling = FALSE;
   self->verifying = FALSE;
+  self->identifying = FALSE;
   self->enroll_print = NULL;
+  self->identify_prints = NULL;
 }

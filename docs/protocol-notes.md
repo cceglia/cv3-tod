@@ -203,6 +203,14 @@ The plaintext is the TLV plus the 32-byte token, rounded up to a whole AES block
 one more block. The type-2 entry is always present, with size zero when no handle is named; what a
 zero-size entry asks the sensor to do is not established and the next hardware run measures it.
 
+**A multi-handle array is the identification request, and is not yet measured.** The vendor passes
+`count` handles, and this driver's identification sends one entry with every bound print's handle;
+only one-handle requests have been measured on this sensor (2026-10-29). That the sensor matches
+against all of them and returns one of them is what the ticket-20 hardware harness
+(`scripts/identify-hardware.sh`) is meant to establish. The request shape itself is the same
+`0x2F` with attr `0x47`; identification never sends the attr-`0x42` inventory query and does not
+depend on its reply.
+
 **The CV2 values in this driver were wrong for CV3.** `0x148` and `0x7b0ad3` do not occur in the
 blob as constants at all; they came from the audited reference, which targets ControlVault 2, and
 `0x53e2` occurs exactly once, as the argument above. `crates/cv3-core/src/verify.rs` now builds
