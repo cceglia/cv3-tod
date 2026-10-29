@@ -13,6 +13,10 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # crates/cv3-tod is a workspace member: its C shim needs the distribution's TOD headers,
+      # pkg-config and a C compiler. The core and the probe build without them.
+      - name: TOD plugin build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfprint-2-tod-dev pkg-config
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Clippy

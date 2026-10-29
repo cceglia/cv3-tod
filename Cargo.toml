@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/cv3-core", "crates/cv3-probe"]
+members = ["crates/cv3-core", "crates/cv3-probe", "crates/cv3-tod"]
+# The TOD plugin needs the distribution's libfprint TOD headers, so it stays out of the default
+# build: `cargo build` and `cargo test` work on a machine without them, `-p cv3-tod` and
+# `--workspace` need `libfprint-2-tod-dev`.
+default-members = ["crates/cv3-core", "crates/cv3-probe"]
 
 [workspace.package]
 version = "0.1.0"

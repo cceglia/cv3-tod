@@ -1,0 +1,17 @@
+[package]
+name = "cv3-tod"
+description = "libfprint TOD plugin for the ControlVault 3 sensor: a GObject shim over the Rust core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "cv3_tod"
+crate-type = ["cdylib"]
+
+[build-dependencies]
+cc = "=1.10.0"
+
+[dependencies]
+cv3-core = { path = "../cv3-core" }

@@ -1,14 +1,14 @@
 # controlvault3
 
 A Linux driver project for the Dell/Broadcom **ControlVault 3** fingerprint sensor (BCM58200, USB
-`0a5c:5843`): a Rust protocol core and probe, with a thin C shim planned for the libfprint TOD
-interface.
+`0a5c:5843`): a Rust protocol core and probe, with a thin C shim for the libfprint TOD interface.
 
-Status: protocol probe. The Rust core speaks the sensor's ECDH handshake and secure session and
-performs capture, enrolment and verification; `cvctl` drives it against the sensor directly. Still
-missing: the libfprint TOD plugin (`crates/cv3-tod`, not built yet), binding a match to the print
-that was enrolled (ticket 10), and the template inventory with list and delete. Until those land
-this is a probe, not a login driver.
+Status: protocol probe plus an enumeration-only libfprint TOD plugin. The Rust core speaks the
+sensor's ECDH handshake and secure session and performs capture, enrolment and verification;
+`cvctl` drives it against the sensor directly. `crates/cv3-tod` makes the sensor appear to
+`fprintd` as a reader but opens no session yet. Still missing: the plugin's session and operations,
+binding a match to the print that was enrolled (ticket 10), and the template inventory with list
+and delete. Until those land this is a probe, not a login driver.
 
 ## What the probe can do
 
@@ -31,7 +31,7 @@ this is a probe, not a login driver.
 |---|---|
 | `crates/cv3-core` | Protocol core. Performs no I/O: events in, actions out. |
 | `crates/cv3-probe` | `cvctl`, the probe used to establish protocol facts on hardware. |
-| `crates/cv3-tod` | The libfprint TOD plugin: the C shim plus the Rust core it drives. Not built yet. |
+| `crates/cv3-tod` | The libfprint TOD plugin: the C shim plus the Rust crate, enumeration only. |
 | `docs/adr/` | Why the shape is what it is. |
 | `docs/agents/` | Issue tracker, triage and domain-doc conventions for agents. |
 | `GLOSSARY.md` | The project's vocabulary. Read it before naming anything. |
@@ -55,17 +55,53 @@ the session's key material, which the SPEC forbids.
 ## Building
 
 ```sh
-cargo test          # whole workspace; no hardware needed
+cargo test               # core and probe; no headers and no hardware needed
 cargo build --release
+cargo test --workspace   # adds the TOD plugin; needs libfprint-2-tod-dev
 ```
 
 The probe drives the sensor through the kernel's USB device nodes and therefore runs as root.
-`cv3-tod` additionally needs `libfprint-2-tod-dev`.
+`cv3-tod` additionally needs `libfprint-2-tod-dev` (headers), `pkg-config` and a C compiler; it is
+a workspace member but not a default one, so the core and the probe build without them.
 
 `./scripts/check-core.sh` mechanically checks that the core's direct dependencies are only the
 pinned crypto set and that its source contains no `unsafe`; the GitHub workflow runs it alongside
 formatting, clippy, the workspace tests, and `cargo-deny` for RustSec advisories and licences
 (`deny.toml`).
+
+## The TOD plugin
+
+`crates/cv3-tod` builds `libcv3_tod.so`, a libfprint TOD driver. At this milestone it only makes
+the sensor appear to `fprintd` as a reader: the class id is `cv3`, the full name names the
+Dell/Broadcom ControlVault 3, the id table matches `0a5c:5843`, the scan type is press, and the
+probe completes without touching USB. No session, enrol or verify exists yet and the device
+advertises no feature, so clients list the reader but offer it no operation.
+
+```sh
+./scripts/build-plugin.sh      # cargo build, then a check of the TOD symbol versions
+./scripts/install-plugin.sh    # build, then copy one .so into the TOD drivers directory
+./scripts/uninstall-plugin.sh  # delete that one file
+```
+
+Installing adds `/usr/lib/x86_64-linux-gnu/libfprint-2/tod-1/libfprint-2-tod-1-cv3.so` and
+nothing else: no `libfprint` or `fprintd` configuration is touched. Neither script runs `sudo`;
+without write access they print the exact command to run as root. Remove any other TOD driver
+that claims `0a5c:5843` first, since only one driver can own the reader; that is also a single
+file.
+
+`./scripts/check-tod-link.sh` (run by `build-plugin.sh`) inspects the built object with
+`readelf -sW` and fails when a `fpi_*` import is unversioned or binds a version older than the
+library's default. That is the trap where `fpi_ssm_new_full` silently binds the legacy 4-argument
+`@LIBFPRINT_TOD_1.0.0` thunk and crashes `fprintd` inside `fp_device_open`.
+
+Verify, after installing and restarting the daemon (`sudo systemctl restart fprintd`):
+
+```sh
+fprintd-list "$USER"    # reports the cv3 reader (with no prints enrolled)
+```
+
+Uninstall by deleting the one file (`./scripts/uninstall-plugin.sh`, or `sudo rm` with the path it
+prints) and restarting `fprintd`.
 
 ## `cvctl` exit codes
 
