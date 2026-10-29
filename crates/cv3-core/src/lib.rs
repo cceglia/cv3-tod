@@ -4,8 +4,8 @@
 //! transport should perform next, which keeps every parser and state machine testable against
 //! recorded frames and without hardware. See `docs/adr/0001-io-free-core-with-c-shim.md`.
 //!
-//! Two transports drive it: `cvctl`, the development probe, and the libfprint TOD plugin. Both
-//! implement [`Transport`] and share [`transport::run`].
+//! The probe drives it through [`Transport`] and [`transport::run`]; the libfprint plugin drives
+//! the same operations through `cv3-wire`'s step machine. Neither changes the core.
 //!
 //! An operation is one object with [`Operation::start`] and [`Operation::step`]; [`handshake`] is
 //! the first. Events and actions are [`Event`] and [`Action`]; the core's transport failure type

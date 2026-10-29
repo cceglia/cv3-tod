@@ -59,8 +59,8 @@ pub enum OutcomeKind {
     /// The finger never arrived. `libfprint` carries this as a retry, so `fprintd` says "retry"
     /// rather than "device error".
     Retry = 6,
-    /// The operation was cancelled. `libfprint`'s task is already cancelled; the shim reports that
-    /// no match was found and completes.
+    /// The operation was cancelled. `libfprint`'s task is already cancelled; the shim reports no
+    /// verdict, sends no match and completes with the cancellation.
     Cancelled = 7,
     /// The print's stored record is not one this driver can read.
     DataInvalid = 8,

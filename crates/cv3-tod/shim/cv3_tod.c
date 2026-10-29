@@ -341,6 +341,51 @@ cv3_tod_identify_finished (FpDevice *device, const Cv3Action *action)
 static void
 cv3_tod_dispatch (FpDevice *device, Cv3Action action);
 
+/* Ends whatever operation is in flight with `message` and `code`. Every state that can be running
+ * when an action cannot be performed uses this, so no path leaves a flag set and the client
+ * hanging. A close still completes successfully: it is best effort and has nothing to report. */
+static void
+cv3_tod_fail_current_operation (FpDevice *device, Cv3FinishKind kind, const gchar *message)
+{
+  FpiDeviceCv3 *self = CV3_TOD_DEVICE (device);
+
+  if (self->opening)
+    {
+      cv3_tod_open_failed (device, kind, message);
+    }
+  else if (self->enrolling)
+    {
+      self->enrolling = FALSE;
+      self->enroll_print = NULL;
+      fpi_device_enroll_complete (device, NULL,
+                                  fpi_device_error_new_msg (cv3_tod_error_for (kind), "%s",
+                                                            message));
+    }
+  else if (self->verifying)
+    {
+      self->verifying = FALSE;
+      fpi_device_verify_complete (device,
+                                  fpi_device_error_new_msg (cv3_tod_error_for (kind), "%s",
+                                                            message));
+    }
+  else if (self->identifying)
+    {
+      self->identifying = FALSE;
+      cv3_tod_clear_gallery (self);
+      fpi_device_identify_complete (device,
+                                    fpi_device_error_new_msg (cv3_tod_error_for (kind), "%s",
+                                                              message));
+    }
+  else if (self->closing)
+    {
+      cv3_tod_close_finished (device);
+    }
+  else
+    {
+      g_warning ("cv3: %s", message);
+    }
+}
+
 /* Whether libfprint's cancellable for the current action has been cancelled.
  *
  * A cancellation can arrive while a command transfer is in flight. That transfer is deliberately
@@ -597,37 +642,8 @@ cv3_tod_dispatch (FpDevice *device, Cv3Action action)
   if (action.kind != CV3_ACTION_CONTROL && action.buffer == NULL)
     {
       g_warning ("cv3: a transfer action without a buffer");
-      if (self->opening)
-        cv3_tod_open_failed (device, CV3_FINISH_GENERAL,
-                             "cv3: a transfer action carried no buffer");
-      else if (self->enrolling)
-        {
-          self->enrolling = FALSE;
-          self->enroll_print = NULL;
-          fpi_device_enroll_complete (
-            device, NULL,
-            fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
-                                      "cv3: a transfer action carried no buffer"));
-        }
-      else if (self->verifying)
-        {
-          self->verifying = FALSE;
-          fpi_device_verify_complete (
-            device,
-            fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
-                                      "cv3: a transfer action carried no buffer"));
-        }
-      else if (self->identifying)
-        {
-          self->identifying = FALSE;
-          cv3_tod_clear_gallery (self);
-          fpi_device_identify_complete (
-            device,
-            fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
-                                      "cv3: a transfer action carried no buffer"));
-        }
-      else if (self->closing)
-        cv3_tod_close_finished (device);
+      cv3_tod_fail_current_operation (device, CV3_FINISH_GENERAL,
+                                      "cv3: a transfer action carried no buffer");
       return;
     }
 
@@ -652,42 +668,25 @@ cv3_tod_dispatch (FpDevice *device, Cv3Action action)
                                             action.length, NULL);
       break;
     case CV3_ACTION_CONTROL:
-      fpi_usb_transfer_fill_control (transfer,
-                                     G_USB_DEVICE_DIRECTION_HOST_TO_DEVICE,
-                                     G_USB_DEVICE_REQUEST_TYPE_VENDOR,
-                                     G_USB_DEVICE_RECIPIENT_DEVICE,
-                                     action.request,
-                                     action.value,
-                                     action.index,
-                                     0);
+      /* bmRequestType comes from the core: bit 7 is the direction, bits 6..5 the type and bits
+       * 4..0 the recipient. Mapping its bits to libgusb's enums is transport work, not a
+       * protocol decision, and keeps a second control request from silently going out with the
+       * timestamp request's setup. */
+      fpi_usb_transfer_fill_control (
+        transfer,
+        (action.request_type & 0x80) != 0 ? G_USB_DEVICE_DIRECTION_DEVICE_TO_HOST
+                                          : G_USB_DEVICE_DIRECTION_HOST_TO_DEVICE,
+        (GUsbDeviceRequestType) ((action.request_type >> 5) & 0x03),
+        (GUsbDeviceRecipient) (action.request_type & 0x1f), action.request, action.value,
+        action.index, 0);
       break;
     default:
       /* A kind this shim does not know cannot be performed; fail the operation rather than
        * aborting the root daemon. This transfer is never submitted, so it is ours to free. */
       g_warning ("cv3: unknown action kind %u", action.kind);
       fpi_usb_transfer_unref (transfer);
-      if (self->opening)
-        cv3_tod_open_failed (device, CV3_FINISH_GENERAL,
-                             "cv3: the core returned an unknown action");
-      else if (self->verifying)
-        {
-          self->verifying = FALSE;
-          fpi_device_verify_complete (
-            device,
-            fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
-                                      "cv3: the core returned an unknown action"));
-        }
-      else if (self->identifying)
-        {
-          self->identifying = FALSE;
-          cv3_tod_clear_gallery (self);
-          fpi_device_identify_complete (
-            device,
-            fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
-                                      "cv3: the core returned an unknown action"));
-        }
-      else if (self->closing)
-        cv3_tod_close_finished (device);
+      cv3_tod_fail_current_operation (device, CV3_FINISH_GENERAL,
+                                      "cv3: the core returned an unknown action");
       return;
     }
 

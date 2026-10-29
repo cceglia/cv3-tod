@@ -21,8 +21,11 @@ no storage features, so `fprintd` never offers an operation the sensor cannot ho
 - The match id still matters, but for a different job: binding a verification to the print that was
   enrolled, not for identifying prints. It is obtained from a confirmation touch after the commit,
   because enrolment itself never receives one.
-- The fallback is not a configuration switch. Which model is active is decided at open time by
-  whether the inventory query was decoded on this sensor, and is visible in the features the driver
+- The fallback is not a configuration switch. The intended design decides the model at open time by
+  whether the inventory query was decoded on this sensor, and exposes it in the features the driver
   reports.
-- Both paths must stay implemented and tested, because the fallback is the only behaviour available
-  until the query is decoded — and the only one left if it never is.
+- **As shipped, the query is undecoded** (ticket 16: status `0x0E`, and the stock driver's `list`
+  vfunc is a no-op). There is therefore no open-time branch and no store-diff code: the host-stored
+  fallback is unconditional, and the driver declares no storage feature. The branch described above
+  remains the design for a sensor whose inventory is decoded later; both paths are not implemented
+  today, because the second one cannot be written without the format.

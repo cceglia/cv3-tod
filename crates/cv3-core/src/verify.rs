@@ -49,8 +49,8 @@
 //! # What the handle is not
 //!
 //! The matched handle names the template the sensor compared against. It is not compared with the
-//! caller's handles here: that binding is ticket 10's work, and [`Verdict::matched`] still comes
-//! from the verdict word alone.
+//! caller's handles here; [`crate::print::PrintPayload::accepts`] is where a caller binds a verdict
+//! to the print it asked about. [`Verdict::matched`] still comes from the verdict word alone.
 //!
 //! # Teardown
 //!

@@ -39,8 +39,8 @@ so anything speaking fprintd's protocol works.
 - Outcomes are kept apart so fprintd can tell them apart: a match reports `FPI_MATCH_SUCCESS`, a
   no-match (verdict `0`, verdict `1` for another handle, or another verdict word) reports
   `FPI_MATCH_FAIL` with no error, a finger-wait timeout reports `FPI_MATCH_ERROR` with a
-  `FP_DEVICE_RETRY_GENERAL` error (the only shape libfprint accepts with an error), a cancel reports
-  `FPI_MATCH_FAIL` and completes, and a transport or protocol failure completes with
+  `FP_DEVICE_RETRY_GENERAL` error (the only shape libfprint accepts with an error), a cancel reports no verdict
+  and completes with libfprint's cancellation (ticket 15's behaviour), and a transport or protocol failure completes with
   `FP_DEVICE_ERROR_REMOVED`/`GENERAL`/`PROTO`. Retry errors go to the report, never to the
   completion. A reply that does not decrypt, a body the sensor never sent and a refused request stay
   device errors rather than a no-match: the driver cannot say what that answer meant.

@@ -15,8 +15,8 @@ expect, using the match ids every stored print already carries.
       right index matched the gallery print; left index answered `no match`).
 - [ ] With two users enrolled, a finger identifies its own user's print and no other (hardware: the
       two-print gallery below, presenting each finger)
-- [x] The identify feature is declared only when prints are bound, and is independent of whether the
-      sensor's inventory was decoded — with the ABI caveat below: `FpDeviceClass.features` is static
+- [ ] The identify feature is declared only when prints are bound, and is independent of whether the
+      sensor's inventory was decoded — not met literally in this ABI (see the caveat below): `FpDeviceClass.features` is static
       and libfprint 1.95 has no per-gallery bit, so `IDENTIFY` is declared with `VERIFY` and identify
       itself returns no match for an empty or unusable gallery. The request is `0x2F` attr `0x47`
       with the gallery's handles and never reads attr `0x42`.
