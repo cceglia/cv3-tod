@@ -5,18 +5,21 @@ key from the ECDH secret, the device nonce and the host nonce, proving the crypt
 
 **Blocked by:** 01 (transport and enumeration)
 
-**Status:** ready-for-human
+**Status:** done
 
-- [ ] `cvctl handshake` completes against the sensor and prints the session handle, the length of
+- [x] `cvctl handshake` completes against the sensor and prints the session handle, the length of
       each nonce, and a fingerprint of the derived key — the raw key only behind an explicit flag
-- [ ] Each run generates a fresh host keypair, so the host public key differs between runs
-- [ ] A rejected challenge, a short reply and a status error are each reported as distinct failures
-      without panicking
-- [ ] The key schedule uses the device nonce and the nonce sent in the challenge response, never the
-      client nonce from the first challenge
-- [ ] A full-handshake test vector, constructed from the protocol description rather than captured,
-      derives the expected key; per-primitive known-answer tests cover AES-CBC, HMAC, SHA-1 and ECDH
-- [ ] The exchange is driven through the core's event/action seam, with no I/O in the core
+      (measured 2026-10-29; `key` appeared only with `--show-key`).
+- [x] Each run generates a fresh host keypair, so the host public key differs between runs
+      (measured: three different host public keys and fingerprints).
+- [x] A rejected challenge, a short reply and a status error are each reported as distinct failures
+      without panicking (scripted scenarios, including `RejectedChallenge(0x0c)`).
+- [x] The key schedule uses the device nonce and the nonce sent in the challenge response, never the
+      client nonce from the first challenge (pinned by the full-handshake vector).
+- [x] A full-handshake test vector, constructed from the protocol description rather than captured,
+      derives the expected key; per-primitive known-answer tests cover AES-CBC, HMAC, SHA-1 and ECDH.
+- [x] The exchange is driven through the core's event/action seam, with no I/O in the core
+      (`scripts/check-core.sh`).
 
 ## Comments
 
