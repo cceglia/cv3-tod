@@ -15,12 +15,20 @@
 #
 # Usage: scripts/check-tod-link.sh [path/to/plugin.so]
 #   default path: target/release/libcv3_tod.so
+# A relative path is resolved against the directory the script is run from, not the repository.
 
 set -eu
 
-cd "$(dirname "$0")/.."
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
-plugin=${1:-target/release/libcv3_tod.so}
+if [ "${1:-}" != "" ]; then
+    case $1 in
+    /*) plugin=$1 ;;
+    *) plugin=$(pwd)/$1 ;;
+    esac
+else
+    plugin=$root/target/release/libcv3_tod.so
+fi
 
 if [ ! -f "$plugin" ]; then
     echo "error: $plugin not found; run ./scripts/build-plugin.sh first" >&2

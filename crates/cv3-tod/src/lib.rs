@@ -6,15 +6,16 @@
 //! functions that own the protocol core: the C side hands over an event and receives the action
 //! to perform, so no parsing, length arithmetic, cryptography or session state ever lives in C.
 //!
-//! Ticket 11 is enumeration only: the probe completes without touching USB and nothing here talks
-//! to the sensor yet.
+//! Ticket 11 is enumeration only: the probe completes without touching USB, nothing here talks to
+//! the sensor yet, and the vfuncs libfprint dereferences unconditionally fail cleanly.
 //!
 //! # Tests
 //!
 //! The C shim is not unit-tested, by decision in the SPEC: a GObject subclass needs a fake
 //! `libfprint` harness, and keeping the shim free of logic is what makes that acceptable. The
-//! tests here instead pin the facts the shim declares to the Rust side, as source text, so the two
-//! declarations cannot drift apart silently.
+//! tests here instead pin the facts the shim declares — its class identity, the vfuncs libfprint
+//! dereferences without a guard, and the shape of the escape hatches — as source text, so the
+//! declarations cannot drift from the Rust side silently.
 
 #![deny(unsafe_code)]
 
@@ -35,8 +36,24 @@ mod tests {
 
     /// The shim, as the C compiler sees it.
     const SHIM: &str = include_str!("../shim/cv3_tod.c");
+    /// The identity header `build.rs` generates for the shim.
+    const IDENTITY_HEADER: &str = include_str!(concat!(env!("OUT_DIR"), "/cv3_tod_identity.h"));
     /// The Rust half of the boundary, for the entry point's name.
     const FFI: &str = include_str!("ffi.rs");
+
+    /// The body of a C function defined in the shim, from its signature to the closing brace.
+    ///
+    /// The vfunc bodies are flat, so the first column-0 `}` ends the function.
+    fn c_function(signature: &str) -> &'static str {
+        let start = SHIM
+            .find(signature)
+            .unwrap_or_else(|| panic!("the shim should define `{signature}`"));
+        let rest = &SHIM[start..];
+        let end = rest
+            .find("\n}")
+            .unwrap_or_else(|| panic!("`{signature}` should end at a column-0 brace"));
+        &rest[..end]
+    }
 
     #[test]
     fn claims_the_sensor_the_core_names() {
@@ -71,14 +88,27 @@ mod tests {
     }
 
     #[test]
-    fn shim_declares_the_class_identity_the_rust_side_names() {
+    fn class_identity_has_one_definition_shared_with_the_shim() {
+        // The spec's values. build.rs generates them once, for C and Rust.
+        assert_eq!(CLASS_ID, "cv3");
+        assert_eq!(FULL_NAME, "Dell/Broadcom ControlVault 3 fingerprint");
+
         assert!(
-            SHIM.contains(&format!("device_class->id = \"{CLASS_ID}\";")),
-            "the shim's class id should be {CLASS_ID}"
+            IDENTITY_HEADER.contains(&format!("#define CV3_TOD_CLASS_ID \"{CLASS_ID}\"")),
+            "the generated header should define the class id"
         );
         assert!(
-            SHIM.contains(&format!("device_class->full_name = \"{FULL_NAME}\";")),
-            "the shim's full_name should be {FULL_NAME}"
+            IDENTITY_HEADER.contains(&format!("#define CV3_TOD_FULL_NAME \"{FULL_NAME}\"")),
+            "the generated header should define the full name"
+        );
+
+        assert!(SHIM.contains("#include \"cv3_tod_identity.h\""));
+        assert!(SHIM.contains("device_class->id = CV3_TOD_CLASS_ID;"));
+        assert!(SHIM.contains("device_class->full_name = CV3_TOD_FULL_NAME;"));
+        assert!(
+            !SHIM.contains("device_class->id = \"")
+                && !SHIM.contains("device_class->full_name = \""),
+            "the shim should use the generated macros, not repeat the literals"
         );
     }
 
@@ -94,19 +124,68 @@ mod tests {
     }
 
     #[test]
-    fn shim_implements_no_operation_yet() {
+    fn shim_stubs_every_vfunc_libfprint_calls_without_a_null_check() {
+        // libfprint 1.95 dereferences these three through FpDeviceClass without testing for NULL:
+        // fp_device_open and fp_device_close always, and fp_device_enroll once a template print is
+        // supplied. A NULL there crashes fprintd, which runs as root.
+        for vfunc in ["open", "close", "enroll"] {
+            assert!(
+                SHIM.contains(&format!("device_class->{vfunc} = cv3_tod_{vfunc};")),
+                "`{vfunc}` must be set: libfprint calls it unguarded"
+            );
+        }
+    }
+
+    #[test]
+    fn open_fails_with_not_supported_so_a_claim_reports_an_error() {
+        let open = c_function("cv3_tod_open (FpDevice *device)");
+
+        assert!(
+            open.contains("fpi_device_open_complete (device,"),
+            "open must complete the operation it was asked to start"
+        );
+        assert!(
+            open.contains("fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,"),
+            "open must fail with NOT_SUPPORTED until the session exists"
+        );
+        assert!(
+            !open.contains("fpi_usb_transfer") && !open.contains("g_usb_"),
+            "the milestone performs no USB or session work"
+        );
+    }
+
+    #[test]
+    fn close_always_succeeds() {
+        let close = c_function("cv3_tod_close (FpDevice *device)");
+
+        assert!(
+            close.contains("fpi_device_close_complete (device, NULL);"),
+            "close must complete without an error: this milestone holds nothing"
+        );
+    }
+
+    #[test]
+    fn enrol_fails_with_not_supported_as_defence_in_depth() {
+        let enroll = c_function("cv3_tod_enroll (FpDevice *device)");
+
+        assert!(enroll.contains("fpi_device_enroll_complete (device, NULL,"));
+        assert!(enroll.contains("FP_DEVICE_ERROR_NOT_SUPPORTED"));
+    }
+
+    #[test]
+    fn feature_guarded_operations_stay_unimplemented() {
+        // libfprint checks both the feature and the vfunc for these, and probe withdraws CAPTURE,
+        // so a NULL never reaches them: setting one would imply support this milestone lacks.
         for vfunc in [
-            "device_class->open",
-            "device_class->close",
-            "device_class->enroll",
-            "device_class->verify",
-            "device_class->capture",
-            "device_class->identify",
-            "device_class->list",
-            "device_class->delete",
+            "verify",
+            "identify",
+            "capture",
+            "list",
+            "delete",
+            "clear_storage",
         ] {
             assert!(
-                !SHIM.contains(vfunc),
+                !SHIM.contains(&format!("device_class->{vfunc}")),
                 "enumeration only: `{vfunc}` belongs to a later ticket"
             );
         }

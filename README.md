@@ -75,7 +75,9 @@ formatting, clippy, the workspace tests, and `cargo-deny` for RustSec advisories
 the sensor appear to `fprintd` as a reader: the class id is `cv3`, the full name names the
 Dell/Broadcom ControlVault 3, the id table matches `0a5c:5843`, the scan type is press, and the
 probe completes without touching USB. No session, enrol or verify exists yet and the device
-advertises no feature, so clients list the reader but offer it no operation.
+advertises no feature, so clients list the reader but cannot claim or open it: `fp_device_open`
+fails with `NOT_SUPPORTED` and `fprintd` stays up. Claiming and the operations arrive with
+ticket 12.
 
 ```sh
 ./scripts/build-plugin.sh      # cargo build, then a check of the TOD symbol versions
@@ -85,9 +87,11 @@ advertises no feature, so clients list the reader but offer it no operation.
 
 Installing adds `/usr/lib/x86_64-linux-gnu/libfprint-2/tod-1/libfprint-2-tod-1-cv3.so` and
 nothing else: no `libfprint` or `fprintd` configuration is touched. Neither script runs `sudo`;
-without write access they print the exact command to run as root. Remove any other TOD driver
-that claims `0a5c:5843` first, since only one driver can own the reader; that is also a single
-file.
+without write access they print the exact command to run as root, with the paths quoted. If the
+TOD drivers directory does not exist yet, `install-plugin.sh` prints the `sudo install -d` command
+that creates it. Remove any other TOD driver that claims `0a5c:5843` first, since only one driver
+can own the reader; that is also a single file. A relative `CV3_TOD_DIR` is resolved against the
+directory you run the script from.
 
 `./scripts/check-tod-link.sh` (run by `build-plugin.sh`) inspects the built object with
 `readelf -sW` and fails when a `fpi_*` import is unversioned or binds a version older than the
@@ -97,7 +101,8 @@ library's default. That is the trap where `fpi_ssm_new_full` silently binds the 
 Verify, after installing and restarting the daemon (`sudo systemctl restart fprintd`):
 
 ```sh
-fprintd-list "$USER"    # reports the cv3 reader (with no prints enrolled)
+fprintd-list "$USER"     # reports the cv3 reader (with no prints enrolled)
+fprintd-enroll "$USER"   # must fail cleanly with NOT_SUPPORTED and leave fprintd running
 ```
 
 Uninstall by deleting the one file (`./scripts/uninstall-plugin.sh`, or `sudo rm` with the path it
