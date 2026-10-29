@@ -90,8 +90,8 @@ already open".
 
 ```console
 $ fprintd-enroll "$USER"
-Using device Dell/Broadcom ControlVault 3
-failed to claim device: Open failed with error: cv3: opening the sensor needs the session (ticket 12)
+Using device /net/reactivated/Fprint/Device/0
+failed to claim device: GDBus.Error:net.reactivated.Fprint.Error.Internal: Open failed with error: cv3: opening the sensor needs the session (ticket 12)
 ```
 
 `fprintd-enroll` exits non-zero. The daemon keeps running with the same `MainPID`, a second

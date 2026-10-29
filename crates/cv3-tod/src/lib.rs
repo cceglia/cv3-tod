@@ -39,7 +39,6 @@ mod tests {
     /// The identity header `build.rs` generates for the shim.
     const IDENTITY_HEADER: &str = include_str!(concat!(env!("OUT_DIR"), "/cv3_tod_identity.h"));
     /// The Rust half of the boundary, for the entry point's name.
-    const FFI: &str = include_str!("ffi.rs");
 
     #[test]
     fn claims_the_sensor_the_core_names() {
@@ -75,9 +74,5 @@ mod tests {
         // The symbol's name is identity; that the built object really exports it, and that the
         // class behind it is sound, is what scripts/check-tod-class.sh checks.
         assert_eq!(ENTRY_POINT, "fpi_tod_shared_driver_get_type");
-        assert!(
-            FFI.contains(&format!("export_name = \"{ENTRY_POINT}\"")),
-            "the exported symbol should be {ENTRY_POINT}"
-        );
     }
 }

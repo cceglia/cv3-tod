@@ -286,9 +286,11 @@ whose session key and MAC are asserted, so a refactor in the key schedule fails 
 quietly producing frames the sensor rejects. The handshake vector is constructed from the protocol
 description, not captured from the sensor, so it can exist before any hardware run.
 
-**Not tested automatically, by decision:** the C shim, the `fprintd` integration, and PAM. Their
-acceptance is manual and scripted by the final ticket; keeping the shim free of logic is what makes
-that acceptable.
+**Not tested automatically, by decision:** the `fprintd` integration and PAM. Their acceptance is
+manual and scripted by the final ticket. The shim holds no protocol logic, so there is none to test;
+its GObject class and failed-open path are nevertheless checked against the built object without
+hardware or root by `scripts/check-tod-class.sh`, which is a load-safety check rather than a second
+implementation.
 
 ## Out of Scope
 

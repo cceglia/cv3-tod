@@ -137,11 +137,14 @@ check_open_path (GType type)
       GError *error = NULL;
       gboolean closed = fp_device_close_sync (device, NULL, &error);
 
-      /* Close after a failed open is expected to refuse (libfprint thinks nothing is open); what
-       * matters is that it returns instead of crashing or wedging the handle. */
-      check (error == NULL || g_strstr_len (error->message, -1, "already open") == NULL,
-             "close %u is safe (got %s `%s`)", i + 1, closed ? "success" : "an error",
-             error ? error->message : "-");
+      /* libfprint refuses close before the vfunc because its own state says nothing is open; the
+       * point is that it returns NOT_OPEN instead of crashing or reaching a NULL vfunc. The
+       * vfunc's own body is exercised indirectly: the plugin calls g_usb_device_close from open,
+       * and the fake requires it to be the handle libfprint opened. */
+      check (!closed && error != NULL && error->domain == FP_DEVICE_ERROR
+               && error->code == FP_DEVICE_ERROR_NOT_OPEN,
+             "close %u refuses with NOT_OPEN (got %s `%s`)", i + 1,
+             closed ? "success" : "an error", error ? error->message : "-");
       g_clear_error (&error);
     }
 

@@ -7,32 +7,32 @@
  * real library does, and it is what makes the "second Claim says already open" bug observable
  * without a sensor, root or USB.
  *
- * The pointer is ignored: fp_device_open passes the device's GUsbDevice field straight through, and
- * a harness has no way to install a real one. If a future libfprint starts testing that field, the
- * harness fails loudly instead of passing silently.
+ * The fake remembers which handle was opened and requires close to receive that same handle, so it
+ * proves the plugin released the one libfprint opened, not merely that a close happened. If a
+ * future libfprint passes a different field, the harness fails loudly instead of passing silently.
  */
 
 #include <gusb.h>
 
 static gboolean opened;
+static GUsbDevice *opened_device;
 static guint opens;
 static guint closes;
 
 gboolean
 g_usb_device_open (GUsbDevice *device, GError **error)
 {
-  (void) device;
-
   if (opened)
     {
       g_set_error_literal (error, G_USB_DEVICE_ERROR,
                            G_USB_DEVICE_ERROR_ALREADY_OPEN,
-                           "Device is already open");
+                           "Device 0a5c:5843 is already open");
       g_printerr ("fake gusb: open refused, the handle is still open\n");
       return FALSE;
     }
 
   opened = TRUE;
+  opened_device = device;
   opens++;
   g_printerr ("fake gusb: open %u\n", opens);
   return TRUE;
@@ -41,8 +41,6 @@ g_usb_device_open (GUsbDevice *device, GError **error)
 gboolean
 g_usb_device_close (GUsbDevice *device, GError **error)
 {
-  (void) device;
-
   if (!opened)
     {
       g_set_error_literal (error, G_USB_DEVICE_ERROR,
@@ -51,7 +49,17 @@ g_usb_device_close (GUsbDevice *device, GError **error)
       return FALSE;
     }
 
+  if (device != opened_device)
+    {
+      g_set_error_literal (error, G_USB_DEVICE_ERROR,
+                           G_USB_DEVICE_ERROR_NOT_OPEN,
+                           "The wrong device handle is being closed");
+      g_printerr ("fake gusb: close refused, wrong handle\n");
+      return FALSE;
+    }
+
   opened = FALSE;
+  opened_device = NULL;
   closes++;
   g_printerr ("fake gusb: close %u\n", closes);
   return TRUE;

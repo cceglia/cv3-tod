@@ -5,7 +5,7 @@ with no session yet and nothing forwarded to the core.
 
 **Blocked by:** 03 (secure session)
 
-**Status:** in-progress
+**Status:** ready-for-human
 
 **Manual acceptance (needs root):** with the plugin in the real TOD directory and `fprintd`
 restarted, all of these hold:
@@ -15,7 +15,7 @@ restarted, all of these hold:
 2. `fprintd-enroll "$USER"` exits non-zero and prints, after its `Using device …` line:
 
    ```console
-   failed to claim device: Open failed with error: cv3: opening the sensor needs the session (ticket 12)
+   failed to claim device: GDBus.Error:net.reactivated.Fprint.Error.Internal: Open failed with error: cv3: opening the sensor needs the session (ticket 12)
    ```
 
    `fprintd` 1.94 maps every open failure to `net.reactivated.Fprint.Error.Internal`, so the
