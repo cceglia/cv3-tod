@@ -34,8 +34,8 @@ reader alone is not the whole check.
       symbols; the build fails loudly rather than binding the legacy compatibility thunk
       (`scripts/build-plugin.sh` + `scripts/check-tod-link.sh`; every `fpi_*` import checked with
       `readelf`).
-- [ ] `fprintd` lists the reader as `Dell/Broadcom ControlVault 3`, and both `fprintd-enroll`
-      attempts fail as stated above while `fprintd` keeps its PID.
+- [x] `fprintd` lists the reader as `Dell/Broadcom ControlVault 3`, and both `fprintd-enroll`
+      attempts fail as stated above while `fprintd` keeps its PID (measured 2026-10-29).
 - [x] The shim contains no parsing, no length arithmetic and no cryptography; it forwards nothing to
       the core yet and performs no transfers (GObject plumbing only at this milestone).
 - [x] The plugin is installed and removed by adding or deleting a single shared object, with no change
@@ -79,3 +79,17 @@ return safely. Against the pre-fix object the second open fails with GUsb's
 `G_USB_DEVICE_ERROR_ALREADY_OPEN`, so the harness pins the behaviour rather than the source text.
 Installing under the real TOD directory and running `fprintd-list`/`fprintd-enroll` as root is the
 remaining manual box.
+
+Measured on hardware 2026-10-29 with the plugin at
+`/usr/lib/x86_64-linux-gnu/libfprint-2/tod-1/libfprint-2-tod-1-cv3.so`:
+
+```text
+found 1 devices
+Device at /net/reactivated/Fprint/Device/0
+User cristiano has no fingers enrolled for Dell/Broadcom ControlVault 3.
+Using device /net/reactivated/Fprint/Device/0
+failed to claim device: GDBus.Error:net.reactivated.Fprint.Error.Internal: Open failed with error: cv3: opening the sensor needs the session (ticket 12)
+```
+
+`MainPID` was `153178` and `active` before and after both attempts, the two attempts printed the
+same open error (never "already open"), and `fprintd-list` kept reporting the reader. All boxes met.
