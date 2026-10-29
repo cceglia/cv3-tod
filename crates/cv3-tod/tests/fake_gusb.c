@@ -12,6 +12,11 @@
  * ALREADY_OPEN, closing a closed one fails with NOT_OPEN, and close must receive the handle that
  * was opened. The claim/release pair is recorded, so the harness can prove the interface is
  * released on both the failed-open and the close paths.
+ *
+ * Transfer ownership is libfprint's: `fpi_usb_transfer_new` returns one reference, submit consumes
+ * it, and the completion drops it after the callback. This fake keeps exactly that model — no
+ * extra reference at submit — so a caller that unrefs a submitted transfer aborts the harness on a
+ * use-after-free / double free instead of leaking quietly.
  */
 
 #include <drivers_api.h>
@@ -362,6 +367,12 @@ complete_transfer (gpointer data)
   GError *error = NULL;
   gsize actual = 0;
 
+  /* libfprint's completion runs while holding the one reference submit consumed. A refcount of 0
+   * here means the caller unrefed a transfer it had already submitted: this memory is freed and
+   * every read below is a use-after-free. Failing here names the bug instead of letting the
+   * allocator's free list feed the callback a garbage `transfer->device`. */
+  g_assert (transfer->ref_count == 1);
+
   if (transfer->type == FP_TRANSFER_BULK && !(transfer->endpoint & FPI_USB_ENDPOINT_IN))
     {
       /* A command write. Record it and attach it to the next scripted reply. */
@@ -425,6 +436,9 @@ complete_transfer (gpointer data)
   transfer->callback (transfer, transfer->device, pending->user_data, error);
   g_clear_error (&error);
 
+  /* Ownership, as in libfprint 1.95.1: submit consumed the reference `fpi_usb_transfer_new` gave
+   * the caller, and the completion drops it after the callback has returned. Nothing else unrefs a
+   * submitted transfer; the transfer is freed here, not by the caller. */
   fpi_usb_transfer_unref (transfer);
   g_free (pending);
   return G_SOURCE_REMOVE;
@@ -442,9 +456,17 @@ fpi_usb_transfer_submit (FpiUsbTransfer        *transfer,
   (void) timeout_ms;
   (void) cancellable;
 
+  /* `fpi_usb_transfer_submit` takes no reference of its own: it consumes the single reference
+   * `fpi_usb_transfer_new` returned. Checking it here catches a caller that already dropped that
+   * reference (which would leave the freeing to whoever decrements next) or took another one
+   * (which would leak the transfer once the completion drops only one). */
+  g_assert (transfer->ref_count == 1);
+
   transfer->callback = callback;
   transfer->user_data = user_data;
-  pending->transfer = fpi_usb_transfer_ref (transfer);
+  /* The submitted transfer's own reference; complete_transfer drops it. Deliberately not refed
+   * again: a second reference here would hide a caller that unrefs after submitting. */
+  pending->transfer = transfer;
   pending->user_data = user_data;
   g_idle_add (complete_transfer, pending);
 }

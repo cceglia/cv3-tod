@@ -10,7 +10,10 @@
 #   2. Drives fprintd's Claim/Release on that class with tests/fake_gusb.c linked into the harness
 #      (`-Wl,--export-dynamic` so its symbols interpose for the plugin). The fake scripts the
 #      sensor's reply frames at fpi_usb_transfer_submit and models libgusb's open/close/claim
-#      state, so no root, sensor or USB is needed.
+#      state, so no root, sensor or USB is needed. It also models libfprint's transfer ownership —
+#      submit consumes the reference fpi_usb_transfer_new returned, the completion drops it after
+#      the callback — so a driver that unrefs a submitted transfer aborts here instead of
+#      segfaulting fprintd later.
 #
 # The session the harness runs:
 #   - a first Claim whose 0x24 reply is refused fails with FP_DEVICE_ERROR_PROTO, after writing the

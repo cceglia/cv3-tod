@@ -206,6 +206,12 @@ impl Cv3Tod {
     }
 
     /// Reclaims the last buffer, if C has not returned it yet.
+    ///
+    /// This runs at the top of [`Self::publish`], which the shim calls from inside libfprint's
+    /// transfer callback, so the previous transfer's bytes are freed before libfprint's completion
+    /// wrapper drops the transfer. The order is safe: the shim fills transfers with a NULL free
+    /// function (libfprint never owns the buffer) and libfprint does not touch `transfer->buffer`
+    /// after the callback returns, so nothing reads this allocation after it is freed.
     fn release_pending(&mut self) {
         if let Some(pending) = self.pending.take() {
             // SAFETY: the pointer and length came from `Box::into_raw` of a `[u8]` in

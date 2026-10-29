@@ -318,8 +318,9 @@ cv3_tod_transfer_cb (FpiUsbTransfer *transfer,
       return;
     }
 
-  /* libfprint holds its own reference for the callback and releases it after we return; unrefing
-   * here would free the transfer before libfprint does, and the next transfer could reuse it. */
+  /* The reference `fpi_usb_transfer_submit` consumed is dropped by libfprint's own completion
+   * wrapper, which runs after this callback returns: the transfer is still alive here and must not
+   * be unrefed. */
   action = cv3_tod_on_transfer (self->tod, result, code, actual_length);
   cv3_tod_dispatch (device, action);
 }
@@ -330,6 +331,10 @@ cv3_tod_transfer_cb (FpiUsbTransfer *transfer,
  * command, 60 s for a reply announcement or body, 3 s for a teardown frame, 1 s for the host
  * timestamp control request). Command transfers are passed a NULL cancellable and are never
  * cancelled: aborting one mid-flight is what deep-wedges this sensor.
+ *
+ * Transfer ownership: `fpi_usb_transfer_new` returns one reference and `fpi_usb_transfer_submit`
+ * consumes it, so a submitted transfer is never unrefed here or in the callback. libfprint's
+ * completion wrapper drops that reference after the callback returns. See the note at the submit.
  */
 static void
 cv3_tod_dispatch (FpDevice *device, Cv3Action action)
@@ -405,7 +410,7 @@ cv3_tod_dispatch (FpDevice *device, Cv3Action action)
       break;
     default:
       /* A kind this shim does not know cannot be performed; fail the operation rather than
-       * aborting the root daemon. */
+       * aborting the root daemon. This transfer is never submitted, so it is ours to free. */
       g_warning ("cv3: unknown action kind %u", action.kind);
       fpi_usb_transfer_unref (transfer);
       if (self->opening)
@@ -418,7 +423,13 @@ cv3_tod_dispatch (FpDevice *device, Cv3Action action)
 
   fpi_usb_transfer_submit (transfer, action.timeout_ms, NULL, cv3_tod_transfer_cb,
                            GINT_TO_POINTER (action.kind));
-  fpi_usb_transfer_unref (transfer);
+
+  /* OWNERSHIP: `fpi_usb_transfer_submit` CONSUMES the reference `fpi_usb_transfer_new` returned;
+   * it does not take a reference of its own. The asynchronous operation owns the transfer from
+   * here, and libfprint's completion wrapper unrefs it after it has called cv3_tod_transfer_cb.
+   * Unrefing here too (which this shim used to do) frees the transfer while the URB is in flight:
+   * the completion then reads a freed `transfer->device` and fprintd segfaults in the callback.
+   * The unknown-kind branch above is the only unref in this function because it never submits. */
 }
 
 static void

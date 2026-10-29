@@ -21,7 +21,9 @@
  *    Release is refused by libfprint with NOT_OPEN and nothing crashes.
  *
  * The scripted replies are real frames the Rust core parses and cryptographically accepts; the
- * fake fabricates nothing the core would reject.
+ * fake fabricates nothing the core would reject. The fake also enforces libfprint's transfer
+ * ownership (submit consumes the reference `fpi_usb_transfer_new` returned), so a shim that unrefs
+ * a submitted transfer aborts this harness rather than segfaulting fprintd on a real Claim.
  */
 
 #include <fprint.h>
