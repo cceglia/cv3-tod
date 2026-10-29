@@ -5,13 +5,14 @@ case a screen locker hits every time it times out.
 
 **Blocked by:** 14 (verify through fprintd), 08 (cancellation and the wrap-sequence rule)
 
-**Status:** in-progress
+**Status:** ready-for-human
 
-- [ ] Cancelling a verification through `fprintd` returns promptly instead of waiting for the finger
-      timeout
-- [ ] The sensor is usable immediately afterwards: the next verification succeeds without a restart or a
-      power cycle
-- [ ] Ten consecutive cancel-then-verify cycles leave the sensor healthy
+- [x] Cancelling a verification through `fprintd` returns promptly instead of waiting for the finger
+      timeout (measured 2026-10-29: Ctrl+C exited immediately while `Verifying:` was waiting).
+- [x] The sensor is usable immediately afterwards: the next verification succeeds without a restart or
+      a power cycle (measured: the next `fprintd-verify` gave `verify-match`).
+- [x] Ten consecutive cancel-then-verify cycles leave the sensor healthy (measured: ten
+      `timeout -s INT 2 fprintd-verify` cycles, then `verify-match` without a restart).
 - [x] A cancel that arrives while a command transfer is in flight does not abort that transfer, and the
       transfer completes before the session closes (scripted: the command transfers carry a NULL
       `GCancellable` and the C dispatch harness waits for the command's result before submitting the
@@ -98,3 +99,15 @@ case a screen locker hits every time it times out.
 
   The device path is the one `busctl tree net.reactivated.Fprint` prints when it is not
   `/net/reactivated/Fprint/Device/0`.
+
+## Hardware
+
+Measured 2026-10-29:
+
+- `fprintd-verify -f right-index-finger` waiting at `Verifying:` and Ctrl+C: exits immediately, not
+  after the 30 s finger timeout.
+- The next `fprintd-verify` with the finger: `Verify result: verify-match (done)`.
+- Ten `timeout -s INT 2 fprintd-verify` cycles, then a verify with the finger: `verify-match`.
+
+Ticket 08's mid-session re-arm question is sidestepped, not resolved: this driver closes the session
+on cancel and the next Claim opens a fresh one.
