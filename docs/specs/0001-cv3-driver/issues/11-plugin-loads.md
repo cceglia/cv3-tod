@@ -1,7 +1,8 @@
 # 11: Plugin loads
 
 **What to build:** the sensor appears to `fprintd` as a reader through the C shim — enumeration only,
-with no session yet and nothing forwarded to the core.
+with no session yet and nothing forwarded to the core. **Superseded for behaviour by tickets 12–20**;
+this ticket records the load milestone and its failure path as it was then.
 
 **Blocked by:** 03 (secure session)
 

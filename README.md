@@ -34,7 +34,7 @@ guessed. What the driver does not claim is as important as what it does.
 | `capture` | Arms `0x66`, waits for the finger, reads the sample hash and tears the session down. `--hex` also prints the decrypted arm reply: its lengths, hex rows and TLV scan. |
 | `inventory` | Sends the wrapped `0x2F` inventory query and dumps its reply: the raw and plaintext lengths, the plaintext in 16-byte rows and a best-effort TLV scan. It is the ticket-16 measurement tool and does not yet decode the reply. |
 | `enroll` | Discards, starts, captures, submits, commits and prints the template id it now holds. `--commit-sample-hash` forces the last sample hash into the commit; `--show-commit` prints the decrypted `0x6E` reply, its lengths and TLV scan. |
-| `enroll-then-verify` | Enrols and commits, then takes one confirmation touch and matches it in the **same session**. It is the ticket-09 measurement tool: it reports whether a match immediately after a commit works and what value comes back, and it is **not** a binding check. `--commit-sample-hash` forces the last sample hash into the commit and the confirmation match; `--show-commit` dumps the commit reply; `--handle` adds `u32` template handles. When the commit reply names a handle, the confirmation matches it with `0x2F` and the probe prints the bound print payload it would store. |
+| `enroll-then-verify` | Enrols and commits, then takes one confirmation touch and matches it in the **same session**. It reports whether a match immediately after a commit works, and when the commit reply names a handle it matches on `0x2F`, records that handle in the `CV3P` payload and prints `print accepted`/`print rejected`; with no handle it falls back to `0x73`. `--commit-sample-hash` forces the last sample hash into the commit and the confirmation match; `--show-commit` dumps the commit reply; `--handle` adds `u32` template handles. When the commit reply names a handle, the confirmation matches it with `0x2F` and the probe prints the bound print payload it would store. |
 | `verify` | Captures and sends the vendor's identify: **`0x2F`** by default (no hash, matches the `u32` handle array) and **`0x73`** when `--template` supplies a hash. Prints the command sent, the raw status, the verdict word, the matched template handle, the reply lengths and the decrypted plaintext with a TLV scan. `--template <40 hex>` adds the optional `(3,20,hash)` entry; `--handle` adds `u32` template handles to the one-to-many array and enables the binding check (`binding accepted` only when the reply carries that exact id); `--command 72` sends the one-to-one verify instead. |
 | `cancel-then-verify` | Cancels a capture mid-session and verifies in the same session; it is the run that can settle the wrap-sequence question when the first arm answers `0x85`, and the current reading is unmeasured. |
 | `handshake`/`open`/`close --record` | Writes a wire-only transcript; `cvctl replay <file>` reproduces it without hardware. |
@@ -85,8 +85,9 @@ formatting, clippy, the workspace tests, and `cargo-deny` for RustSec advisories
 
 ## The TOD plugin
 
-`crates/cv3-tod` builds `libcv3_tod.so`, a libfprint TOD driver. The class id is `cv3`, the full
-name and device name are `Dell/Broadcom ControlVault 3`, the id table matches `0a5c:5843`, the scan
+`crates/cv3-tod` builds `libcv3_tod.so`, a libfprint TOD driver. The class id is `cv3`, the full name is
+`Dell/Broadcom ControlVault 3 fingerprint` and the device name `fprintd-list` prints is
+`Dell/Broadcom ControlVault 3`, the id table matches `0a5c:5843`, the scan
 type is press, and enrolment declares thirteen stages. The class advertises `VERIFY` and `IDENTIFY`;
 enrolment is gated by the non-zero stage count because this libfprint ABI has no `ENROLL` feature
 bit. The sensor's store is not decoded (ticket 16), so the driver declares no storage feature.
@@ -159,7 +160,8 @@ exiting. `verify` sends `0x2F`, the vendor's one-to-many identify, by default; `
 `0x73` with a hash. The request is the parameter list measured from `cv_do_fingerprint_identify` — `(0,4,handle)`, `(0,4,0x48)`, `(0,4,0x53e2)`,
 `(0,4,0)`, `(2,4*count,handles…)` and, only with `--template`, `(3,20,hash)`. `--handle` supplies
 `u32` template handles (decimal or `0x` hex, repeatable or comma-separated); with no handle the
-type-2 entry is size zero and the sensor matches every stored template. `--command 72` sends the
+type-2 entry is size zero; what the sensor does with an empty type-2 array is not established
+(measured only with at least one handle). `--command 72` sends the
 one-to-one `cv_do_fingerprint_verify` instead. The decode prints the command actually sent and the
 raw reply status (`0x00` or the `0x89` the vendor special-cases), then the verdict word with its
 meaning (`verdict 1 (match)`, `verdict 2 (no match, unexpected word)`), the matched handle (or
@@ -212,7 +214,7 @@ its short fingerprint is printed, because the key is freshly generated for the r
 `verify` and `cancel-then-verify`
 writes every host frame and every device reply body to **stderr** as lowercase hex, prefixed `> `
 and `< ` (`< empty` for a reply with no body, `< finger` for the finger event). The host timestamp
-request the sensor can raise on interrupt type 5 is answered in the shared exchange (`crates/cv3-wire`) for both the probe and the plugin; it has no bulk
+request the sensor can raise on interrupt type 5 is answered by the shared exchange (`crates/cv3-wire`); the probe's finger wait still answers it in its own transport before the shared machine sees it; it has no bulk
 frame, so the dump shows it as `* timestamp <packed:08x>`. It is sent only when the sensor asks:
 the host never volunteers it before a command. The decoded output on stdout is unchanged. The flag is a transport wrapper over the core's
 `Transport` seam, so no operation changes.

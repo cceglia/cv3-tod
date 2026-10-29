@@ -21,8 +21,9 @@ so anything speaking fprintd's protocol works.
 
 ## Implementation notes
 
-- The class declares exactly `FP_DEVICE_FEATURE_VERIFY`. The ticket-11 `CAPTURE` placeholder and the
-  probe's `fpi_device_update_features` withdrawal are gone: libfprint only needs a non-empty mask,
+- The class declared exactly `FP_DEVICE_FEATURE_VERIFY` at this ticket. The ticket-11 `CAPTURE`
+  placeholder and the probe's `fpi_device_update_features` withdrawal are gone (ticket 20 later
+  added `IDENTIFY`, giving `VERIFY|IDENTIFY`): libfprint only needs a non-empty mask,
   and VERIFY is it. `CAPTURE`, `IDENTIFY`, `STORAGE`, `STORAGE_LIST` and `STORAGE_DELETE` stay
   undeclared, and their vfuncs stay NULL. Enrolment is still advertised by the stage count, because
   libfprint 1.95 has no `FP_DEVICE_FEATURE_ENROLL`.
