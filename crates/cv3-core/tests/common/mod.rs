@@ -123,14 +123,14 @@ pub const SAMPLE_HASH: [u8; 20] = [
     0x20, 0x21, 0x22, 0x23,
 ];
 
-/// The documented 36-byte `0x66` parameter block, built independently of the implementation.
+/// The vendor's 36-byte `0x66` parameter block, built independently of the implementation.
 pub fn capture_tlv(handle: u32) -> [u8; 36] {
     let mut tlv = [0u8; 36];
     for length_at in [4usize, 16, 28] {
         tlv[length_at..length_at + 4].copy_from_slice(&4u32.to_le_bytes());
     }
     tlv[8..12].copy_from_slice(&handle.to_le_bytes());
-    tlv[20..24].copy_from_slice(&1u32.to_le_bytes());
+    tlv[20..24].copy_from_slice(&2u32.to_le_bytes());
     tlv[32..36].copy_from_slice(&0x23u32.to_le_bytes());
     tlv
 }

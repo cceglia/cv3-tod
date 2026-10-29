@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! host → sensor  0x66 wrapped, attr 0x47   TLV 36 bytes, plaintext 80 bytes
-//!                                       (0,4,handle) (0,4,1) (0,4,0x23)
+//!                                       (0,4,handle) (0,4,2) (0,4,0x23)
 //! sensor → host  wrapped reply             20-byte sample hash somewhere in the plaintext
 //! sensor → host  interrupt event 0x03      the finger was read
 //! ```
@@ -41,14 +41,19 @@ pub const CAPTURE_PLAINTEXT_LEN: usize = 80;
 /// The largest TLV tag the sample-hash search accepts. The arm reply's own tags are 0, 1 and 2.
 const TLV_MAX_TAG: u32 = 3;
 
-/// The 36-byte `0x66` parameter block: `(0,4,handle) (0,4,1) (0,4,0x23)`.
+/// The 36-byte `0x66` parameter block: `(0,4,handle) (0,4,2) (0,4,0x23)`.
+///
+/// The second entry is the capture mode. The audited ControlVault 2 reference sends `1`; the
+/// vendor's ControlVault 3 path (`cvif_fingerprint_capture_start` → `cv_fingerprint_capture_start`
+/// with `0x23` as the third value) sends `2`, so this driver sends `2` for both enrolment and
+/// match captures.
 pub fn capture_tlv(handle: u32) -> [u8; CAPTURE_TLV_LEN] {
     let mut tlv = [0u8; CAPTURE_TLV_LEN];
     for length_at in [4usize, 16, 28] {
         tlv[length_at..length_at + 4].copy_from_slice(&4u32.to_le_bytes());
     }
     tlv[8..12].copy_from_slice(&handle.to_le_bytes());
-    tlv[20..24].copy_from_slice(&1u32.to_le_bytes());
+    tlv[20..24].copy_from_slice(&2u32.to_le_bytes());
     tlv[32..36].copy_from_slice(&0x23u32.to_le_bytes());
     tlv
 }
@@ -514,7 +519,7 @@ mod tests {
         assert_eq!(&tlv[8..12], &0x1122_3344u32.to_le_bytes(), "handle");
         assert_eq!(&tlv[12..16], &0u32.to_le_bytes(), "tag 0");
         assert_eq!(&tlv[16..20], &4u32.to_le_bytes(), "value length 4");
-        assert_eq!(&tlv[20..24], &1u32.to_le_bytes(), "value 1");
+        assert_eq!(&tlv[20..24], &2u32.to_le_bytes(), "capture mode 2");
         assert_eq!(&tlv[24..28], &0u32.to_le_bytes(), "tag 0");
         assert_eq!(&tlv[28..32], &4u32.to_le_bytes(), "value length 4");
         assert_eq!(&tlv[32..36], &0x23u32.to_le_bytes(), "value 0x23");
