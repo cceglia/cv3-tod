@@ -211,6 +211,15 @@ impl Session {
         self.next_sequence
     }
 
+    /// Sets the wrap sequence the next command will carry.
+    ///
+    /// Measurement override for `cvctl cancel-then-verify --rearm-sequence N`: the sensor rejects
+    /// a re-arm at the reference sequence and at the next one, so the probe must be able to try
+    /// another value without a second implementation of the session.
+    pub fn set_next_sequence(&mut self, sequence: u32) {
+        self.next_sequence = sequence;
+    }
+
     /// Rewinds the wrap sequence by one, for a re-arm at the same sequence after a cancel.
     ///
     /// **Measured behaviour of this sensor, 2026-10-28.** After the first `0x66` arm at sequence N

@@ -63,7 +63,7 @@ const USAGE: &str = "usage: cvctl devices
        cvctl enroll [--commit-sample-hash] [--show-commit] [--hex]
        cvctl enroll-then-verify [--commit-sample-hash] [--show-commit] [--command <2f|72|73>] [--handle <u32>]... [--hex]
        cvctl verify [--template <40 hex>] [--handle <u32>]... [--command <2f|72|73>] [--hex]
-       cvctl cancel-then-verify [--retry-next] [--hex]
+       cvctl cancel-then-verify [--retry-next] [--rearm-sequence N] [--hex]
        cvctl replay <file>";
 
 /// One parsed invocation.
@@ -116,6 +116,7 @@ enum Command<'a> {
     CancelThenVerify {
         hex: bool,
         retry_next: bool,
+        rearm_sequence: Option<u32>,
     },
     Replay {
         file: &'a str,
@@ -130,6 +131,7 @@ struct Flags<'a> {
     record: Option<&'a str>,
     template: Option<[u8; cv3_core::verify::MATCH_VALUE_LEN]>,
     retry_next: bool,
+    rearm_sequence: Option<u32>,
     commit_sample_hash: bool,
     show_commit: bool,
     handles: Vec<u32>,
@@ -145,6 +147,7 @@ struct Accepted {
     record: bool,
     template: bool,
     retry_next: bool,
+    rearm_sequence: bool,
     commit_sample_hash: bool,
     show_commit: bool,
     handle: bool,
@@ -273,12 +276,14 @@ fn parse(args: &[String]) -> Option<Command<'_>> {
                 rest,
                 Accepted {
                     retry_next: true,
+                    rearm_sequence: true,
                     ..Accepted::default()
                 },
             )?;
             Some(Command::CancelThenVerify {
                 hex: flags.hex,
                 retry_next: flags.retry_next,
+                rearm_sequence: flags.rearm_sequence,
             })
         }
         "replay" => match rest {
@@ -297,6 +302,7 @@ fn parse_flags<'a>(args: &'a [String], accepted: Accepted) -> Option<Flags<'a>> 
         record: None,
         template: None,
         retry_next: false,
+        rearm_sequence: None,
         commit_sample_hash: false,
         show_commit: false,
         handles: Vec::new(),
@@ -326,6 +332,10 @@ fn parse_flags<'a>(args: &'a [String], accepted: Accepted) -> Option<Flags<'a>> 
             }
             "--retry-next" if accepted.retry_next && !flags.retry_next => {
                 flags.retry_next = true;
+            }
+            "--rearm-sequence" if accepted.rearm_sequence && flags.rearm_sequence.is_none() => {
+                index += 1;
+                flags.rearm_sequence = Some(parse_handle(args.get(index)?)?);
             }
             "--handle" if accepted.handle => {
                 index += 1;
@@ -453,9 +463,11 @@ pub fn run(
             };
             verify(backend, shutdown, hex, flags, out, err)
         }
-        Some(Command::CancelThenVerify { hex, retry_next }) => {
-            cancel_then_verify(backend, shutdown, hex, retry_next, out, err)
-        }
+        Some(Command::CancelThenVerify {
+            hex,
+            retry_next,
+            rearm_sequence,
+        }) => cancel_then_verify(backend, shutdown, hex, retry_next, rearm_sequence, out, err),
         Some(Command::Replay { file }) => replay(file, out, err),
         None => {
             let _ = writeln!(err, "{USAGE}");
@@ -1996,6 +2008,7 @@ fn cancel_then_verify_over(
     secrets: RunSecrets,
     ivs: CancelIvs,
     retry_next: bool,
+    rearm_sequence: Option<u32>,
     out: &mut dyn Write,
 ) -> Result<(Verdict, Result<(), TeardownError>), CancelThenVerifyFailure> {
     let run =
@@ -2022,7 +2035,9 @@ fn cancel_then_verify_over(
 
     // The measured behaviour: the sensor still expects the arm at the first arm's sequence, so
     // the default rewinds the counter. `--retry-next` keeps the reference reading for comparison.
-    if !retry_next {
+    if let Some(sequence) = rearm_sequence {
+        session.set_next_sequence(sequence);
+    } else if !retry_next {
         session.rewind_sequence();
     }
     let _ = writeln!(out, "re-arm sequence {}", session.next_sequence());
@@ -2046,6 +2061,7 @@ fn cancel_then_verify(
     shutdown: &dyn Shutdown,
     dump_hex: bool,
     retry_next: bool,
+    rearm_sequence: Option<u32>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
@@ -2088,7 +2104,9 @@ fn cancel_then_verify(
         None,
         dump_hex,
         err,
-        |transport| cancel_then_verify_over(transport, secrets, ivs, retry_next, out),
+        |transport| {
+            cancel_then_verify_over(transport, secrets, ivs, retry_next, rearm_sequence, out)
+        },
     );
 
     let code = match outcome {
@@ -4199,6 +4217,27 @@ mod tests {
             assert_eq!(err, format!("{USAGE}\n"), "{template}");
             assert!(usb.calls().is_empty(), "nothing touches the sensor");
         }
+    }
+
+    #[test]
+    fn rearm_sequence_is_accepted_only_by_cancel_then_verify() {
+        let mut usb = FakeUsb::with_sensor();
+        let shutdown = SignalFlag::new();
+        let (code, out, err) = run_with(
+            &["cancel-then-verify", "--rearm-sequence", "3"],
+            &mut usb,
+            &shutdown,
+        );
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert!(
+            out.contains("re-arm sequence 3"),
+            "the override reaches the session: {out}"
+        );
+
+        let mut usb = FakeUsb::with_sensor();
+        let (code, _out, err) = run_with(&["verify", "--rearm-sequence", "3"], &mut usb, &shutdown);
+        assert_eq!(code, EXIT_OTHER);
+        assert_eq!(err, format!("{USAGE}\n"));
     }
 
     #[test]
