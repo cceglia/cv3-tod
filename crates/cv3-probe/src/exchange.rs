@@ -1,28 +1,30 @@
-//! The out / interrupt / bulk-in exchange every command uses.
+//! The probe's blocking adapter over the shared command exchange.
 //!
 //! A command is written to bulk OUT; the sensor answers on interrupt IN with an eight-byte
 //! announcement (`status: u32`, `reply_len: u32`, both little-endian); when `reply_len` is
-//! non-zero the body follows on bulk IN. The body is read before `command` returns, so the next
-//! command can never start with an announced body still in flight.
+//! non-zero the body follows on bulk IN. The sequence itself — including answering a
+//! `CV_GET_HOST_TIMESTAMP_INTERRUPT` with vendor control request `0x0d` — lives in
+//! [`cv3_wire::Exchange`], so the plugin runs exactly the same machine with asynchronous
+//! `libfprint` transfers.
 //!
 //! The byte-level I/O is [`UsbIo`], which lets the sequencing be tested against a mock and keeps
 //! the command transfers non-cancellable in the real transport. Only the finger wait has a
 //! cancellation path, and it is not part of a command exchange.
+//!
+//! The body is read before `command` returns, so the next command can never start with an
+//! announced body still in flight.
 
 use std::time::Duration;
 
 use cv3_core::proto::timeout;
+use cv3_wire::{IoFailure, IoReply, Transfer, WireError};
+
+pub use cv3_wire::{ANNOUNCEMENT_LEN, MAX_REPLY_LEN, Reply};
 
 use crate::usb::UsbError;
 
-/// Bytes in the interrupt announcement.
-pub const ANNOUNCEMENT_LEN: usize = 8;
 /// Bytes in the finger event the interrupt endpoint delivers.
 pub const FINGER_EVENT_LEN: usize = 4;
-
-/// Largest body accepted. The audited implementation reads into an 8192-byte buffer; a length
-/// beyond it cannot be a genuine reply and is refused rather than trusted.
-pub const MAX_REPLY_LEN: usize = 8192;
 
 /// The byte-level USB operations the exchange needs.
 pub trait UsbIo {
@@ -30,7 +32,8 @@ pub trait UsbIo {
     fn out(&mut self, frame: &[u8]) -> Result<(), UsbError>;
 
     /// Reads the announcement. Returns the bytes actually read, which may be short; the exchange
-    /// rejects a short read rather than reading past it.
+    /// rejects a short read rather than reading past it. A host timestamp request is returned as
+    /// the sensor sent it: answering it is the exchange's job, not the transport's.
     fn read_interrupt(&mut self, timeout: Duration) -> Result<Vec<u8>, UsbError>;
 
     /// Reads up to `len` bytes of an announced reply body from bulk IN.
@@ -46,8 +49,8 @@ pub trait UsbIo {
     /// Answers a `CV_GET_HOST_TIMESTAMP_INTERRUPT` with the packed host timestamp.
     ///
     /// This is a vendor device control request, not a bulk frame: it never appears in a transcript
-    /// and never touches the command path. The real transport calls it only from its interrupt
-    /// demultiplexing, when the sensor asks for the clock.
+    /// and never touches the command path. The exchange calls it when the sensor asks for the
+    /// clock, during an announcement read.
     fn sync_timestamp(&mut self, packed: u32) -> Result<(), UsbError>;
 
     /// The timestamp syncs sent since the last call, for `--hex`.
@@ -56,15 +59,6 @@ pub trait UsbIo {
     fn take_timestamps(&mut self) -> Vec<u32> {
         Vec::new()
     }
-}
-
-/// What the sensor announced and, if it announced one, the body that followed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Reply {
-    /// The announcement's status word. The command's own status is at offset 20 of `body` and is
-    /// interpreted by the core, not here; an empty announcement has no such frame.
-    pub status: u32,
-    pub body: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +111,45 @@ impl std::fmt::Display for ExchangeError {
 
 impl std::error::Error for ExchangeError {}
 
+impl From<WireError> for ExchangeError {
+    fn from(error: WireError) -> Self {
+        match error {
+            WireError::Out(failure) => Self::Out(usb_failure(failure)),
+            WireError::Interrupt(failure) => Self::Interrupt(usb_failure(failure)),
+            WireError::Bulk(failure) => Self::Bulk(usb_failure(failure)),
+            // Before the sequencing moved here, a failed timestamp answer came out of
+            // `read_interrupt`; keeping it on the announcement stage preserves that report.
+            WireError::Control(failure) => Self::Interrupt(usb_failure(failure)),
+            WireError::ShortAnnouncement { got } => Self::ShortAnnouncement { got },
+            WireError::ReplyTooLarge { announced, max } => Self::ReplyTooLarge { announced, max },
+            WireError::BodyLength { announced, got } => Self::BodyLength { announced, got },
+            WireError::TooManyTimestampRequests => Self::Interrupt(UsbError::TimestampRequests),
+        }
+    }
+}
+
+fn io_failure(error: UsbError) -> IoFailure {
+    match error {
+        UsbError::Timeout => IoFailure::Timeout,
+        UsbError::Disconnected => IoFailure::Disconnected,
+        UsbError::Stall => IoFailure::Stall,
+        UsbError::Cancelled => IoFailure::Cancelled,
+        UsbError::Busy => IoFailure::Busy,
+        other => IoFailure::Other(other.to_string()),
+    }
+}
+
+fn usb_failure(failure: IoFailure) -> UsbError {
+    match failure {
+        IoFailure::Timeout => UsbError::Timeout,
+        IoFailure::Disconnected => UsbError::Disconnected,
+        IoFailure::Stall => UsbError::Stall,
+        IoFailure::Cancelled => UsbError::Cancelled,
+        IoFailure::Busy => UsbError::Busy,
+        IoFailure::Other(message) => UsbError::Other(message),
+    }
+}
+
 /// Sends one command and completes its announced reply.
 pub struct Exchange<'a> {
     io: &'a mut dyn UsbIo,
@@ -130,47 +163,52 @@ impl<'a> Exchange<'a> {
     /// Writes `frame`, waits for the announcement, and reads the body when one is announced.
     ///
     /// A failure is returned without reading a body; a caller must not send another command after
-    /// an error, because the device may still hold unread reply bytes.
+    /// an error, because the device may still hold unread reply bytes. The write timeout belongs to
+    /// [`UsbIo::out`]; the announcement and body use the times on the transfers.
     pub fn command(&mut self, frame: &[u8]) -> Result<Reply, ExchangeError> {
-        self.io.out(frame).map_err(ExchangeError::Out)?;
-
-        let announcement = self
-            .io
-            .read_interrupt(Duration::from_millis(timeout::REPLY_MS as u64))
-            .map_err(ExchangeError::Interrupt)?;
-        if announcement.len() < ANNOUNCEMENT_LEN {
-            return Err(ExchangeError::ShortAnnouncement {
-                got: announcement.len(),
-            });
+        let mut exchange = cv3_wire::Exchange::new(frame.to_vec());
+        while let Some(transfer) = exchange.next_transfer() {
+            let result = self.perform(transfer);
+            exchange.on_io_result(result);
         }
+        exchange
+            .outcome()
+            .expect("a finished exchange reports an outcome")
+            .map_err(ExchangeError::from)
+    }
 
-        let status = le32(&announcement, 0);
-        let announced = le32(&announcement, 4) as usize;
-        if announced == 0 {
-            return Ok(Reply {
-                status,
-                body: Vec::new(),
-            });
+    fn perform(&mut self, transfer: Transfer) -> IoReply {
+        match transfer {
+            Transfer::Out { frame, .. } => match self.io.out(&frame) {
+                Ok(()) => IoReply::Completed,
+                Err(error) => IoReply::Failed(io_failure(error)),
+            },
+            Transfer::InterruptIn { timeout_ms, .. } => {
+                match self
+                    .io
+                    .read_interrupt(Duration::from_millis(timeout_ms as u64))
+                {
+                    Ok(payload) => IoReply::Data(payload),
+                    Err(error) => IoReply::Failed(io_failure(error)),
+                }
+            }
+            Transfer::BulkIn { len, timeout_ms } => {
+                match self
+                    .io
+                    .read_bulk(len, Duration::from_millis(timeout_ms as u64))
+                {
+                    Ok(body) => IoReply::Data(body),
+                    Err(error) => IoReply::Failed(io_failure(error)),
+                }
+            }
+            Transfer::ControlOut { value, index, .. } => {
+                let packed = u32::from(value) | (u32::from(index) << 16);
+                match self.io.sync_timestamp(packed) {
+                    Ok(()) => IoReply::Completed,
+                    Err(error) => IoReply::Failed(io_failure(error)),
+                }
+            }
         }
-        if announced > MAX_REPLY_LEN {
-            return Err(ExchangeError::ReplyTooLarge {
-                announced,
-                max: MAX_REPLY_LEN,
-            });
-        }
-
-        let body = self
-            .io
-            .read_bulk(announced, Duration::from_millis(timeout::REPLY_MS as u64))
-            .map_err(ExchangeError::Bulk)?;
-        if body.len() != announced {
-            return Err(ExchangeError::BodyLength {
-                announced,
-                got: body.len(),
-            });
-        }
-
-        Ok(Reply { status, body })
     }
 
     /// Waits for the finger event, the one transfer the protocol allows to be cancelled.
@@ -186,22 +224,14 @@ impl<'a> Exchange<'a> {
         if event.len() < FINGER_EVENT_LEN {
             return Err(ExchangeError::ShortFingerEvent { got: event.len() });
         }
-        Ok(le32(&event, 0))
+        Ok(u32::from_le_bytes([event[0], event[1], event[2], event[3]]))
     }
-}
-
-fn le32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-    ])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timestamp;
     use std::cell::RefCell;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,6 +245,8 @@ mod tests {
 
     struct MockIo {
         interrupt: Result<Vec<u8>, UsbError>,
+        /// When non-empty, consumed before `interrupt`, so one exchange can see several reads.
+        interrupt_queue: std::collections::VecDeque<Result<Vec<u8>, UsbError>>,
         bulk: Result<Vec<u8>, UsbError>,
         finger: Result<Vec<u8>, UsbError>,
         out_error: Option<UsbError>,
@@ -230,6 +262,7 @@ mod tests {
             announcement[4..].copy_from_slice(&reply_len.to_le_bytes());
             Self {
                 interrupt: Ok(announcement.to_vec()),
+                interrupt_queue: std::collections::VecDeque::new(),
                 bulk: Ok(vec![0xAA; reply_len as usize]),
                 finger: Ok(0x03u32.to_le_bytes().to_vec()),
                 out_error: None,
@@ -255,7 +288,10 @@ mod tests {
 
         fn read_interrupt(&mut self, timeout: Duration) -> Result<Vec<u8>, UsbError> {
             self.calls.borrow_mut().push(Call::Interrupt(timeout));
-            self.interrupt.clone()
+            match self.interrupt_queue.pop_front() {
+                Some(next) => next,
+                None => self.interrupt.clone(),
+            }
         }
 
         fn read_bulk(&mut self, len: usize, timeout: Duration) -> Result<Vec<u8>, UsbError> {
@@ -446,6 +482,40 @@ mod tests {
                 Call::Interrupt(Duration::from_millis(timeout::REPLY_MS as u64)),
             ]
         );
+    }
+
+    #[test]
+    fn a_host_timestamp_request_is_answered_through_the_shared_exchange() {
+        // The sensor asks for the clock before announcing the reply. The shared machine answers it
+        // with the control request and reads the interrupt endpoint again.
+        let mut io = MockIo::new(0x0000_0002, 0);
+        let mut announcement = vec![0u8; ANNOUNCEMENT_LEN];
+        announcement[..4].copy_from_slice(&2u32.to_le_bytes());
+        io.interrupt_queue
+            .push_back(Ok(timestamp::HOST_TIMESTAMP_INTERRUPT
+                .to_le_bytes()
+                .to_vec()));
+        io.interrupt_queue.push_back(Ok(announcement));
+        let mut exchange = Exchange::new(&mut io);
+
+        let reply = exchange.command(&[0x23]).expect("the announcement arrives");
+
+        assert_eq!(reply.status, 2);
+        let calls = io.calls();
+        assert_eq!(calls[0], Call::Out(vec![0x23]));
+        assert_eq!(
+            calls[1],
+            Call::Interrupt(Duration::from_millis(timeout::REPLY_MS as u64))
+        );
+        assert!(
+            matches!(calls[2], Call::Timestamp(_)),
+            "the request is answered with the vendor control: {calls:?}"
+        );
+        assert_eq!(
+            calls[3],
+            Call::Interrupt(Duration::from_millis(timeout::REPLY_MS as u64))
+        );
+        assert_eq!(calls.len(), 4);
     }
 
     #[test]

@@ -213,8 +213,25 @@ impl UsbIo for NusbIo {
     }
 
     fn read_interrupt(&mut self, wait: Duration) -> Result<Vec<u8>, UsbError> {
-        let mut source = AnnouncementSource { io: self, wait };
-        timestamp::demux_interrupt(&mut source)
+        // Raw: a host timestamp request is returned to the shared exchange, which answers it and
+        // reads again. Answering it here would put the sequence in a second place.
+        let interface = self.interface()?.clone();
+        let mut pipe = interface
+            .endpoint::<Interrupt, In>(endpoint::INTERRUPT)
+            .map_err(map_error)?;
+        let request = pipe.max_packet_size().max(1);
+        pipe.submit(nusb::transfer::Buffer::new(request));
+        match pipe.wait_next_complete(wait) {
+            Some(completion) => {
+                completion.status.map_err(map_transfer)?;
+                Ok(completion.buffer[..completion.actual_len].to_vec())
+            }
+            None => {
+                std::mem::forget(pipe);
+                self.poison();
+                Err(UsbError::Timeout)
+            }
+        }
     }
 
     fn read_bulk(&mut self, len: usize, wait: Duration) -> Result<Vec<u8>, UsbError> {
@@ -260,7 +277,7 @@ impl UsbIo for NusbIo {
                     index: (packed >> 16) as u16,
                     data: &[],
                 },
-                Duration::from_millis(timestamp::SYNC_TIMEOUT_MS),
+                Duration::from_millis(u64::from(timestamp::SYNC_TIMEOUT_MS)),
             )
             .wait()
             .map_err(map_transfer)?;
@@ -270,38 +287,6 @@ impl UsbIo for NusbIo {
 
     fn take_timestamps(&mut self) -> Vec<u32> {
         std::mem::take(&mut self.timestamps)
-    }
-}
-
-/// One announcement read, with the demultiplexer able to answer a timestamp request in between.
-struct AnnouncementSource<'a> {
-    io: &'a mut NusbIo,
-    wait: Duration,
-}
-
-impl TimestampInterrupt for AnnouncementSource<'_> {
-    fn read_interrupt(&mut self) -> Result<Vec<u8>, UsbError> {
-        let interface = self.io.interface()?.clone();
-        let mut pipe = interface
-            .endpoint::<Interrupt, In>(endpoint::INTERRUPT)
-            .map_err(map_error)?;
-        let request = pipe.max_packet_size().max(1);
-        pipe.submit(nusb::transfer::Buffer::new(request));
-        match pipe.wait_next_complete(self.wait) {
-            Some(completion) => {
-                completion.status.map_err(map_transfer)?;
-                Ok(completion.buffer[..completion.actual_len].to_vec())
-            }
-            None => {
-                std::mem::forget(pipe);
-                self.io.poison();
-                Err(UsbError::Timeout)
-            }
-        }
-    }
-
-    fn answer_timestamp(&mut self) -> Result<(), UsbError> {
-        self.io.sync_timestamp(timestamp::pack(SystemTime::now()))
     }
 }
 

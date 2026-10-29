@@ -2,33 +2,36 @@
 //!
 //! The crate is a `cdylib` made of two layers. `shim/cv3_tod.c` owns the GObject side — the
 //! `FpDevice` subclass, its class info and its vfuncs — and this crate exports the single symbol
-//! `libfprint`'s TOD loader resolves. From the session ticket on, the shim's vfuncs call Rust
-//! functions that own the protocol core: the C side hands over an event and receives the action
-//! to perform, so no parsing, length arithmetic, cryptography or session state ever lives in C.
+//! `libfprint`'s TOD loader resolves. The shim's vfuncs call the Rust functions in [`ffi`], which
+//! own the protocol core and return one action per step: an OUT / interrupt / bulk-in / control
+//! transfer to perform, or a finish with a status, an error kind and a message. No parsing, length
+//! arithmetic, cryptography or session state lives in C.
 //!
-//! Ticket 11 is enumeration only: the probe completes without touching USB, nothing here talks to
-//! the sensor yet, and the vfuncs libfprint dereferences unconditionally fail cleanly. A failed
-//! open releases the GUsb handle libfprint opened for it, so the reader stays available to the next
-//! Claim.
+//! Opening a device runs the `0x23`/`0x24` handshake and the wrapped `0x02` open through the same
+//! I/O-free core the probe uses; closing sends the plain `0x04`. A failed open releases the GUsb
+//! handle libfprint opened and destroys the Rust state, so the next Claim starts clean and no
+//! session handle is left on the sensor. [`plugin`] is the session state machine and [`secret`]
+//! draws the per-session key material.
 //!
 //! # Tests
 //!
 //! The C shim is not unit-tested from Rust: text assertions on its source pass whether the code
 //! works or not, and cannot see what libfprint actually dereferences. Instead
-//! `scripts/check-tod-class.sh` loads the built object, reads the live class, and drives the open
-//! path under a fake for gusb — the behaviour this milestone promises. The tests here keep the
-//! identity the two sides share, plus the exported symbol's name.
+//! `scripts/check-tod-class.sh` loads the built object, reads the live class, and drives a whole
+//! failed-then-successful Claim and Release under a fake for gusb and for `fpi_usb_transfer_submit`.
+//! The Rust tests here cover the session step machine against scripted transfers, plus the action
+//! layout and message handling the two sides share.
 
 #![deny(unsafe_code)]
 
 pub mod identity;
+pub mod plugin;
+pub mod secret;
 
-// The export links the C shim; unit tests pin the shim's declarations as text and do not link it,
-// so the test binary stays a plain Rust binary.
-//
-// `unsafe` is confined to that module: an `extern` block and an `export_name` are the minimum the
-// C boundary needs, and no protocol code goes here.
-#[cfg(not(test))]
+// `unsafe` is confined to that module: an `extern` block and the raw buffer ownership are the
+// minimum the C boundary needs, and no protocol code goes here. The module compiles under tests
+// too, with only the symbol export and the shim's extern block gated out, so the action layout and
+// message handling are tested without linking the C shim.
 #[allow(unsafe_code)]
 pub mod ffi;
 
@@ -38,7 +41,6 @@ mod tests {
 
     /// The identity header `build.rs` generates for the shim.
     const IDENTITY_HEADER: &str = include_str!(concat!(env!("OUT_DIR"), "/cv3_tod_identity.h"));
-    /// The Rust half of the boundary, for the entry point's name.
 
     #[test]
     fn claims_the_sensor_the_core_names() {

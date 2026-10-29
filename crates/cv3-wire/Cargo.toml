@@ -1,0 +1,10 @@
+[package]
+name = "cv3-wire"
+description = "I/O-free out / interrupt / bulk-in sequencing for the ControlVault 3 sensor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cv3-core = { path = "../cv3-core" }

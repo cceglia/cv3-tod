@@ -205,6 +205,7 @@ name = "cv3-probe"
 version = "0.1.0"
 dependencies = [
  "cv3-core",
+ "cv3-wire",
  "getrandom",
  "nusb",
  "signal-hook",
@@ -215,6 +216,15 @@ name = "cv3-tod"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "cv3-core",
+ "cv3-wire",
+ "getrandom",
+]
+
+[[package]]
+name = "cv3-wire"
+version = "0.1.0"
+dependencies = [
  "cv3-core",
 ]
 

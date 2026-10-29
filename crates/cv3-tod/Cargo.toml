@@ -15,3 +15,5 @@ cc = "=1.10.0"
 
 [dependencies]
 cv3-core = { path = "../cv3-core" }
+cv3-wire = { path = "../cv3-wire" }
+getrandom = "=0.2.15"

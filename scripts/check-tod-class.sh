@@ -1,18 +1,27 @@
 #!/bin/sh
 # Loads the built plugin the way libfprint's TOD loader does and checks what fprintd then sees.
 #
-# The unit tests in crates/cv3-tod/src/lib.rs can only read the C source as text, and text cannot
-# tell a class that is safe from one that only looks safe. This script checks the real object:
+# The unit tests in crates/cv3-tod can only check the Rust session machine, not the C boundary or
+# what libfprint actually calls. This script checks the real object:
 #
 #   1. g_module_open()s it, resolves `fpi_tod_shared_driver_get_type` and reads the class: identity,
 #      id table, and the vfuncs libfprint dereferences without a NULL test (`open`, `close`,
 #      `enroll`) — a NULL in any of those is a segfault inside fprintd, which runs as root.
-#   2. With an LD_PRELOAD fake for g_usb_device_open/close (crates/cv3-tod/tests/fake_gusb.c) so no
-#      root, sensor or USB is needed, calls fp_device_open_sync twice: libfprint opens the GUsb
-#      handle *before* the driver's open vfunc and fpi_device_open_complete does not close it, so a
-#      failed Claim that leaks the handle makes the second open fail with GUsb's "Device is already
-#      open". Both opens must report FP_DEVICE_ERROR_NOT_SUPPORTED, and neither may say
-#      "already open". fp_device_close_sync is then called twice to show it stays safe.
+#   2. Drives fprintd's Claim/Release on that class with tests/fake_gusb.c linked into the harness
+#      (`-Wl,--export-dynamic` so its symbols interpose for the plugin). The fake scripts the
+#      sensor's reply frames at fpi_usb_transfer_submit and models libgusb's open/close/claim
+#      state, so no root, sensor or USB is needed.
+#
+# The session the harness runs:
+#   - a first Claim whose 0x24 reply is refused fails with FP_DEVICE_ERROR_PROTO, after writing the
+#     plain 0x04 that releases the handle and releasing both interface 0 and the GUsb handle;
+#   - a second Claim on the same device sends 0x23, 0x24 and the wrapped 0x02 and succeeds, so a
+#     failed open leaves nothing that turns the next Claim into "Device is already open";
+#   - Release sends the plain 0x04, releases the interface and completes successfully;
+#   - an open whose sensor leaves the bus before the 0x23 announcement completes with
+#     FP_DEVICE_ERROR_REMOVED instead of hanging;
+#   - a Release whose 0x04 gets no announcement still completes successfully, with the failure
+#     logged and the interface and handle released.
 #
 # Usage: scripts/check-tod-class.sh [path/to/plugin.so]
 #   default path: target/release/libcv3_tod.so
@@ -40,7 +49,7 @@ if [ ! -f "$plugin" ]; then
 fi
 
 # The TOD headers define FpDeviceClass, which the public API keeps opaque; the harness needs the
-# struct to read the class's vfunc slots.
+# struct to read the class's vfunc slots and FpiUsbTransfer to complete a transfer.
 if ! pkg-config --exists libfprint-2-tod-1 libfprint-2 gusb gmodule-2.0; then
     echo "error: missing libfprint-2-tod-dev, libgusb-dev or glib development files" >&2
     exit 1
@@ -49,14 +58,11 @@ fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-cc -shared -fPIC -o "$work/fake-gusb.so" "$tests/fake_gusb.c" \
-    $(pkg-config --cflags --libs gusb)
-cc -o "$work/tod-class-open" "$tests/tod_class_open.c" \
+cc -o "$work/tod-class-open" "$tests/tod_class_open.c" "$tests/fake_gusb.c" \
     $(pkg-config --cflags libfprint-2-tod-1 gmodule-2.0) \
-    $(pkg-config --libs libfprint-2-tod-1 libfprint-2 gusb gmodule-2.0)
+    $(pkg-config --libs libfprint-2-tod-1 libfprint-2 gusb gmodule-2.0) \
+    -Wl,--export-dynamic
 
-# The fake must be preloaded, not linked: it replaces the library's symbols for libfprint and for
-# the plugin alike.
-LD_PRELOAD="$work/fake-gusb.so" "$work/tod-class-open" "$plugin"
+"$work/tod-class-open" "$plugin"
 
 echo "TOD class/open check passed for $plugin"

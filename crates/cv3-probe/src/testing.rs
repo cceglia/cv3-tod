@@ -826,11 +826,9 @@ impl UsbIo for HandshakeSensor {
     }
 
     fn read_interrupt(&mut self, _timeout: Duration) -> Result<Vec<u8>, UsbError> {
-        let mut source = FakeInterruptSource {
-            sensor: self,
-            kind: FakeInterrupt::Announcement,
-        };
-        timestamp::demux_interrupt(&mut source)
+        // Raw, like the real transport: the shared exchange answers a timestamp request and reads
+        // again, so the scripted sensor must hand it the request itself.
+        self.next_announcement()
     }
 
     fn read_bulk(&mut self, _len: usize, _timeout: Duration) -> Result<Vec<u8>, UsbError> {
@@ -838,10 +836,7 @@ impl UsbIo for HandshakeSensor {
     }
 
     fn read_finger(&mut self, _timeout: Duration) -> Result<Vec<u8>, UsbError> {
-        let mut source = FakeInterruptSource {
-            sensor: self,
-            kind: FakeInterrupt::Finger,
-        };
+        let mut source = FakeInterruptSource { sensor: self };
         timestamp::demux_interrupt(&mut source)
     }
 
@@ -859,23 +854,14 @@ impl UsbIo for HandshakeSensor {
     }
 }
 
-/// The scripted sensor's raw interrupt reads, with the demux able to answer a type-5 event.
-enum FakeInterrupt {
-    Announcement,
-    Finger,
-}
-
+/// The scripted sensor's raw finger reads, with the demux able to answer a type-5 event.
 struct FakeInterruptSource<'a> {
     sensor: &'a mut HandshakeSensor,
-    kind: FakeInterrupt,
 }
 
 impl TimestampInterrupt for FakeInterruptSource<'_> {
     fn read_interrupt(&mut self) -> Result<Vec<u8>, UsbError> {
-        match self.kind {
-            FakeInterrupt::Announcement => self.sensor.next_announcement(),
-            FakeInterrupt::Finger => self.sensor.next_finger(),
-        }
+        self.sensor.next_finger()
     }
 
     fn answer_timestamp(&mut self) -> Result<(), UsbError> {

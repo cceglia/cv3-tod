@@ -36,11 +36,11 @@ The vendor packs **local** civil time; this probe packs **UTC**, because a `Syst
 timezone. The field widths and positions are what the controller consumes, so the encoding is
 otherwise identical. The year field is six bits (2000..2063) and saturates at either end.
 
-`cvctl` answers type-5 events in the USB transport — during both the reply-announcement read and
-the finger wait, with a bounded number of retries. It does **not** send the sync unprompted: on
-2026-10-29 an unsolicited sync at session start timed out and the handshake that followed also
-timed out, so the probe now waits for the sensor to ask. With `--hex` the host-side control appears
-as `* timestamp <packed:08x>`, alongside the `>`/`<` bulk lines.
+`cvctl` answers type-5 events below the command layer — in the shared exchange for reply
+announcements and in the probe's finger wait, with a bounded number of retries. It does **not** send
+the sync unprompted: on 2026-10-29 an unsolicited sync at session start timed out and the handshake
+that followed also timed out, so the probe now waits for the sensor to ask. With `--hex` the
+host-side control appears as `* timestamp <packed:08x>`, alongside the `>`/`<` bulk lines.
 
 ## Measured on 2026-10-28
 
