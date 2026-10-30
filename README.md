@@ -83,6 +83,160 @@ pinned crypto set and that its source contains no `unsafe`; the GitHub workflow 
 formatting, clippy, the workspace tests, and `cargo-deny` for RustSec advisories and licences
 (`deny.toml`).
 
+## Installation
+
+The complete procedure, from a checkout to a finger unlocking `sudo`. It is written for
+Debian/Ubuntu, the distribution this driver was tested on; on another distribution install the
+equivalent packages for libfprint's TOD headers, GUsb, GLib and a C toolchain.
+
+Tested with libfprint `1.95.1+tod1`, fprintd `1.94.5` and the sensor on USB `0a5c:5843`. The
+plugin needs libfprint's TOD ABI; a libfprint without `libfprint-2-tod-dev` cannot build it.
+
+### 1. Check the sensor and the prerequisites
+
+```sh
+lsusb -d 0a5c:5843                 # must list the ControlVault 3
+rustc --version                    # needs 1.93 or newer
+pkg-config --modversion libfprint-2-tod-1
+```
+
+Then install the build and runtime packages:
+
+```sh
+sudo apt install build-essential pkg-config libfprint-2-tod-dev libfprint-2-dev \
+    libgusb-dev libglib2.0-dev fprintd libpam-fprintd
+```
+
+If the distribution's Rust is older than 1.93, install a current toolchain with rustup:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
+rustc --version
+```
+
+Building needs no root. The probe does: it opens the kernel's USB device nodes directly.
+
+### 2. Remove a competing driver
+
+libfprint's TOD loader scans one directory, and only one driver may own the reader. Remove the
+vendor Broadcom TOD package — or move its shared object out of the directory — before installing
+this one, or the sensor can stay with the old driver:
+
+```sh
+pkg-config --variable=tod_driversdir libfprint-2-tod-1
+ls "$(pkg-config --variable=tod_driversdir libfprint-2-tod-1)"
+dpkg -l | grep -i 'tod1-broadcom'
+```
+
+If the listing shows `libfprint-2-tod-1-broadcom.so`, `libfprint-2-tod-1-broadcom-cv3plus.so` or
+another driver claiming `0a5c:5843`, remove its package (`sudo apt remove <package>`) or move the
+file aside. Keep a copy if you want to restore it.
+
+### 3. Build and test
+
+From the repository root:
+
+```sh
+cargo test --workspace             # core, probe and TOD plugin
+./scripts/build-plugin.sh          # release build, symbol-version check, class/open checks
+```
+
+`cargo test --workspace` and `build-plugin.sh` need `libfprint-2-tod-dev`; `cargo test` alone (the
+default members) does not. `build-plugin.sh` produces `target/release/libcv3_tod.so` and runs the
+link and class checks described under [The TOD plugin](#the-tod-plugin).
+
+### 4. Install and restart fprintd
+
+```sh
+./scripts/install-plugin.sh
+sudo systemctl restart fprintd
+fprintd-list "$USER"
+```
+
+`install-plugin.sh` builds the plugin and copies exactly one file,
+`libfprint-2-tod-1-cv3.so`, into libfprint's TOD directory. It never runs `sudo`: if the directory
+is not writable it prints the exact `sudo install` command; run that instead. Nothing else on the
+system changes. If the TOD directory does not exist, the script prints the `sudo install -d`
+command that creates it; install `libfprint-2-tod-dev` first.
+
+`fprintd-list` must name `Dell/Broadcom ControlVault 3 (press)`. If it does not, see
+[Troubleshooting](#troubleshooting).
+
+### 5. Enrol and verify
+
+```sh
+fprintd-enroll -f right-index-finger "$USER"    # place the finger until enroll-completed
+fprintd-verify -f right-index-finger "$USER"    # expect verify-match
+```
+
+Enrolment collects up to twelve samples and one confirmation touch; follow the prompts. The finger
+name is an fprintd label, not a hardware fact, so verify with the same label you enrolled.
+
+### 6. Enable fingerprint authentication (optional)
+
+`fprintd` alone does not change PAM. Add `pam_fprintd` to the services that should accept a finger,
+keeping the password after it. The tested setup is `sudo` and the KDE lock screen:
+
+```sh
+sudo cp -a /etc/pam.d/sudo /etc/pam.d/sudo.bak-cv3
+sudo cp -a /etc/pam.d/kscreenlocker /etc/pam.d/kscreenlocker.bak-cv3
+sudoedit /etc/pam.d/sudo
+sudoedit /etc/pam.d/kscreenlocker
+```
+
+Add this line **before** `@include common-auth` in each file:
+
+```text
+auth       sufficient   pam_fprintd.so
+```
+
+If the service already has an `auth` module for a PIN before that line (for example a
+`pam_pin.so` entry), it can answer first and `pam_fprintd` never runs; comment that line out for
+that service only. Leave `@include common-auth` in place: it is the password fallback.
+
+Keep a root shell (`sudo -s`) open while you edit PAM. Then test:
+
+```sh
+sudo -k        # drop the cached credential
+sudo -v        # fingerprint prompt; Ctrl+C falls back to the password
+```
+
+Ctrl+C at the prompt falls back to the password; Esc does not cancel `pam_fprintd` 1.94.5. If
+`sudo` stops working, restore the backup from the root shell:
+`cp /etc/pam.d/sudo.bak-cv3 /etc/pam.d/sudo`.
+
+Lock the session and unlock it with the enrolled finger to test the lock screen. On KDE the PAM
+service is `kscreenlocker`; this project was tested with KDE only.
+
+### 7. Uninstall
+
+```sh
+fprintd-delete "$USER"          # optional: delete this user's prints first
+./scripts/uninstall-plugin.sh
+sudo systemctl restart fprintd
+```
+
+The uninstall script removes the one `.so` and leaves `fprintd` working as it was. It never runs
+`sudo`: without write access it prints the exact `sudo rm` command; run that instead. Fingerprints
+live under `/var/lib/fprint`, and removing the plugin does not delete them; `fprintd-delete` needs
+the driver, so delete them first or remove `/var/lib/fprint/<user>` as root. PAM changes are
+separate system configuration: restore the backups.
+
+### Troubleshooting
+
+| Symptom | What to check |
+|---|---|
+| `fprintd-list` shows no `ControlVault 3` device | Is `libfprint-2-tod-1-cv3.so` in the TOD directory? `systemctl status fprintd` and `journalctl -u fprintd -b`; another TOD driver may own the sensor. |
+| `cvctl` exits 3, "sensor is busy" | `fprintd` holds interface 0: `sudo systemctl stop fprintd`, run the probe, then start it again. |
+| `cvctl` exits 4, permission denied | Run the probe as root. `fprintd` runs as a system service and needs no extra rule. |
+| No fingerprint prompt on `sudo` | `pam_fprintd` is missing, after a module that succeeds, or after `common-auth`; check the order. |
+| The sensor stops answering | `docs/recovery.md`: USB `authorized` toggle, then a full power-down. Do not reset the device. |
+
+Optional: identification. fprintd 1.94 has no identify call, but `scripts/identify-hardware.sh`
+builds a small libfprint harness and prints the root command to run it. It needs `libfprint-2-dev`
+and `fprintd` stopped.
+
 ## The TOD plugin
 
 `crates/cv3-tod` builds `libcv3_tod.so`, a libfprint TOD driver. The class id is `cv3`, the full name is
@@ -101,19 +255,9 @@ inventory, no known delete command), and identification through `fprintd`, whose
 interface has no identification call. Identification works at the libfprint level, and
 `scripts/identify-hardware.sh` drives it.
 
-```sh
-./scripts/build-plugin.sh      # cargo build, the TOD version check, and the class/open checks
-./scripts/install-plugin.sh    # build, then copy one .so into the TOD drivers directory
-./scripts/uninstall-plugin.sh  # delete that one file
-```
-
-Installing adds `/usr/lib/x86_64-linux-gnu/libfprint-2/tod-1/libfprint-2-tod-1-cv3.so` and
-nothing else: no `libfprint` or `fprintd` configuration is touched. Neither script runs `sudo`;
-without write access they print the exact command to run as root, with the paths quoted. If the
-TOD drivers directory does not exist yet, `install-plugin.sh` prints the `sudo install -d` command
-that creates it. Remove any other TOD driver that claims `0a5c:5843` first, since only one driver
-can own the reader; that is also a single file. A relative `CV3_TOD_DIR` is resolved against the
-directory you run the script from.
+Build, install and uninstall are in [Installation](#installation). Installing adds exactly
+`libfprint-2-tod-1-cv3.so` to the TOD drivers directory and changes no `libfprint` or `fprintd`
+configuration; a relative `CV3_TOD_DIR` is resolved against the directory you run the script from.
 
 `./scripts/check-tod-link.sh` (run by `build-plugin.sh`) inspects the built object with
 `readelf -sW` and fails when a `fpi_*` import is unversioned or binds any version other than the
@@ -127,31 +271,6 @@ open succeeds, Release sends `0x04`, a failed `0x04` still completes, a vanished
 `REMOVED`, a cancelled enrolment stores no print, and the bound payload round-trips through
 `fp_print_serialize`/`fp_print_deserialize`. A real successful enrolment or verify needs the
 sensor's session key, so those stay on hardware. It needs no root, no sensor and no USB.
-
-After installing and restarting the daemon (`sudo systemctl restart fprintd`):
-
-```sh
-fprintd-enroll "$USER"                          # place the finger until Enroll result: enroll-completed
-fprintd-verify -f right-index-finger "$USER"    # Verify result: verify-match
-```
-
-### sudo and the lock screen
-
-`fprintd` alone does not change PAM; `pam_fprintd` must be enabled for the services that should
-accept a finger. The tested setup adds one `sufficient` line before `common-auth` (so the password
-stays the fallback) and removes any old PIN module:
-
-```sh
-# /etc/pam.d/sudo and /etc/pam.d/kscreenlocker, before @include common-auth
-auth       sufficient   pam_fprintd.so
-```
-
-With `pam_fprintd` 1.94.5, Ctrl+C at the fingerprint prompt falls back to the password; Esc does
-not cancel it. Uninstalling the driver is still one file and leaves `fprintd` working; the PAM lines
-are separate system configuration.
-
-Uninstall by deleting the one file (`./scripts/uninstall-plugin.sh`, or `sudo rm` with the path it
-prints) and restarting `fprintd`.
 
 ## `cvctl` exit codes
 
