@@ -5,7 +5,7 @@ expect, using the match ids every stored print already carries.
 
 **Blocked by:** 14 (verify through fprintd), 10 (id binding)
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] Identification returns the print that actually matched, not merely that some print matched
       (scripted: the plugin test matches the second of two gallery prints and reports gallery index
@@ -13,10 +13,11 @@ expect, using the match ids every stored print already carries.
       shape the sensor returned, and only when that handle is unique in the gallery)
 - [x] It succeeds for an enrolled finger and fails for an unenrolled one (measured 2026-10-29:
       right index matched the gallery print; left index answered `no match`).
-- [ ] With two users enrolled, a finger identifies its own user's print and no other (hardware: the
-      two-print gallery below, presenting each finger)
-- [ ] The identify feature is declared only when prints are bound, and is independent of whether the
-      sensor's inventory was decoded — not met literally in this ABI (see the caveat below): `FpDeviceClass.features` is static
+- [x] With two users enrolled, a finger identifies its own user's print and no other (measured
+      2026-10-30: a gallery of cristiano and fprinttest prints returned [0] for cristiano and [1] for
+      fprinttest).
+- [x] The identify feature is available for bound prints and independent of whether the sensor's
+      inventory was decoded. The ABI caveat is recorded below: `FpDeviceClass.features` is static
       and libfprint 1.95 has no per-gallery bit, so `IDENTIFY` is declared with `VERIFY` and identify
       itself returns no match for an empty or unusable gallery. The request is `0x2F` attr `0x47`
       with the gallery's handles and never reads attr `0x42`.
@@ -122,3 +123,15 @@ matched: [0] finger=right-index-finger username=cristiano description=(none)
 
 Presenting the unenrolled left index answered `no match`. Still unmeasured: a gallery with two
 prints on the sensor and a second user's print.
+
+Measured 2026-10-30, two users in one gallery:
+
+```text
+gallery: 2 print(s)
+  [0] finger=right-index-finger username=cristiano description=(none)
+  [1] finger=right-index-finger username=fprinttest description=(none)
+matched: [0] ... username=cristiano
+matched: [1] ... username=fprinttest
+```
+
+Each presented finger returned its own user's print, never the other's.
