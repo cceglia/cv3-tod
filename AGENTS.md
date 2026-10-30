@@ -4,6 +4,11 @@ Be concise. No walls of text. Prefer short paragraphs and a few bullets; use a t
 carries real structure. No preamble, no restating the question, no summarising work that the diff or
 the files already show. If a reply needs more than roughly a screen, cut it or ask.
 
+## Language
+
+All repository prose is English: documentation, code comments, commit messages, tickets and ticket
+comments. Do not mix languages in the same file, and do not leave a new file in another language.
+
 ## CodeGraph
 
 This repo is indexed (`.codegraph/`). Reach for it before grep or reading files when you need to
