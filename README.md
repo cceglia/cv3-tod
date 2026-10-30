@@ -135,6 +135,21 @@ fprintd-enroll "$USER"                          # place the finger until Enroll 
 fprintd-verify -f right-index-finger "$USER"    # Verify result: verify-match
 ```
 
+### sudo and the lock screen
+
+`fprintd` alone does not change PAM; `pam_fprintd` must be enabled for the services that should
+accept a finger. The tested setup adds one `sufficient` line before `common-auth` (so the password
+stays the fallback) and removes any old PIN module:
+
+```sh
+# /etc/pam.d/sudo and /etc/pam.d/kscreenlocker, before @include common-auth
+auth       sufficient   pam_fprintd.so
+```
+
+With `pam_fprintd` 1.94.5, Ctrl+C at the fingerprint prompt falls back to the password; Esc does
+not cancel it. Uninstalling the driver is still one file and leaves `fprintd` working; the PAM lines
+are separate system configuration.
+
 Uninstall by deleting the one file (`./scripts/uninstall-plugin.sh`, or `sudo rm` with the path it
 prints) and restarting `fprintd`.
 
