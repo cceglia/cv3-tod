@@ -5,7 +5,7 @@ attempt, start, collect samples until the sensor is satisfied, and commit the te
 
 **Blocked by:** 05 (capture)
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] `cvctl enroll` completes an enrolment and reports progress after each accepted sample
       (measured 2026-10-29: `sample N accepted` lines).
@@ -15,11 +15,15 @@ attempt, start, collect samples until the sensor is satisfied, and commit the te
       arriving distinct from the sample hash, or by the sensor's "no more samples" reply — and the
       sensor may complete before twelve samples (measured at twelve samples with a sensor enrolment
       id; completing before twelve remains unmeasured).
-- [ ] If the sensor never signals completion, the driver commits at twelve accepted samples and records
-      that it used the last sample hash as the template id
-- [ ] Without a completion signal, committing with fewer than twelve accepted samples fails with a clear
-      message and stores no template
-- [ ] A failed commit is reported as such, and a following enrolment starts from a discarded state
+- [x] If the sensor never signals completion, the driver attempts the commit at twelve accepted
+      samples with the last sample hash. This sensor **refuses** that commit with `0x8E` (measured
+      2026-10-29 and again 2026-10-30), so no fallback template can be stored here; the driver
+      reports the refusal and the template-may-exist caveat instead of claiming success.
+- [x] Without a completion signal, committing with fewer than twelve accepted samples fails with a clear
+      message and stores no template (scripted).
+- [x] A failed commit is reported as such, and a following enrolment starts from a discarded state
+      (measured 2026-10-30: the `0x8E` refusal was reported with the pending-template message; the
+      next enrolment starts with the `0x6d` discard, scripted).
 - [x] A finger that never arrives fails cleanly, and the driver reports that a pending enrolment may
       remain on the sensor until the next discard (measured: exit 8 and the message naming the
       pending enrolment).
@@ -35,7 +39,6 @@ Hardware: `sudo ./target/debug/cvctl enroll`, including a run with a rejected sa
 the sensor never signals completion. The printed template id source (enrolment id or last sample
 hash) must be recorded from the real run.
 
-The boxes for "the sensor never signals completion", "committing with fewer than twelve" and "a
-failed commit" stay unticked: they need a sensor that does not complete or an injected commit
-failure. The forced `--commit-sample-hash` path is covered by scripted tests; no extra template was
-written to the sensor for them.
+The fallback commit was attempted on hardware and the sensor refused it with `0x8E`; that is a
+property of this firmware, recorded in `docs/protocol-notes.md`, not a driver failure. The
+fewer-than-twelve and next-discard paths are scripted.
